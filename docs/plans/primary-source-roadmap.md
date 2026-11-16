@@ -63,6 +63,8 @@ Scope: turn the current settings dialog into a location-oriented configuration v
 
 A change of place must invalidate obsolete associations and flag uncovered hazards. Support multiple counties and official warning/evacuation zones. Keep identifier namespaces explicit: a Census county, a NWS forecast zone, a SAME code and a local evacuation zone are different things. Never infer a household footprint from the center of a town.
 
+Design a low-noise default awareness view separately from raw collection: prioritize current protective warnings and nationally significant products, provide explicit per-source filters (including earthquake magnitude and proximity), and retain a way to inspect the raw stream. Collecting all USGS magnitudes can reduce a classification delay, but tiny distant earthquakes should not crowd out major news in the default view. Use transparent source-specific rules and show their effect; no AI importance score may authorize household sound. Keep awareness filters independent of HA eligibility.
+
 New source origins require an explicit browser-permission workflow. Investigate optional per-origin permissions requested by user gesture, instead of granting automatic access to every website. Keep executable adapters packaged locally. Catalog entries must not contain executable JavaScript or remote plugins.
 
 Acceptance: changing NYC to another sample locality does not retain stale coverage claims or remove unrelated user locations. Import/export round-trips private settings locally without publishing them. Unknown sources remain proposals. Mock and browser tests cover denied host permission, removed sources, jurisdiction ambiguity, changed geographic codes and an unsupported local-government channel.

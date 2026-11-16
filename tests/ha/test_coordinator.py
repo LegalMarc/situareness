@@ -264,6 +264,85 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
             self.assertEqual(len(services.calls), 2)
 
+            # Partial collection suspends an unconfirmed prior item while an
+            # unrelated current alert can still be processed and reported.
+            store = DurableStore()
+            services = Flaky()
+            hass = types.SimpleNamespace(services=services)
+            first = mod.SituarenessCoordinator(hass, cfg, store, {})
+            await first._async_update_data()
+            unrelated = copy.deepcopy(e)
+            unrelated["id"] += "-unrelated"
+
+            async def partial(*args):
+                from test_domain import collector
+
+                return collector.CollectedEvents(
+                    [unrelated], 1, [[e["id"] + "-oversize", e["id"]]], False
+                )
+
+            services.fail = False
+            with patch.object(mod, "fetch", partial):
+                data = await first._async_update_data()
+            self.assertTrue(data["partial"])
+            self.assertEqual((data["quarantined_count"], data["active_count"]), (1, 1))
+            self.assertEqual(
+                (
+                    data["pending_count"],
+                    data["deliverable_count"],
+                    data["suspended_count"],
+                ),
+                (1, 0, 1),
+            )
+            self.assertEqual(len(services.calls), 2)
+
+            # Root-only references find the current descendant and carry a
+            # retry exactly once, linking the current message.
+            store = DurableStore()
+            services = Flaky()
+            hass = types.SimpleNamespace(services=services)
+            first = mod.SituarenessCoordinator(hass, cfg, store, {})
+            await first._async_update_data()
+            b = copy.deepcopy(e)
+            b.update(id=e["id"] + "-b", references=[e["id"]])
+
+            async def current(*args):
+                return [b]
+
+            with patch.object(mod, "fetch", current):
+                await first._async_update_data()
+                b["id"] = e["id"] + "-c"
+                services.fail = False
+                data = await first._async_update_data()
+            self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+            self.assertEqual(len(services.calls), 3)
+            self.assertEqual(services.calls[-1][2]["data"]["url"], b["id"])
+
+            # A cancel referencing only the root invalidates a retry attached
+            # to its descendant; a stale reappearance cannot revive it.
+            store = DurableStore()
+            services = Flaky()
+            hass = types.SimpleNamespace(services=services)
+            first = mod.SituarenessCoordinator(hass, cfg, store, {})
+            await first._async_update_data()
+            b = copy.deepcopy(e)
+            b.update(id=e["id"] + "-b", references=[e["id"]])
+            with patch.object(mod, "fetch", current):
+                await first._async_update_data()
+                cancelled = copy.deepcopy(e)
+                cancelled.update(
+                    id=e["id"] + "-cancel", references=[e["id"]], message_type="Cancel"
+                )
+                saved_b = b
+                b = cancelled
+                services.fail = False
+                data = await first._async_update_data()
+                self.assertEqual(data["pending_count"], 0)
+                b = saved_b
+                data = await first._async_update_data()
+            self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+            self.assertEqual(len(services.calls), 2)
+
             # A failed target follows the eligible sibling, regardless of order.
             for reverse in (False, True):
                 store = DurableStore()
@@ -314,8 +393,8 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
             self.assertEqual(len(services.calls), 2)
 
-            # A temporarily ineligible merge retains pending work for both
-            # distinct qualifying predecessor actions, in either reference order.
+            # A temporarily ineligible merge discards the changed action and
+            # retains the matching one, in either reference order.
             for reverse in (False, True):
                 store = DurableStore()
                 services = Flaky()
@@ -344,7 +423,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 with patch.object(mod, "fetch", merge):
                     data = await restarted._async_update_data()
                     self.assertEqual(
-                        (data["planned_count"], data["pending_count"]), (0, 2)
+                        (data["planned_count"], data["pending_count"]), (0, 1)
                     )
                     merged["expires"] = (now + timedelta(minutes=30)).isoformat()
                     data = await restarted._async_update_data()

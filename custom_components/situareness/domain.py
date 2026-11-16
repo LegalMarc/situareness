@@ -34,6 +34,10 @@ def safe_url(value):
         return None
 
 
+class OversizedFeature(ValueError):
+    """A validly framed feature exceeds the per-lineage safety limit."""
+
+
 def normalize(feature):
     if not isinstance(feature, dict) or feature.get("type") != "Feature":
         return None
@@ -72,7 +76,7 @@ def normalize(feature):
         isinstance(r, dict) and isinstance(r.get("@id"), str) and len(r["@id"]) > 512
         for r in refs
     ):
-        return None
+        raise OversizedFeature("NWS reference limit exceeded")
     references = [
         r.get("@id") for r in refs if isinstance(r, dict) and safe_url(r.get("@id"))
     ]
@@ -246,50 +250,205 @@ def action_history(record):
     )
 
 
-def reconcile(previous, events, config, now, baseline=False, activate=False):
-    """Return bounded incident journal and plans. Only complete successful polls call this."""
+def action_identity(event):
+    """Material wording independent of temporary geometry or urgency changes."""
+    value = [event.get("event"), event.get("instruction")]
+    return sha256(json.dumps(value, ensure_ascii=True).encode()).hexdigest()
+
+
+def lineage_index(records, events):
+    """Union shared identifiers once; return component IDs and member records."""
+    parent = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(ids):
+        if not ids:
+            return
+        anchor = ids[0]
+        find(anchor)
+        for value in ids[1:]:
+            a, b = find(anchor), find(value)
+            if a != b:
+                parent[b] = a
+
+    for eid, record in records.items():
+        union([eid, *record.get("lineage", [])])
+    for event in events:
+        union([event["id"], *event.get("references", [])])
+    members = {}
+    for eid in records:
+        members.setdefault(find(eid), []).append(eid)
+    return {eid: find(eid) for eid in parent}, members
+
+
+def reconcile(
+    previous,
+    events,
+    config,
+    now,
+    baseline=False,
+    activate=False,
+    partial=False,
+    quarantine_lineages=(),
+    quarantine_all=False,
+):
+    """Reconcile bounded history; quarantined inputs cannot end unrelated records."""
     prior = deepcopy(previous or {})
     records = deepcopy(prior)
     plans = []
-    seen = set()
-    # Equivalent siblings can arrive together even when their parent was not
-    # previously observed. Group them by shared identifiers, independent of order.
-    groups = []
-    for event in events:
-        ids = {event["id"], *event.get("references", [])}
-        touching = [g for g in groups if g & ids]
-        for group in touching:
-            ids |= group
-            groups.remove(group)
-        groups.append(ids)
+    quarantine_events = [
+        {"id": ids[0], "references": ids[1:]} for ids in quarantine_lineages if ids
+    ]
+    groups, members = lineage_index(prior, [*events, *quarantine_events])
+    quarantine_groups = {groups[e["id"]] for e in quarantine_events}
+    if quarantine_all:
+        quarantine_groups = set(groups.values())
+    cancelled_groups = {
+        groups[e["id"]]
+        for e in events
+        if e.get("status") == "Actual" and e.get("message_type") == "Cancel"
+    }
     planned_in_poll = set()
-    referenced = {}
-    for event in events:
-        for ref in event.get("references", []):
-            if ref != event["id"]:
-                referenced.setdefault(ref, []).append(event)
+    seen = set()
+    referenced = set()
+    quarantined = False
+    renewed_groups = set()
+    inactive_states = {"ineligible", "ended_or_absent", "quarantined", "unconfirmed"}
+    summaries = {}
+
+    def merge_bounded(target, source):
+        for key, value in source.items():
+            target[key] = value
+            if len(target) > 100:
+                break
+
+    for group, ids in members.items():
+        summary = {
+            "has_active": False,
+            "tombstone": False,
+            "active": {},
+            "inactive": {},
+            "active_identity": {},
+            "inactive_identity": {},
+            "inactive_since": None,
+        }
+        for record_id in ids:
+            record = prior[record_id]
+            summary["tombstone"] |= bool(record.get("cancel_message"))
+            state = record.get("state")
+            if state in ("superseded", "cancelled"):
+                continue
+            bucket = "inactive" if state in inactive_states else "active"
+            if bucket == "inactive":
+                since = timestamp(record.get("inactive_since") or record.get("updated"))
+                if not since or since > now or now - since > timedelta(minutes=15):
+                    continue
+                summary["inactive_since"] = min(
+                    summary["inactive_since"] or since, since
+                )
+            else:
+                summary["has_active"] |= state == "active"
+            history = action_history(record)
+            merge_bounded(summary[bucket], history)
+            by_identity = summary[bucket + "_identity"]
+            merge_bounded(
+                by_identity.setdefault(record.get("action_identity"), {}), history
+            )
+        summaries[group] = summary
+    for group in quarantine_groups:
+        for eid in members.get(group, []):
+            if records[eid].get("state") not in ("cancelled", "superseded"):
+                records[eid]["state"] = "quarantined"
+                records[eid]["inactive_since"] = (
+                    records[eid].get("inactive_since") or now.isoformat()
+                )
     for event in events:
         eid = event["id"]
+        group = groups[eid]
+        refs = event.get("references", [])
         decision = qualify(event, config, now)
         fp = fingerprint(event, decision)
-        predecessors = [prior.get(eid)] + [
-            prior.get(ref) for ref in event.get("references", []) if ref != eid
-        ]
-        # Superseded ancestors must not override the latest changed action.
-        candidates = [
-            r
-            for r in predecessors
-            if r and r.get("state") not in ("superseded", "cancelled")
-        ]
+        identity = action_identity(event)
+        cancelled = (
+            event.get("status") == "Actual" and event.get("message_type") == "Cancel"
+        )
+        summary = summaries.get(group, {})
+        renewed = any(ref in prior and prior[ref].get("cancel_message") for ref in refs)
+        blocked = group in cancelled_groups or (
+            summary.get("tombstone") and not renewed
+        )
+        if group in quarantine_groups:
+            old_record = records.get(eid, {})
+            records[eid] = {
+                "state": "quarantined",
+                "fingerprint": fp,
+                "actions": action_history(old_record),
+                "action_identity": old_record.get("action_identity"),
+                "lineage": sorted({eid, *refs}),
+                "reasons": ["lineage quarantined"],
+                "affected": [],
+                "inactive_since": old_record.get("inactive_since") or now.isoformat(),
+                "updated": now.isoformat(),
+            }
+            seen.add(eid)
+            quarantined = True
+            continue
         actions = {}
-        for record in candidates:
-            actions.update(action_history(record))
+
+        def include_bucket(bucket):
+            if decision["qualifies"]:
+                merge_bounded(actions, summary.get(bucket, {}))
+            else:
+                indexed = summary.get(bucket + "_identity", {})
+                merge_bounded(actions, indexed.get(None, {}))
+                merge_bounded(actions, indexed.get(identity, {}))
+
+        include_bucket("active")
+        inactive_dates = []
+        if not summary.get("has_active"):
+            include_bucket("inactive")
+            if summary.get("inactive_since"):
+                inactive_dates.append(summary["inactive_since"])
+        else:
+            for record_id in {eid, *refs}:
+                record = prior.get(record_id, {})
+                if record.get("state") not in inactive_states:
+                    continue
+                since = timestamp(record.get("inactive_since") or record.get("updated"))
+                if not since or since > now or now - since > timedelta(minutes=15):
+                    continue
+                inactive_dates.append(since)
+                if decision["qualifies"] or record.get("action_identity") in (
+                    None,
+                    identity,
+                ):
+                    merge_bounded(actions, action_history(record))
         if len(actions) > 100:
-            raise ValueError("incident action history limit reached")
-        group = next(i for i, ids in enumerate(groups) if eid in ids)
+            quarantined = True
+            old_record = records.get(eid, {})
+            records[eid] = {
+                "state": "quarantined",
+                "fingerprint": fp,
+                "actions": action_history(old_record),
+                "action_identity": old_record.get("action_identity"),
+                "lineage": sorted({eid, *refs}),
+                "reasons": ["action history limit exceeded"],
+                "affected": [],
+                "inactive_since": old_record.get("inactive_since") or now.isoformat(),
+                "updated": now.isoformat(),
+            }
+            seen.add(eid)
+            continue
         equivalent = fp in actions or (group, fp) in planned_in_poll
         if (
             decision["qualifies"]
+            and not blocked
             and not baseline
             and (activate or not equivalent)
             and (group, fp) not in planned_in_poll
@@ -305,39 +464,58 @@ def reconcile(previous, events, config, now, baseline=False, activate=False):
                 }
             )
             planned_in_poll.add((group, fp))
-        cancelled = (
-            event.get("status") == "Actual" and event.get("message_type") == "Cancel"
-        )
-        if cancelled:
+        if cancelled or blocked:
             actions = {}
         elif decision["qualifies"]:
             actions = {fp: decision["affected"]}
+            if renewed:
+                renewed_groups.add(group)
+        inactive_since = min(inactive_dates, default=now).isoformat()
         records[eid] = {
             "state": "cancelled"
-            if cancelled
+            if cancelled or blocked
             else "active"
             if decision["qualifies"]
             else "ineligible",
             "fingerprint": fp,
             "actions": actions,
-            "lineage": sorted({eid, *event.get("references", [])}),
-            "reasons": decision["reasons"],
-            "affected": decision["affected"],
+            "action_identity": identity,
+            "inactive_since": None
+            if decision["qualifies"] and not blocked
+            else inactive_since,
+            "lineage": sorted({eid, *refs}),
+            "cancel_message": cancelled,
+            "reasons": ["lineage cancelled"]
+            if blocked and not cancelled
+            else decision["reasons"],
+            "affected": decision["affected"] if not blocked else [],
             "updated": now.isoformat(),
         }
         seen.add(eid)
-    for ref, successors in referenced.items():
-        if ref in records and ref not in seen:
-            cancelled = all(
-                e.get("status") == "Actual" and e.get("message_type") == "Cancel"
-                for e in successors
-            )
-            records[ref]["state"] = "cancelled" if cancelled else "superseded"
-            if cancelled:
-                records[ref]["actions"] = {}
+        referenced.update(ref for ref in refs if ref != eid)
+    # A real cancellation applies to the entire known lineage, including
+    # pending descendants absent from the latest feed.
+    for group in cancelled_groups:
+        for eid in members.get(group, []):
+            if eid in records:
+                records[eid] = {**records[eid], "state": "cancelled", "actions": {}}
+    for group in renewed_groups - cancelled_groups:
+        for eid in members.get(group, []):
+            if eid in records:
+                records[eid]["cancel_message"] = False
+    for ref in referenced:
+        if (
+            ref in records
+            and ref not in seen
+            and records[ref].get("state") != "cancelled"
+        ):
+            records[ref]["state"] = "superseded"
     for eid, record in records.items():
         if eid not in seen and record.get("state") == "active":
-            record["state"] = "ended_or_absent"
+            record["state"] = (
+                "unconfirmed" if partial or quarantined else "ended_or_absent"
+            )
+            record["inactive_since"] = now.isoformat()
             record["updated"] = now.isoformat()
     records = dict(
         sorted(

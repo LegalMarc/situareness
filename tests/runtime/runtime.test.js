@@ -459,3 +459,25 @@ test("global retention prioritizes current alerts and reports any omitted record
   assert.equal(overflow.events.length, 500);
   assert.equal(overflow.dropped, 50);
 });
+
+test("old current alerts without expiry age out and failed sources lose priority", () => {
+  const now = new Date("2026-11-15T12:00:00Z");
+  const old = {
+    id: "old",
+    source_id: "nws",
+    collected_at: "2026-11-01T12:00:00Z",
+    awareness_lifecycle: "current",
+  };
+  assert.equal(retainEvents([old], [], now).events.length, 0);
+  const cached = { ...old, id: "cached", collected_at: "2026-11-14T12:00:00Z" };
+  const newer = Array.from({ length: 500 }, (_, i) => ({
+    id: `news-${i}`,
+    collected_at: now.toISOString(),
+  }));
+  assert.equal(
+    retainEvents([cached, ...newer], [], now, [
+      { id: "nws", enabled: false, status: "error" },
+    ]).events.some((event) => event.id === "cached"),
+    false,
+  );
+});

@@ -3,7 +3,7 @@ import { MAX_SOURCE_ITEMS, normalizeJson, normalizeRss } from "./normalize.js";
 export const MAX_BYTES = 8_000_000;
 export const MAX_EVENTS = 500;
 const TIMEOUT_MS = 12000;
-const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
+export const RETAIN_MS = 7 * 24 * 60 * 60 * 1000;
 
 export async function readBounded(response) {
   if (!response.ok)
@@ -137,17 +137,14 @@ export async function collectSource(
     clearTimeout(timer);
   }
 }
-export function retainEvents(existing, results, now) {
+export function retainEvents(existing, results, now, sources = null) {
   const cutoff = now.getTime() - RETAIN_MS;
   const byId = new Map();
   for (const item of existing) {
     if (
       item &&
       typeof item.id === "string" &&
-      (Date.parse(item.collected_at) >= cutoff ||
-        (item.awareness_lifecycle === "current" &&
-          (!Number.isFinite(Date.parse(item.expires_at)) ||
-            Date.parse(item.expires_at) > now.getTime())))
+      Date.parse(item.collected_at) >= cutoff
     )
       byId.set(item.id, item);
   }
@@ -169,6 +166,13 @@ export function retainEvents(existing, results, now) {
   const ordered = [...byId.values()].sort((a, b) => {
     const priority = (item) =>
       item.awareness_lifecycle === "current" &&
+      (sources === null ||
+        sources.some(
+          (source) =>
+            source.id === item.source_id &&
+            source.enabled !== false &&
+            source.status === "ok",
+        )) &&
       (!Number.isFinite(Date.parse(item.expires_at)) ||
         Date.parse(item.expires_at) > now.getTime())
         ? 1

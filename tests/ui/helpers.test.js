@@ -337,3 +337,57 @@ test("legacy dashboard imports normalize to the optional context dashboard", () 
   );
   assert.equal(Object.hasOwn(normalized.room, "primary_dashboard"), false);
 });
+
+test("explicit null context dashboard overrides a legacy URL", () => {
+  const config = structuredClone(defaults);
+  config.room.context_dashboard = null;
+  config.room.primary_dashboard = "https://example.com/legacy";
+  assert.equal(publicConfig(config).room.context_dashboard, null);
+  assert.equal(validateConfig(config).room.context_dashboard, null);
+});
+
+test("weather presence is marked cached when its source is unavailable or overdue", () => {
+  const now = Date.now();
+  const event = {
+    source_id: "nws",
+    awareness_lifecycle: "current",
+    category: "weather",
+    official: true,
+  };
+  const sources = [{ id: "nws", kind: "nws", interval_minutes: 1 }];
+  for (const source of [
+    {
+      id: "nws",
+      enabled: false,
+      status: "ok",
+      last_success_at: new Date(now).toISOString(),
+    },
+    {
+      id: "nws",
+      enabled: true,
+      status: "error",
+      last_success_at: new Date(now).toISOString(),
+    },
+    {
+      id: "nws",
+      enabled: true,
+      status: "ok",
+      last_success_at: new Date(now - 180_000).toISOString(),
+    },
+  ])
+    assert.equal(
+      nwsAwarenessLifecycle(event, now, sources, [source]),
+      "cached",
+    );
+  assert.equal(
+    nwsAwarenessLifecycle(event, now, sources, [
+      {
+        id: "nws",
+        enabled: true,
+        status: "ok",
+        last_success_at: new Date(now).toISOString(),
+      },
+    ]),
+    "current",
+  );
+});

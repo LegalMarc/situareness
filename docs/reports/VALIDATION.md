@@ -2,11 +2,13 @@
 
 ## Current status
 
-Public-release preparation, November 16, 2026. This is a locally tested prototype with household outputs disabled by default. Production installation and audible commissioning have not been performed. Initial independent standards and specification reviews identified issues now repaired in a new checkpoint; fresh review and the final adversarial pass remain pending. A complete independent release review is still pending; interrupted or timed-out review attempts are not approvals.
+Public-release preparation, November 16, 2026. This is a locally tested prototype with household outputs disabled by default. Production installation and audible commissioning have not been performed. Independent standards and specification reviews identified issues in two candidates. The further repair pass is locally tested; fresh review and the final adversarial pass remain pending; see the [separate review record](REVIEW.md). A complete independent release review is still pending; interrupted or timed-out review attempts are not approvals.
 
 ## Automated evidence
 
-The current public checkpoint passed static checks, 29 Node tests, 28 standard-library Home Assistant policy/boundary/packaging tests, seven companion-catalog tests, and 12 isolated Chromium browser tests. Installation archives were rebuilt twice with matching manifests and SHA-256 hashes. Three additional tests passed against the actual Home Assistant 2026.11.1 loader, entity registry, disk-backed storage and service registry, with source events and output targets simulated locally.
+The new repair checkpoint passed static checks, 34 Node tests, 33 standard-library Home Assistant policy/boundary/packaging tests, seven companion-catalog tests, and 14 isolated Chromium browser tests. Five additional tests passed against Home Assistant 2026.11.1, including the actual loader, entity/service registries, disk-backed private storage, recorder SQLite exclusions, and removal during an in-flight refresh. Source events and output targets were simulated locally. This is 93 automated tests total, with no household device delivery.
+
+Ruff lint and formatting passed, and the standard-library HA suite passed with warnings treated as errors. A read-only live browser smoke test on November 16 received HTTP 200 from NWS, USGS and both BBC endpoints; NWS returned no current items in the sample NY/DC query. Two installation archive builds produced identical manifests and SHA-256 hashes. These checks cannot validate real CAP lineage or source availability beyond that observation.
 
 The real Home Assistant test dependency stack emitted five upstream deprecation warnings from Home Assistant HTTP and `backoff`. They were not suppressed or patched in the project. The standard-library suite passes with warnings treated as errors. Reproduction commands are in [setup](../setup.md) and [HA setup](../ha/README.md).
 

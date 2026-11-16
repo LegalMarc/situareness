@@ -187,7 +187,9 @@ export function validateConfig(config) {
     room: {
       browser: String(config.room.browser || "Google Chrome").slice(0, 300),
       context_dashboard: safeUrl(
-        config.room.context_dashboard ?? config.room.primary_dashboard,
+        Object.hasOwn(config.room, "context_dashboard")
+          ? config.room.context_dashboard
+          : config.room.primary_dashboard,
       ),
       closing_room_stops_monitoring: false,
     },

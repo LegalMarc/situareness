@@ -9,12 +9,35 @@ import {
   sourceFreshness,
 } from "./ui/helpers.mjs";
 
-const bundledConfig = await (
-  await fetch(chrome.runtime.getURL("defaults/config.json"))
-).json();
-const sourceDefaults = Object.fromEntries(
-  bundledConfig.sources.map((source) => [source.id, source]),
-);
+let sourceDefaults = {};
+let bootstrapError = null;
+try {
+  if (!globalThis.chrome?.runtime?.getURL)
+    throw new Error(
+      "Extension runtime is unavailable. Open this page from the installed Situareness extension.",
+    );
+  const response = await fetch(chrome.runtime.getURL("defaults/config.json"));
+  if (!response.ok)
+    throw new Error("Bundled source defaults could not be loaded.");
+  const bundledConfig = await response.json();
+  if (!Array.isArray(bundledConfig.sources))
+    throw new Error("Bundled source defaults are invalid.");
+  sourceDefaults = Object.fromEntries(
+    bundledConfig.sources.map((source) => [source.id, source]),
+  );
+  if (
+    !["nws", "usgs", "bbc_world", "bbc_us_canada"].every(
+      (id) =>
+        sourceDefaults[id] &&
+        Number.isInteger(sourceDefaults[id].interval_minutes) &&
+        sourceDefaults[id].interval_minutes > 0,
+    )
+  )
+    throw new Error("Bundled source defaults are incomplete.");
+} catch (error) {
+  bootstrapError =
+    error?.message || "Bundled source defaults could not be loaded.";
+}
 
 const byId = (id) => document.getElementById(id);
 const els = {
@@ -36,6 +59,7 @@ const els = {
   filteredEmpty: byId("filtered-empty"),
   notice: byId("notice"),
   freshness: byId("freshness-note"),
+  retention: byId("retention-note"),
   dashboard: byId("dashboard-link"),
   search: byId("search-input"),
   category: byId("category-filter"),
@@ -119,8 +143,13 @@ function renderStatus(state) {
   const collector = state?.collector || {};
   const paused = collector.paused === true;
   const running = collector.running === true;
-  els.collectorDot.className = `status-dot ${paused ? "paused" : (state?.sources || []).some((source) => source.enabled !== false && source.status === "error") ? "error" : "ok"}`;
+  const enabled = (state?.sources || []).filter(
+    (source) => source.enabled !== false,
+  );
+  els.collectorDot.className = `status-dot ${paused ? "paused" : !enabled.length ? "neutral" : enabled.some((source) => source.status === "error") ? "error" : "ok"}`;
   if (paused) els.collectorLabel.textContent = "Collection paused";
+  else if (!enabled.length)
+    els.collectorLabel.textContent = "No sources enabled";
   else if (running) els.collectorLabel.textContent = "Collecting updates…";
   else if (collector.last_run_at)
     els.collectorLabel.textContent = `Collector active · last run ${relativeAge(collector.last_run_at)}`;
@@ -248,10 +277,7 @@ function renderSources(state) {
   const errors = sources.filter(
     (source) => source.enabled !== false && source.status === "error",
   );
-  els.freshness.hidden =
-    stale.length === 0 &&
-    errors.length === 0 &&
-    !state?.collector?.storage_truncated;
+  els.freshness.hidden = stale.length === 0 && errors.length === 0;
   const freshnessMessages = [];
   if (errors.length)
     freshnessMessages.push(
@@ -261,10 +287,10 @@ function renderSources(state) {
     freshnessMessages.push(
       `${stale.length} source${stale.length === 1 ? " is" : "s are"} overdue. Items are shown with their collection times and may be stale.`,
     );
-  if (state?.collector?.storage_truncated)
-    freshnessMessages.push(
-      "The 500-item storage limit omitted some items; the displayed collection may be incomplete.",
-    );
+  els.retention.hidden = !state?.collector?.last_storage_loss_at;
+  els.retention.textContent = state?.collector?.last_storage_loss_at
+    ? "The 500-item storage limit omitted some items; the displayed collection may be incomplete."
+    : "";
   els.freshness.textContent = freshnessMessages.join(" ");
 }
 
@@ -315,12 +341,17 @@ function renderEvent(event, locations) {
     event,
     Date.now(),
     currentState?.config?.sources,
+    currentState?.sources,
   );
   if (lifecycle) {
     const labels = {
       current: [
         "In latest results",
         "Present in the latest processed weather alert results.",
+      ],
+      cached: [
+        "Cached · source unavailable",
+        "Previously present in weather results; the source is disabled, failed, or overdue.",
       ],
       expired: [
         "Source expiry passed",
@@ -421,6 +452,9 @@ function renderFeed(state) {
     (source) => source.enabled !== false && source.status === "error",
   );
   const paused = state?.collector?.paused === true;
+  const noEnabledSources = !(state?.sources || []).some(
+    (source) => source.enabled !== false,
+  );
   if (events.length === 0) {
     els.list.hidden = true;
     els.filteredEmpty.hidden = true;
@@ -429,25 +463,29 @@ function renderFeed(state) {
     const heading = element(
       "strong",
       "",
-      paused
-        ? "Collection is paused"
-        : failedSources.length
-          ? "No events available"
-          : "No events collected yet",
+      noEnabledSources
+        ? "No sources enabled"
+        : paused
+          ? "Collection is paused"
+          : failedSources.length
+            ? "No events available"
+            : "No events collected yet",
     );
     els.state.append(
       heading,
       element(
         "span",
         "",
-        failedSources.length
-          ? "One or more providers failed. Check source status for details."
-          : paused
-            ? "Resume collection to check your configured feeds."
-            : "Your configured sources have not returned any events yet.",
+        noEnabledSources
+          ? "Enable a source in settings to collect events."
+          : failedSources.length
+            ? "One or more providers failed. Check source status for details."
+            : paused
+              ? "Resume collection to check your configured feeds."
+              : "Your configured sources have not returned any events yet.",
       ),
     );
-    if (!paused && failedSources.length === 0) {
+    if (!noEnabledSources && !paused && failedSources.length === 0) {
       const spinner = element("span", "spinner");
       spinner.setAttribute("aria-hidden", "true");
       els.state.prepend(spinner);
@@ -809,7 +847,16 @@ els.saveSettings.addEventListener("click", async () => {
   }
 });
 
-refreshState();
-window.setInterval(() => {
-  void refreshState();
-}, 15_000);
+if (bootstrapError) {
+  els.collectorDot.className = "status-dot error";
+  els.collectorLabel.textContent = "Room could not start";
+  els.state.replaceChildren(
+    element("strong", "", "Unable to start room"),
+    element("span", "", bootstrapError),
+  );
+} else {
+  refreshState();
+  window.setInterval(() => {
+    void refreshState();
+  }, 15_000);
+}

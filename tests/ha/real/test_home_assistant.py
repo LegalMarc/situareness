@@ -1,6 +1,7 @@
 """Optional tests against real Home Assistant; network and devices remain simulated."""
 
 import json
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers.translation import async_get_translations
 from pytest_homeassistant.common import MockConfigEntry
+from pytest_homeassistant.components.recorder.common import async_wait_recording_done
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -155,3 +157,69 @@ async def test_real_ha_shadow_blocks_service(hass, monkeypatch):
     assert coordinator.data["planned_count"] == 1
     assert coordinator.data["shadow"] is True
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_recorder_excludes_high_churn_attributes(
+    recorder_mock, hass, monkeypatch
+):
+    from homeassistant.components.recorder.db_schema import (
+        StateAttributes,
+        States,
+        StatesMeta,
+    )
+    from homeassistant.helpers.recorder import session_scope
+    from sqlalchemy import select
+
+    await hass.async_start()
+    await integration_module(hass, monkeypatch, [])
+    entry = MockConfigEntry(domain="situareness", title="Situareness", data={})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await async_wait_recording_done(hass)
+
+    def stored_attributes():
+        with session_scope(hass=hass, read_only=True) as session:
+            return list(
+                session.scalars(
+                    select(StateAttributes.shared_attrs)
+                    .join(States, States.attributes_id == StateAttributes.attributes_id)
+                    .join(StatesMeta, States.metadata_id == StatesMeta.metadata_id)
+                    .where(StatesMeta.entity_id == "sensor.situareness_monitoring")
+                )
+            )
+
+    rows = await hass.async_add_executor_job(stored_attributes)
+    assert rows
+    attrs = [json.loads(row) for row in rows if row]
+    assert attrs and all(
+        "events" not in row and "last_success" not in row for row in attrs
+    )
+    assert "events" in hass.states.get("sensor.situareness_monitoring").attributes
+    assert "last_success" in hass.states.get("sensor.situareness_monitoring").attributes
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_removal_cannot_recreate_store_during_refresh(hass, monkeypatch):
+    component = await integration_module(hass, monkeypatch, [])
+    entry = MockConfigEntry(domain="situareness", title="Situareness", data={})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    coordinator = hass.data["situareness"][entry.entry_id]
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_fetch(*args):
+        started.set()
+        await release.wait()
+        return []
+
+    monkeypatch.setattr(component, "fetch", slow_fetch)
+    refresh = asyncio.create_task(coordinator._async_update_data())
+    await started.wait()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.config_entries.async_remove(entry.entry_id)
+    release.set()
+    with pytest.raises(Exception, match="state persistence failed"):
+        await refresh
+    assert not (
+        Path(hass.config.path(".storage")) / ("situareness." + entry.entry_id)
+    ).exists()

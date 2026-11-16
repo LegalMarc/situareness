@@ -72,7 +72,8 @@ def pending_valid(item, records, config, now, *, allow_suspended=False):
         )
         suspended = (
             allow_suspended
-            and record.get("state") in ("ineligible", "ended_or_absent")
+            and record.get("state")
+            in ("ineligible", "ended_or_absent", "quarantined", "unconfirmed")
             and item["fingerprint"] in action_history(record)
         )
         if not (active or suspended):

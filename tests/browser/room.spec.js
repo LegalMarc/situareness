@@ -183,7 +183,9 @@ test("shows read-only status, two sample places, source links, timestamps and sa
     page.getByRole("link", { name: "Open source ↗" }).first(),
   ).toHaveAttribute("href", /^https:\/\//);
   await expect(
-    page.getByRole("link", { name: "Open World Monitor ↗" }),
+    page.getByRole("link", {
+      name: "Open third-party context (non-authoritative) ↗",
+    }),
   ).toHaveAttribute("href", "https://www.worldmonitor.app/dashboard");
   await expect(
     page.getByRole("button", { name: "Pause collection" }),
@@ -341,13 +343,11 @@ test("saves editable places and provider intervals while live actions stay disab
   await page.getByRole("button", { name: "Open settings" }).click();
   const importDialog = page.getByRole("dialog");
   await ensureConfigEditorVisible(importDialog);
-  await importDialog
-    .locator("#import-file")
-    .setInputFiles({
-      name: "browser-settings.json",
-      mimeType: "application/json",
-      buffer: Buffer.from(JSON.stringify(imported)),
-    });
+  await importDialog.locator("#import-file").setInputFiles({
+    name: "browser-settings.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(imported)),
+  });
   await importDialog.getByRole("button", { name: "Save settings" }).click();
   saved = await send({ type: "GET_STATE" });
   expect(saved.state.config.locations[1]).toMatchObject({
@@ -473,13 +473,11 @@ test("rejects invalid configuration imports and keeps the room usable at a phone
   await page.getByRole("button", { name: "Open settings" }).click();
   const dialog = page.getByRole("dialog");
   await ensureConfigEditorVisible(dialog);
-  await dialog
-    .locator("#import-file")
-    .setInputFiles({
-      name: "bad.json",
-      mimeType: "application/json",
-      buffer: Buffer.from('{"schema_version":2}'),
-    });
+  await dialog.locator("#import-file").setInputFiles({
+    name: "bad.json",
+    mimeType: "application/json",
+    buffer: Buffer.from('{"schema_version":2}'),
+  });
   await expect(dialog.getByRole("alert")).toContainText("schema version 1");
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await page.screenshot({
@@ -598,13 +596,11 @@ test("omitted providers use bundled defaults when restored through settings and 
   await page.getByRole("button", { name: "Open settings" }).click();
   dialog = page.getByRole("dialog");
   await ensureConfigEditorVisible(dialog);
-  await dialog
-    .locator("#import-file")
-    .setInputFiles({
-      name: "missing.json",
-      mimeType: "application/json",
-      buffer: Buffer.from(JSON.stringify(missing)),
-    });
+  await dialog.locator("#import-file").setInputFiles({
+    name: "missing.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(missing)),
+  });
   await expect(
     dialog.getByLabel("Enable National Weather Service alerts"),
   ).not.toBeChecked();
@@ -632,7 +628,7 @@ test("omitted providers use bundled defaults when restored through settings and 
 test("disabled failed sources are neutral and storage truncation is visible", async () => {
   const stored = structuredClone((await send({ type: "GET_STATE" })).state);
   stored.collector.paused = false;
-  stored.collector.storage_truncated = true;
+  stored.collector.last_storage_loss_at = new Date().toISOString();
   const source = stored.sources.find((item) => item.id === "nws");
   Object.assign(source, {
     enabled: false,
@@ -664,9 +660,43 @@ test("disabled failed sources are neutral and storage truncation is visible", as
       .locator(".source-status"),
   ).toHaveClass(/disabled/);
   await expect(page.getByText("Old failure")).toHaveCount(0);
+  await expect(page.getByText("Cached · source unavailable")).toBeVisible();
   await expect(page.locator("#collector-dot")).not.toHaveClass(/error/);
-  await expect(page.locator("#freshness-note")).toContainText(
+  await expect(page.locator("#retention-note")).toContainText(
     "500-item storage limit omitted some items",
   );
   await expect(page.locator("#freshness-note")).not.toContainText("failed");
+});
+
+test("no enabled sources has a neutral status and useful empty state", async () => {
+  const config = structuredClone(
+    (await send({ type: "GET_STATE" })).state.config,
+  );
+  config.sources = [];
+  expect((await send({ type: "UPDATE_CONFIG", config })).ok).toBe(true);
+  await page.reload();
+  await expect(page.locator("#collector-label")).toHaveText(
+    "No sources enabled",
+  );
+  await expect(page.locator("#collector-dot")).toHaveClass(/neutral/);
+  await expect(page.locator("#feed-state")).toContainText(
+    "Enable a source in settings",
+  );
+  await expect(page.locator("#feed-state .spinner")).toHaveCount(0);
+});
+
+test("a broken bundled defaults response produces an explicit startup error", async () => {
+  await page.route("**/defaults/config.json", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: "{}" }),
+  );
+  await page.reload();
+  await expect(page.locator("#collector-label")).toHaveText(
+    "Room could not start",
+  );
+  await expect(page.locator("#feed-state")).toContainText(
+    "Bundled source defaults are invalid",
+  );
+  await expect(
+    page.getByRole("button", { name: "Open settings" }),
+  ).toBeDisabled();
 });

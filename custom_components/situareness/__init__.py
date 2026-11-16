@@ -15,7 +15,7 @@ from .collector import fetch
 from .config import validate
 from .const import DOMAIN
 from .delivery import deliver_one, live, pending_valid, targets
-from .domain import qualify, reconcile
+from .domain import action_history, lineage_index, qualify, reconcile
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.SENSOR]
@@ -55,24 +55,33 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.initialized = persisted.get("initialized") is True
         self.was_live = persisted.get("was_live") is True
         self.session = async_get_clientsession(hass)
+        self._save_lock = asyncio.Lock()
+        self._stopping = False
 
     async def _save(self, records, outbox, outcomes):
-        await self.store.async_save(
-            {
-                "records": records,
-                "outbox": outbox,
-                "outcomes": outcomes[-100:],
-                "initialized": True,
-                "was_live": live(self.config),
-            }
-        )
-        self.records, self.outbox, self.outcomes, self.initialized = (
-            records,
-            outbox,
-            outcomes[-100:],
-            True,
-        )
-        self.was_live = live(self.config)
+        async with self._save_lock:
+            if self._stopping:
+                raise RuntimeError("integration is stopping")
+            await self.store.async_save(
+                {
+                    "records": records,
+                    "outbox": outbox,
+                    "outcomes": outcomes[-100:],
+                    "initialized": True,
+                    "was_live": live(self.config),
+                }
+            )
+            self.records, self.outbox, self.outcomes, self.initialized = (
+                records,
+                outbox,
+                outcomes[-100:],
+                True,
+            )
+            self.was_live = live(self.config)
+
+    async def async_stop(self):
+        async with self._save_lock:
+            self._stopping = True
 
     async def _async_update_data(self):
         try:
@@ -87,43 +96,42 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 now,
                 baseline=baseline,
                 activate=live(self.config) and not self.was_live,
+                partial=bool(getattr(events, "quarantined", 0)),
+                quarantine_lineages=getattr(events, "quarantined_lineages", ()),
+                quarantine_all=getattr(events, "quarantine_ambiguous", False),
             )
             # Carry an undelivered item through equivalent NWS update identifiers.
-            successors = {}
+            groups, _ = lineage_index(records, events)
+            event_index = {}
             for event in events:
-                for ref in event["references"]:
-                    successors.setdefault(ref, []).append(event["id"])
+                eid = event["id"]
+                record = records[eid]
+                if record["state"] in ("active", "ineligible"):
+                    for fp in action_history(record):
+                        event_index.setdefault((groups[eid], fp), []).append(eid)
+            for ids in event_index.values():
+                ids.sort(key=lambda eid: (records[eid]["state"] != "active", eid))
             candidates = []
             for item in self.outbox:
                 if not isinstance(item, dict):
                     continue
-                matches = []
                 incident = item.get("incident_id")
-                successor_ids = set(successors.get(incident, []))
-                old = self.records.get(incident, {})
-                if old.get("state") != "cancelled" and isinstance(
-                    old.get("lineage"), list
-                ):
-                    lineage = set(old["lineage"])
-                    successor_ids.update(
-                        event["id"]
-                        for event in events
-                        if lineage.intersection({event["id"], *event["references"]})
-                    )
-                for successor in successor_ids:
-                    candidate = {**item, "incident_id": successor}
+                if records.get(incident, {}).get("state") == "cancelled":
+                    continue
+                successors = event_index.get(
+                    (groups.get(incident), item.get("fingerprint")), []
+                )
+                if successors:
+                    successor = successors[0]
+                    candidate = {
+                        **item,
+                        "incident_id": successor,
+                        "source_url": successor,
+                    }
                     if pending_valid(
                         candidate, records, self.config, now, allow_suspended=True
                     ):
-                        matches.append(candidate)
-                if matches:
-                    item = sorted(
-                        matches,
-                        key=lambda x: (
-                            records[x["incident_id"]]["state"] != "active",
-                            x["incident_id"],
-                        ),
-                    )[0]
+                        item = candidate
                 candidates.append(item)
             outbox = (
                 [
@@ -135,12 +143,22 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 else []
             )
             if live(self.config):
-                existing = {x["key"] for x in outbox}
+
+                def signature(x):
+                    return (
+                        groups.get(x["incident_id"]),
+                        x["fingerprint"],
+                        x["kind"],
+                        x["target"],
+                        x["location"],
+                    )
+
+                existing = {signature(x) for x in outbox}
                 for plan in plans:
                     for item in targets(plan, self.config, now):
-                        if item["key"] not in existing:
+                        if signature(item) not in existing:
                             outbox.append(item)
-                            existing.add(item["key"])
+                            existing.add(signature(item))
             if len(outbox) > 5000:
                 raise ValueError("delivery outbox limit reached")
             await self._save(records, outbox, list(self.outcomes))
@@ -154,6 +172,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             by_id = {event["id"]: event for event in events}
             deadline = now + timedelta(seconds=30)
             for offset in range(0, len(batch), 10):
+                if self._stopping:
+                    break
                 current = datetime.now(timezone.utc)
                 if current >= deadline:
                     break
@@ -201,10 +221,32 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(
                 f"NWS collection or state persistence failed: {type(err).__name__}"
             ) from err
+        by_id = {event["id"]: event for event in events}
+        health_now = datetime.now(timezone.utc)
+        current_eligible = {
+            eid
+            for eid, event in by_id.items()
+            if records[eid]["state"] == "active"
+            and qualify(event, self.config, health_now)["qualifies"]
+        }
+        deliverable = sum(
+            item["incident_id"] in current_eligible
+            and pending_valid(item, self.records, self.config, health_now)
+            for item in self.outbox
+        )
+        quarantine_count = getattr(events, "quarantined", 0) + sum(
+            records[e["id"]]["state"] == "quarantined" for e in events
+        )
         return {
             "last_success": now.isoformat(),
             "event_count": len(events),
-            "active_count": sum(r["state"] == "active" for r in records.values()),
+            "source_feature_count": getattr(events, "source_count", len(events)),
+            "active_count": sum(records[e["id"]]["state"] == "active" for e in events),
+            "partial": bool(quarantine_count),
+            "quarantined_count": quarantine_count,
+            "quarantine_ambiguous": bool(
+                getattr(events, "quarantine_ambiguous", False)
+            ),
             "shadow": not live(self.config),
             "events": [
                 {
@@ -220,6 +262,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             ],
             "planned_count": len(plans),
             "pending_count": len(self.outbox),
+            "deliverable_count": deliverable,
+            "suspended_count": len(self.outbox) - deliverable,
             "delivery_attempts": attempts,
             "delivery_failures": failures,
         }
@@ -243,6 +287,7 @@ async def async_setup_entry(hass, entry):
 
 async def async_unload_entry(hass, entry):
     if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        await hass.data[DOMAIN][entry.entry_id].async_stop()
         hass.data[DOMAIN].pop(entry.entry_id, None)
         return True
     return False

@@ -54,7 +54,7 @@
       <section class="feed-panel" aria-labelledby="feed-heading">
         <div class="feed-header">
           <div><div class="eyebrow">SITUATION BRIEFING</div><h2 id="feed-heading">World &amp; national events</h2><p class="muted" id="feed-subtitle">Collected from your configured sources</p></div>
-          <div class="feed-meta"><span id="event-count">0 items</span><span class="meta-divider">·</span><span id="last-updated">Waiting for first collection</span><span class="meta-divider">·</span><a id="dashboard-link" class="dashboard-link" hidden>Open World Monitor ↗</a></div>
+          <div class="feed-meta"><span id="event-count">0 items</span><span class="meta-divider">·</span><span id="last-updated">Waiting for first collection</span><span class="meta-divider">·</span><a id="dashboard-link" class="dashboard-link" hidden>Open third-party context (non-authoritative) ↗</a></div>
         </div>
         <form class="filters" id="filter-form" role="search">
           <label class="search-box"><span class="sr-only">Search events</span><span aria-hidden="true">⌕</span><input id="search-input" type="search" placeholder="Search events, places, sources…" autocomplete="off"></label>
@@ -63,6 +63,7 @@
         </form>
         <div class="feed-legend"><span><i class="legend-dot dot-news"></i>News &amp; world</span><span><i class="legend-dot dot-weather"></i>Weather</span><span><i class="legend-dot dot-quake"></i>Earthquake</span><span class="read-only-note">Awareness feed · no automated alarm decisions</span></div>
         <div id="freshness-note" class="freshness-note" role="status" hidden></div>
+        <div id="retention-note" class="freshness-note" role="status" hidden></div>
         <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
         <div id="feed-state" class="feed-state" aria-live="polite"><span class="spinner" aria-hidden="true"></span><strong>Connecting to the local collector</strong><span>Event data will appear here after the first successful collection.</span></div>
         <ol id="event-list" class="event-list" aria-label="Events" hidden></ol>

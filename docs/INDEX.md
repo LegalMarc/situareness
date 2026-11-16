@@ -33,6 +33,7 @@ Start with the [project context](CONTEXT.md) and [continuation guide](plans/RESU
 - `docs/reference/primary-sources.md` — Verified official-channel references and access limitations for weather, earthquakes, NYC/DC, IPAWS, hurricanes, and space weather. anchors: weather-warnings-and-faster-transports, earthquakes, nyc-and-dc-local-authority-channels, national-all-hazards-coverage, preparation-and-national-impact-candidates, how-to-maintain-this-evidence
 
 ## docs/reports/
+- `docs/reports/REVIEW.md` — Immutable review candidates, reviewer metadata, separate findings by axis, and resolution status. anchors: candidates-and-reviewers, standards-findings-at-2c0f1e1, specification-findings-at-2c0f1e1, evidence-limits
 - `docs/reports/VALIDATION.md` — Public-candidate validation status, test evidence, review gates, and physical commissioning limits. anchors: current-status, automated-evidence, required-release-checks, limits
 
 ## docs/spec/

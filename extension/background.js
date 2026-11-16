@@ -3,6 +3,7 @@ import {
   collectSource,
   markExpired,
   retainEvents,
+  RETAIN_MS,
   sourceState,
 } from "./lib/collector.js";
 
@@ -72,23 +73,31 @@ async function initialize() {
       typeof e.collected_at === "string" &&
       (!nwsIds.has(e.source_id) || !legacyNwsIds.has(e.source_id)),
   );
+  const restoredSources = config.sources.map((s) =>
+    sourceState(
+      s,
+      legacyNwsIds.has(s.id)
+        ? null
+        : storedSources.find((p) => p && p.id === s.id && p.url === s.url),
+    ),
+  );
   const retained = retainEvents(
     markExpired(validEvents, new Date()),
     [],
     new Date(),
+    restoredSources,
   );
+  const priorLoss =
+    stored?.collector?.last_storage_loss_at ||
+    (stored?.collector?.storage_truncated === true
+      ? stored.collector.last_run_at || new Date().toISOString()
+      : null);
+  const priorLossMs = Date.parse(priorLoss || "");
   state = {
     schema_version: 1,
     config,
     events: retained.events,
-    sources: config.sources.map((s) =>
-      sourceState(
-        s,
-        legacyNwsIds.has(s.id)
-          ? null
-          : storedSources.find((p) => p && p.id === s.id && p.url === s.url),
-      ),
-    ),
+    sources: restoredSources,
     collector: {
       paused: stored?.collector?.paused === true,
       running: false,
@@ -100,11 +109,18 @@ async function initialize() {
         stored?.collector?.last_alarm_clock_at,
       )
         ? stored.collector.last_alarm_clock_at
-        : Number.isFinite(stored?.collector?.last_alarm_scheduled_at)
-          ? stored.collector.last_alarm_scheduled_at
-          : null,
-      storage_truncated:
-        stored?.collector?.storage_truncated === true || retained.dropped > 0,
+        : null,
+      last_non_alarm_clock_at: Number.isFinite(
+        stored?.collector?.last_non_alarm_clock_at,
+      )
+        ? stored.collector.last_non_alarm_clock_at
+        : null,
+      last_storage_loss_at:
+        retained.dropped > 0
+          ? new Date().toISOString()
+          : Number.isFinite(priorLossMs) && Date.now() - priorLossMs < RETAIN_MS
+            ? new Date(Math.min(priorLossMs, Date.now())).toISOString()
+            : null,
     },
     ha: { status: "not_connected" },
   };
@@ -144,9 +160,16 @@ async function parseRss(text) {
     throw new Error("Feed parsing failed.");
   return { items: response.items, items_available: response.items_available };
 }
-async function refresh(force, alarmClockAt = null) {
+async function refresh(force, alarmClockAt = null, scheduledTime = null) {
   await initialize();
   if (state.collector.paused) return state;
+  if (
+    Number.isFinite(scheduledTime) &&
+    state.collector.last_non_alarm_clock_at !== null &&
+    scheduledTime <= state.collector.last_non_alarm_clock_at
+  )
+    return state;
+  const nowMs = Date.now();
   // Count periodic alarm slots independently of request and storage latency. Chrome
   // may deliver early or late; the observed delivery clock catches up after sleep.
   if (Number.isFinite(alarmClockAt)) {
@@ -157,6 +180,14 @@ async function refresh(force, alarmClockAt = null) {
         : Math.max(1, Math.round((alarmClockAt - previous) / 60000));
     state.collector.alarm_tick += slots;
     state.collector.last_alarm_clock_at = alarmClockAt;
+  } else {
+    const previous = state.collector.last_alarm_clock_at;
+    if (previous !== null)
+      state.collector.alarm_tick += Math.max(
+        0,
+        Math.round((nowMs - previous) / 60000),
+      );
+    state.collector.last_alarm_clock_at = Math.max(nowMs, previous ?? nowMs);
   }
   const due = state.config.sources.filter((s) => {
     const previous = state.sources.find((p) => p.id === s.id);
@@ -164,6 +195,10 @@ async function refresh(force, alarmClockAt = null) {
       s.enabled &&
       (force ||
         previous?.last_alarm_tick == null ||
+        (!Number.isFinite(alarmClockAt) &&
+          (!Number.isFinite(Date.parse(previous?.last_attempt_at || "")) ||
+            nowMs - Date.parse(previous.last_attempt_at) >=
+              s.interval_minutes * 60000)) ||
         (Number.isFinite(alarmClockAt) &&
           state.collector.alarm_tick - previous.last_alarm_tick >=
             s.interval_minutes))
@@ -172,6 +207,15 @@ async function refresh(force, alarmClockAt = null) {
   if (!due.length) {
     if (Number.isFinite(alarmClockAt)) await persist();
     return state;
+  }
+  if (!Number.isFinite(alarmClockAt)) {
+    // Rephase the repeating alarm so a manual or startup fetch is followed by
+    // a full interval, rather than an immediately queued duplicate collection.
+    state.collector.last_non_alarm_clock_at = nowMs;
+    await chrome.alarms.create(ALARM, {
+      delayInMinutes: 1,
+      periodInMinutes: 1,
+    });
   }
   state.collector.running = true;
   await persist();
@@ -192,8 +236,7 @@ async function refresh(force, alarmClockAt = null) {
       );
     }
     for (const result of results) {
-      if (Number.isFinite(alarmClockAt))
-        result.source.last_alarm_tick = state.collector.alarm_tick;
+      result.source.last_alarm_tick = state.collector.alarm_tick;
       state.sources = state.sources.map((s) =>
         s.id === result.source.id ? result.source : s,
       );
@@ -202,9 +245,11 @@ async function refresh(force, alarmClockAt = null) {
       markExpired(state.events, new Date()),
       results,
       new Date(),
+      state.sources,
     );
     state.events = markExpired(retained.events, new Date());
-    state.collector.storage_truncated ||= retained.dropped > 0;
+    if (retained.dropped > 0)
+      state.collector.last_storage_loss_at = new Date().toISOString();
     state.collector.last_run_at = new Date().toISOString();
   } finally {
     state.collector.running = false;
@@ -228,8 +273,22 @@ async function openRoom() {
 }
 async function handle(message) {
   await initialize();
-  const updated = markExpired(state.events, new Date());
-  if (updated.some((event, index) => event !== state.events[index])) {
+  const lossAt = Date.parse(state.collector.last_storage_loss_at || "");
+  if (Number.isFinite(lossAt) && Date.now() - lossAt >= RETAIN_MS) {
+    state.collector.last_storage_loss_at = null;
+    await persist();
+  }
+  const now = new Date(Date.now());
+  const updated = retainEvents(
+    markExpired(state.events, now),
+    [],
+    now,
+    state.sources,
+  ).events;
+  if (
+    updated.length !== state.events.length ||
+    updated.some((event, index) => event !== state.events[index])
+  ) {
     state.events = updated;
     await persist();
   }
@@ -275,6 +334,7 @@ async function handle(message) {
           keep.has(s.id) ? state.sources.find((p) => p.id === s.id) : null,
         ),
       );
+      if (keep.size === 0) state.collector.last_storage_loss_at = null;
       state.config = config;
       await persist();
       return { ok: true, state };
@@ -323,7 +383,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM && !alarmPending) {
     alarmPending = true;
     const alarmClockAt = Math.max(alarm.scheduledTime, Date.now());
-    void exclusive(() => refresh(false, alarmClockAt))
+    void exclusive(() => refresh(false, alarmClockAt, alarm.scheduledTime))
       .catch(() => {})
       .finally(() => {
         alarmPending = false;

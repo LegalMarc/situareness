@@ -60,7 +60,9 @@ export function publicConfig(config) {
       Object.hasOwn(input.room || {}, "primary_dashboard")
         ? {
             context_dashboard: safeHttpUrl(
-              input.room.context_dashboard ?? input.room.primary_dashboard,
+              Object.hasOwn(input.room, "context_dashboard")
+                ? input.room.context_dashboard
+                : input.room.primary_dashboard,
             ),
           }
         : {}),
@@ -215,7 +217,12 @@ export function eventTimestamp(event) {
     : { timestamp: 0, value: null, label: "Time unknown" };
 }
 
-export function nwsAwarenessLifecycle(event, now = Date.now(), sources = []) {
+export function nwsAwarenessLifecycle(
+  event,
+  now = Date.now(),
+  sources = [],
+  sourceStates = null,
+) {
   const sourceIsWeather =
     Array.isArray(sources) &&
     sources.some(
@@ -233,7 +240,23 @@ export function nwsAwarenessLifecycle(event, now = Date.now(), sources = []) {
   if (event.awareness_lifecycle === "expired") return "expired";
   if (event.awareness_lifecycle === "not_in_latest_fetch")
     return "not_in_latest_fetch";
-  if (event.awareness_lifecycle === "current") return "current";
+  if (event.awareness_lifecycle === "current") {
+    if (sourceStates) {
+      const state = sourceStates.find(
+        (source) => source.id === event.source_id,
+      );
+      const config = sources.find((source) => source.id === event.source_id);
+      if (
+        !state ||
+        sourceFreshness(
+          { ...state, interval_minutes: config?.interval_minutes },
+          now,
+        ) !== "ok"
+      )
+        return "cached";
+    }
+    return "current";
+  }
   return "unknown";
 }
 

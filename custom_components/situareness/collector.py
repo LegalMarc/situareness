@@ -3,14 +3,39 @@
 import asyncio
 import json
 from urllib.parse import urlencode, urlparse
-from .domain import normalize, safe_url
+from .domain import OversizedFeature, normalize, safe_url
 
 MAX_BYTES = 8 * 1024 * 1024
 MAX_PAGES = 10
 
 
+class CollectedEvents(list):
+    """Successful paginated fetch with a count of quarantined features."""
+
+    def __init__(
+        self,
+        events,
+        quarantined,
+        quarantined_lineages,
+        quarantine_ambiguous,
+        source_count=None,
+    ):
+        super().__init__(events)
+        self.quarantined = quarantined
+        self.quarantined_lineages = quarantined_lineages
+        self.quarantine_ambiguous = quarantine_ambiguous
+        self.source_count = (
+            source_count if source_count is not None else len(events) + quarantined
+        )
+
+
 async def fetch(session, states):
     events = {}
+    quarantined = 0
+    quarantined_lineages = []
+    quarantine_refs = 0
+    quarantine_ambiguous = False
+    feature_count = 0
     url = "https://api.weather.gov/alerts/active?" + urlencode(
         {"area": ",".join(states)}
     )
@@ -48,7 +73,27 @@ async def fetch(session, states):
         ):
             raise ValueError("invalid NWS response")
         for feature in payload["features"]:
-            event = normalize(feature)
+            feature_count += 1
+            if feature_count > 1000:
+                raise ValueError("NWS event limit reached")
+            try:
+                event = normalize(feature)
+            except OversizedFeature:
+                quarantined += 1
+                refs = feature["properties"].get("references", [])
+                ids = [feature["id"]]
+                for ref in refs:
+                    if isinstance(ref, dict) and isinstance(ref.get("@id"), str):
+                        if len(ref["@id"]) > 512:
+                            quarantine_ambiguous = True
+                        elif safe_url(ref["@id"]):
+                            if quarantine_refs >= 5000:
+                                quarantine_ambiguous = True
+                                break
+                            ids.append(ref["@id"])
+                            quarantine_refs += 1
+                quarantined_lineages.append(ids)
+                continue
             if event is None:
                 raise ValueError("invalid NWS feature")
             events[event["id"]] = event
@@ -65,4 +110,10 @@ async def fetch(session, states):
     else:
         raise ValueError("NWS pagination limit reached")
     superseded = {ref for event in events.values() for ref in event["references"]}
-    return [event for eid, event in events.items() if eid not in superseded]
+    return CollectedEvents(
+        [event for eid, event in events.items() if eid not in superseded],
+        quarantined,
+        quarantined_lineages,
+        quarantine_ambiguous,
+        feature_count,
+    )

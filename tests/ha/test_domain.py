@@ -1,5 +1,5 @@
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib
 from pathlib import Path
 import sys
@@ -75,7 +75,8 @@ class Policy(unittest.TestCase):
         self.assertIsNone(d.normalize(bad))
         bad = feature()
         bad["properties"]["references"] = [{"@id": feature()["id"]}] * 101
-        self.assertIsNone(d.normalize(bad))
+        with self.assertRaises(d.OversizedFeature):
+            d.normalize(bad)
 
     def test_positive_and_boundary(self):
         e = d.normalize(feature())
@@ -239,7 +240,10 @@ class Policy(unittest.TestCase):
                     previous, _ = d.reconcile({}, [a], config(), NOW)
                     records, plans = d.reconcile(previous, siblings, config(), NOW)
                     self.assertFalse(plans)
-                    self.assertEqual(records[b["id"]]["state"], "active")
+                    self.assertEqual(
+                        records[b["id"]]["state"],
+                        "cancelled" if cancelled else "active",
+                    )
                     # A first-observed pair with the same qualifying action plans once.
                     c = copy.deepcopy(b)
                     c["id"] = a["id"] + "-c"
@@ -290,12 +294,129 @@ class Policy(unittest.TestCase):
         e = d.normalize(feature())
         e["references"] = [str(i) for i in range(101)]
         records = {
-            str(i): {"state": "ineligible", "actions": {str(i): ["new_york_ny"]}}
+            str(i): {
+                "state": "ineligible",
+                "updated": NOW.isoformat(),
+                "actions": {str(i): ["new_york_ny"]},
+            }
             for i in range(101)
         }
         e["geometry"] = None
-        with self.assertRaises(ValueError):
-            d.reconcile(records, [e], config(), NOW)
+        result, plans = d.reconcile(records, [e], config(), NOW)
+        self.assertEqual(result[e["id"]]["state"], "quarantined")
+        self.assertFalse(plans)
+
+    def test_root_reference_and_reversion_use_current_action(self):
+        a = d.normalize(feature())
+        records, _ = d.reconcile({}, [a], config(), NOW)
+        b = copy.deepcopy(a)
+        b.update(id=a["id"] + "-b", references=[a["id"]])
+        records, plans = d.reconcile(records, [b], config(), NOW)
+        self.assertFalse(plans)
+        c = copy.deepcopy(a)
+        c.update(id=a["id"] + "-c", references=[a["id"]])
+        records, plans = d.reconcile(records, [c], config(), NOW)
+        self.assertFalse(plans)
+        changed = copy.deepcopy(c)
+        changed.update(id=a["id"] + "-d", instruction="Take shelter in the basement.")
+        records, plans = d.reconcile(records, [changed], config(), NOW)
+        self.assertEqual(len(plans), 1)
+        reverted = copy.deepcopy(a)
+        reverted.update(id=a["id"] + "-e", references=[a["id"]])
+        _, plans = d.reconcile(records, [reverted], config(), NOW)
+        self.assertEqual(len(plans), 1)
+
+    def test_inactive_window_and_changed_unqualified_instruction(self):
+        a = d.normalize(feature())
+        for loss in ("geometry", "urgency", "absent"):
+            for minutes, expected in ((14, 0), (16, 1)):
+                with self.subTest(loss=loss, minutes=minutes):
+                    records, _ = d.reconcile({}, [a], config(), NOW)
+                    b = copy.deepcopy(a)
+                    b.update(id=a["id"] + "-b", references=[a["id"]])
+                    if loss == "geometry":
+                        b["geometry"] = None
+                    elif loss == "urgency":
+                        b["urgency"] = "Future"
+                    records, _ = d.reconcile(
+                        records, [] if loss == "absent" else [b], config(), NOW
+                    )
+                    update = copy.deepcopy(a)
+                    update.update(
+                        id=a["id"] + "-c",
+                        references=[a["id"] if loss == "absent" else b["id"]],
+                    )
+                    _, plans = d.reconcile(
+                        records, [update], config(), NOW + timedelta(minutes=minutes)
+                    )
+                    self.assertEqual(len(plans), expected)
+        records, _ = d.reconcile({}, [a], config(), NOW)
+        b = copy.deepcopy(a)
+        b.update(
+            id=a["id"] + "-b",
+            references=[a["id"]],
+            instruction="No protective action needed.",
+        )
+        records, _ = d.reconcile(records, [b], config(), NOW)
+        self.assertFalse(records[b["id"]]["actions"])
+
+    def test_ancestor_cancellation_blocks_stale_reappearance_and_allows_explicit_renewal(
+        self,
+    ):
+        a = d.normalize(feature())
+        records, _ = d.reconcile({}, [a], config(), NOW)
+        b = copy.deepcopy(a)
+        b.update(id=a["id"] + "-b", references=[a["id"]])
+        records, _ = d.reconcile(records, [b], config(), NOW)
+        cancel = copy.deepcopy(a)
+        cancel.update(
+            id=a["id"] + "-cancel", references=[a["id"]], message_type="Cancel"
+        )
+        records, _ = d.reconcile(records, [cancel], config(), NOW)
+        self.assertEqual(records[b["id"]]["state"], "cancelled")
+        records, plans = d.reconcile(records, [b], config(), NOW)
+        self.assertFalse(plans)
+        self.assertEqual(records[b["id"]]["state"], "cancelled")
+        renewal = copy.deepcopy(a)
+        renewal.update(id=a["id"] + "-renewal", references=[cancel["id"]])
+        records, plans = d.reconcile(records, [renewal], config(), NOW)
+        self.assertEqual(len(plans), 1)
+        successor = copy.deepcopy(renewal)
+        successor.update(id=a["id"] + "-next", references=[renewal["id"]])
+        _, plans = d.reconcile(records, [successor], config(), NOW)
+        self.assertFalse(plans)
+
+    def test_partial_quarantine_preserves_unrelated_history_and_processes_fresh_alerts(
+        self,
+    ):
+        a = d.normalize(feature())
+        records, _ = d.reconcile({}, [a], config(), NOW)
+        unrelated = copy.deepcopy(a)
+        unrelated["id"] += "-unrelated"
+        records, plans = d.reconcile(
+            records,
+            [unrelated],
+            config(),
+            NOW,
+            partial=True,
+            quarantine_lineages=[[a["id"] + "-oversize", a["id"]]],
+        )
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(records[a["id"]]["state"], "quarantined")
+        self.assertTrue(records[a["id"]]["actions"])
+        self.assertEqual(records[unrelated["id"]]["state"], "active")
+        returned, plans = d.reconcile(
+            records, [a, unrelated], config(), NOW + timedelta(minutes=1)
+        )
+        self.assertFalse(plans)
+        self.assertEqual(returned[a["id"]]["state"], "active")
+
+        other = copy.deepcopy(a)
+        other["id"] += "-previous"
+        prior, _ = d.reconcile({}, [other], config(), NOW)
+        result, _ = d.reconcile(prior, [unrelated], config(), NOW, partial=True)
+        self.assertEqual(result[other["id"]]["state"], "unconfirmed")
+        self.assertTrue(result[other["id"]]["actions"])
 
     def test_antimeridian_fails_closed(self):
         g = {
@@ -512,6 +633,39 @@ class Session:
 
 
 class Collector(unittest.IsolatedAsyncioTestCase):
+    async def test_oversized_feature_is_quarantined_without_losing_other_alerts(self):
+        import json
+
+        bad = feature()
+        bad["id"] += "-oversize"
+        bad["properties"]["references"] = [{"@id": feature()["id"]}] * 101
+        body = {"type": "FeatureCollection", "features": [bad, feature()]}
+        events = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertEqual((len(events), events.quarantined), (1, 1))
+        self.assertIn(feature()["id"], events.quarantined_lineages[0])
+        self.assertFalse(events.quarantine_ambiguous)
+        bad["properties"]["references"] = [
+            {"@id": "https://api.weather.gov/alerts/" + "a" * 513}
+        ]
+        body["features"] = [bad, feature()]
+        events = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertTrue(events.quarantine_ambiguous)
+        bad["properties"]["references"] = [
+            {"@id": f"https://api.weather.gov/alerts/{i}"} for i in range(5001)
+        ]
+        events = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertTrue(events.quarantine_ambiguous)
+        self.assertLessEqual(len(events.quarantined_lineages[0]), 5001)
+        body["features"] = [feature()] * 1001
+        with self.assertRaises(ValueError):
+            await collector.fetch(Session(Response(json.dumps(body).encode())), ["NY"])
+
     async def test_fetch_and_failures(self):
         import json
 
