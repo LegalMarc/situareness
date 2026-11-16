@@ -100,6 +100,8 @@ def validate(data):
             fail("source: invalid role, access_status or runtime_support")
         if type(src["enabled"]) is not bool:
             fail("source.enabled: expected boolean")
+        if (src["role"] == "authorized_distributor" or src["enabled"]) and src["authority_evidence_url"] is None:
+            fail("distributor or enabled source requires authority evidence URL")
         if src["enabled"] and (src["runtime_support"] != "supported" or src["access_status"] != "public_api/feed" or src["endpoint_url"] is None or src["checked_at"] is None or not src["evidence_urls"]):
             fail("enabled source requires supported runtime, verified public endpoint and evidence")
         date = src["checked_at"]

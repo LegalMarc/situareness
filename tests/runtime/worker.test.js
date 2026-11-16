@@ -212,3 +212,105 @@ test("restart ignores corrupt storage entries and derives expiry from the clock"
   assert.equal(restored.state.events[0].awareness_lifecycle, "expired");
   assert.equal(restored.state.sources[0].status, "idle");
 });
+
+test("alarm slots preserve one-minute cadence despite early ticks and delayed persistence", async () => {
+  persisted.situareness_state_v1 = {
+    config: structuredClone(defaults),
+    sources: [],
+    events: [],
+    collector: { paused: false },
+  };
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    if (url.startsWith("chrome-extension:"))
+      return new Response(JSON.stringify(defaults));
+    requests.push(url);
+    return new Response(
+      url.includes("bbci.co.uk")
+        ? "<rss></rss>"
+        : JSON.stringify({ features: [] }),
+    );
+  };
+  const storageSet = chrome.storage.local.set;
+  const originalNow = Date.now;
+  chrome.storage.local.set = async (value) => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await storageSet(value);
+  };
+  try {
+    await import("../../extension/background.js?cadence");
+    await send({ type: "GET_STATE" });
+    const tick = async (scheduledTime) => {
+      listeners.alarm({ name: "situareness_collect", scheduledTime });
+      await send({ type: "GET_STATE" });
+    };
+    const base = Date.now();
+    await tick(base);
+    await tick(base + 59_997);
+    assert.equal(
+      requests.filter((url) => url.includes("weather.gov")).length,
+      2,
+    );
+    assert.equal(
+      requests.filter((url) => url.includes("earthquake.usgs.gov")).length,
+      2,
+    );
+    assert.equal(
+      requests.filter((url) => url.includes("bbci.co.uk")).length,
+      2,
+    );
+    await tick(base + 119_998);
+    await tick(base + 179_999);
+    await tick(base + 239_998);
+    await tick(base + 299_997);
+    assert.equal(
+      requests.filter((url) => url.includes("weather.gov")).length,
+      6,
+    );
+    assert.equal(
+      requests.filter((url) => url.includes("bbci.co.uk")).length,
+      4,
+    );
+    // Chrome may report the original scheduled time after a long sleep.
+    Date.now = () => base + 30 * 60_000;
+    await tick(base + 359_997);
+    assert.equal(
+      requests.filter((url) => url.includes("weather.gov")).length,
+      7,
+    );
+    assert.equal(
+      requests.filter((url) => url.includes("bbci.co.uk")).length,
+      6,
+    );
+    // An immediate subsequent tick must not repeat the five-minute fetch.
+    await tick(base + 419_997);
+    assert.equal(
+      requests.filter((url) => url.includes("weather.gov")).length,
+      8,
+    );
+    assert.equal(
+      requests.filter((url) => url.includes("bbci.co.uk")).length,
+      6,
+    );
+    // Repeated callbacks while a cycle is in progress are coalesced.
+    for (const offset of [479_997, 539_997, 599_997]) {
+      listeners.alarm({
+        name: "situareness_collect",
+        scheduledTime: base + offset,
+      });
+    }
+    await send({ type: "GET_STATE" });
+    assert.equal(
+      requests.filter((url) => url.includes("weather.gov")).length,
+      9,
+    );
+    assert.equal(
+      requests.filter((url) => url.includes("bbci.co.uk")).length,
+      6,
+    );
+  } finally {
+    chrome.storage.local.set = storageSet;
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});

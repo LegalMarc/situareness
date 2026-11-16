@@ -26,6 +26,10 @@ The room reads NWS alerts, USGS `all_hour` earthquakes, BBC World and BBC US & C
 
 Source status, collection and source timestamps, errors, stale state and truncation indicate what was retrieved. Cached results survive a failed fetch. An empty view or absence from a bounded fetch is not an all-clear or proof of cancellation. Source links provide further context. `config/source-catalog.example.json` is a research catalog, not an input to these collectors. See [the primary-source roadmap](plans/primary-source-roadmap.md).
 
+Current NWS items take retention priority over historical news and earthquake items. The room still bounds its stored collection to 500 events. A global-cap warning persists across restarts after items have been omitted, because later successful fetches cannot reconstruct all omitted history. Per-provider truncation is reported separately. Source fetch counts describe retrieved items and can exceed retained history.
+
+The optional **World Monitor** link opens a separate third-party context dashboard. It is not an issuing authority, a source of automatic household alarms, or a claim of verified latency. The display-link setting is `room.context_dashboard`; older imports using `primary_dashboard` are normalized to this name. Set it to `null` to hide the link.
+
 ## Develop and verify
 
 With Node 22.19 or newer and Python 3.11 or newer:

@@ -242,7 +242,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(services.calls), 2)
             self.assertEqual(store.snapshot["outbox"], [])
 
-            # A failed delivery is discarded if a subsequent complete poll no longer includes the alert.
+            # A transient absence suspends, rather than sends or discards, a retry.
             store = DurableStore()
             services = Flaky()
             hass = types.SimpleNamespace(services=services)
@@ -258,7 +258,142 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
                 await restarted._async_update_data()
             self.assertEqual(len(services.calls), 1)
-            self.assertEqual(store.snapshot["outbox"], [])
+            self.assertEqual(len(store.snapshot["outbox"]), 1)
+            restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
+            data = await restarted._async_update_data()
+            self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+            self.assertEqual(len(services.calls), 2)
+
+            # A failed target follows the eligible sibling, regardless of order.
+            for reverse in (False, True):
+                store = DurableStore()
+                services = Flaky()
+                hass = types.SimpleNamespace(services=services)
+                first = mod.SituarenessCoordinator(hass, cfg, store, {})
+                await first._async_update_data()
+                b = copy.deepcopy(e)
+                b.update(id=e["id"] + "-b", references=[e["id"]])
+                c = copy.deepcopy(b)
+                c.update(id=e["id"] + "-c", geometry=None)
+
+                async def siblings(*args):
+                    return [b, c][:: -1 if reverse else 1]
+
+                services.fail = False
+                restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
+                with patch.object(mod, "fetch", siblings):
+                    data = await restarted._async_update_data()
+                self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+                self.assertEqual(len(services.calls), 2)
+
+            # If two equivalent siblings are first seen together, a retry can
+            # follow the remaining sibling even though neither references the other.
+            store = DurableStore()
+            services = Flaky()
+            hass = types.SimpleNamespace(services=services)
+            b = copy.deepcopy(e)
+            b.update(id=e["id"] + "-b", references=[e["id"]])
+            c = copy.deepcopy(b)
+            c["id"] = e["id"] + "-c"
+
+            async def both(*args):
+                return [b, c]
+
+            first = mod.SituarenessCoordinator(hass, cfg, store, {})
+            with patch.object(mod, "fetch", both):
+                data = await first._async_update_data()
+            self.assertEqual((data["planned_count"], data["pending_count"]), (1, 1))
+
+            async def just_c(*args):
+                return [c]
+
+            services.fail = False
+            restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
+            with patch.object(mod, "fetch", just_c):
+                data = await restarted._async_update_data()
+            self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+            self.assertEqual(len(services.calls), 2)
+
+            # A temporarily ineligible merge retains pending work for both
+            # distinct qualifying predecessor actions, in either reference order.
+            for reverse in (False, True):
+                store = DurableStore()
+                services = Flaky()
+                hass = types.SimpleNamespace(services=services)
+                b = copy.deepcopy(e)
+                b.update(id=e["id"] + "-b", references=[e["id"]])
+                c = copy.deepcopy(b)
+                c.update(id=e["id"] + "-c", instruction="Take shelter in the basement.")
+                first = mod.SituarenessCoordinator(hass, cfg, store, {})
+                with patch.object(mod, "fetch", both):
+                    data = await first._async_update_data()
+                self.assertEqual((data["planned_count"], data["pending_count"]), (2, 2))
+                merged = copy.deepcopy(b)
+                refs = [b["id"], c["id"]]
+                merged.update(
+                    id=e["id"] + "-merge",
+                    references=refs[::-1] if reverse else refs,
+                    expires=(now - timedelta(minutes=1)).isoformat(),
+                )
+
+                async def merge(*args):
+                    return [merged]
+
+                services.fail = False
+                restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
+                with patch.object(mod, "fetch", merge):
+                    data = await restarted._async_update_data()
+                    self.assertEqual(
+                        (data["planned_count"], data["pending_count"]), (0, 2)
+                    )
+                    merged["expires"] = (now + timedelta(minutes=30)).isoformat()
+                    data = await restarted._async_update_data()
+                self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+                self.assertEqual(len(services.calls), 3)
+
+            # An ineligible update suspends the target until a current update qualifies.
+            store = DurableStore()
+            services = Flaky()
+            hass = types.SimpleNamespace(services=services)
+            first = mod.SituarenessCoordinator(hass, cfg, store, {})
+            await first._async_update_data()
+            b = copy.deepcopy(e)
+            b.update(
+                id=e["id"] + "-b",
+                references=[e["id"]],
+                expires=(now - timedelta(minutes=1)).isoformat(),
+            )
+
+            async def update(*args):
+                return [b]
+
+            services.fail = False
+            restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
+            with patch.object(mod, "fetch", update):
+                data = await restarted._async_update_data()
+                self.assertEqual((data["planned_count"], data["pending_count"]), (0, 1))
+                self.assertEqual(len(services.calls), 1)
+                b["expires"] = (now + timedelta(minutes=30)).isoformat()
+                data = await restarted._async_update_data()
+            self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+            self.assertEqual(len(services.calls), 2)
+
+            # An explicit cancellation removes pending work without sending it.
+            store = DurableStore()
+            services = Flaky()
+            hass = types.SimpleNamespace(services=services)
+            first = mod.SituarenessCoordinator(hass, cfg, store, {})
+            await first._async_update_data()
+            b = copy.deepcopy(e)
+            b.update(
+                id=e["id"] + "-cancel", references=[e["id"]], message_type="Cancel"
+            )
+            services.fail = False
+            restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
+            with patch.object(mod, "fetch", update):
+                data = await restarted._async_update_data()
+            self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+            self.assertEqual(len(services.calls), 1)
 
     async def test_new_hazard_after_restart_is_not_baselined(self):
         from datetime import datetime, timezone, timedelta
@@ -304,7 +439,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             await restarted._async_update_data()
         self.assertEqual(len(services.calls), 1)
 
-    async def test_clock_advance_drops_expired_before_next_group(self):
+    async def test_clock_advance_suspends_expired_before_next_group(self):
         from datetime import datetime, timedelta, timezone
 
         path = (
@@ -359,4 +494,4 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         with patch.object(mod, "fetch", fetch), patch.object(mod, "datetime", Clock):
             result = await coordinator._async_update_data()
         self.assertEqual(len(services.calls), 10)
-        self.assertEqual(result["pending_count"], 0)
+        self.assertEqual(result["pending_count"], 1)

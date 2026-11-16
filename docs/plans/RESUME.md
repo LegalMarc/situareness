@@ -4,6 +4,8 @@
 
 The project contains a Chrome room, an independent Home Assistant NWS integration, public NYC/DC examples, tests, packaging, and a source-research skill. HA defaults to shadow with both output gates false; public examples contain no private footprint, rules, or recipients. The room is not connected to HA health. Do not infer household deployment, real device delivery, or successful commissioning from local tests. Consult [validation](../reports/VALIDATION.md) for evidence rather than assuming a review or test was completed.
 
+Review-driven repairs cover CAP sibling/update lineage, suspended retries, browser alarm cadence after sleep, active-alert retention, disabled-source health, missing-source settings, recorder exclusions, private-store removal, runtime translations, and source endorsement evidence. Local checks pass; independent re-review and a fresh adversarial pass are the current release gates. See the validation report before treating this checkpoint as reviewed.
+
 ## Read first
 
 Read [the index](../INDEX.md), [context](../CONTEXT.md), [the current contract](../spec/o3-mvp.md), [the HA guide](../ha/README.md), and [the primary-source roadmap](primary-source-roadmap.md). The catalog at `config/source-catalog.example.json` is research data, not a runtime input. The local [source skill](../../skills/situareness-sources/SKILL.md) describes catalog research and supported configuration changes.

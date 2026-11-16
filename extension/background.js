@@ -2,7 +2,7 @@ import { safeUrl, validateConfig } from "./lib/config.js";
 import {
   collectSource,
   markExpired,
-  mergeEvents,
+  retainEvents,
   sourceState,
 } from "./lib/collector.js";
 
@@ -25,6 +25,7 @@ function isRoomUrl(value) {
 let state;
 let queue = Promise.resolve();
 let offscreenCreating;
+let alarmPending = false;
 
 function exclusive(task) {
   const result = queue.then(task);
@@ -61,22 +62,25 @@ async function initialize() {
       )
       .map((e) => e.source_id),
   );
-  const validEvents = storedEvents
-    .filter(
-      (e) =>
-        e &&
-        typeof e === "object" &&
-        !Array.isArray(e) &&
-        typeof e.id === "string" &&
-        typeof e.source_id === "string" &&
-        typeof e.collected_at === "string" &&
-        (!nwsIds.has(e.source_id) || !legacyNwsIds.has(e.source_id)),
-    )
-    .slice(0, 500);
+  const validEvents = storedEvents.filter(
+    (e) =>
+      e &&
+      typeof e === "object" &&
+      !Array.isArray(e) &&
+      typeof e.id === "string" &&
+      typeof e.source_id === "string" &&
+      typeof e.collected_at === "string" &&
+      (!nwsIds.has(e.source_id) || !legacyNwsIds.has(e.source_id)),
+  );
+  const retained = retainEvents(
+    markExpired(validEvents, new Date()),
+    [],
+    new Date(),
+  );
   state = {
     schema_version: 1,
     config,
-    events: markExpired(validEvents, new Date()),
+    events: retained.events,
     sources: config.sources.map((s) =>
       sourceState(
         s,
@@ -89,6 +93,18 @@ async function initialize() {
       paused: stored?.collector?.paused === true,
       running: false,
       last_run_at: stored?.collector?.last_run_at || null,
+      alarm_tick: Number.isSafeInteger(stored?.collector?.alarm_tick)
+        ? stored.collector.alarm_tick
+        : 0,
+      last_alarm_clock_at: Number.isFinite(
+        stored?.collector?.last_alarm_clock_at,
+      )
+        ? stored.collector.last_alarm_clock_at
+        : Number.isFinite(stored?.collector?.last_alarm_scheduled_at)
+          ? stored.collector.last_alarm_scheduled_at
+          : null,
+      storage_truncated:
+        stored?.collector?.storage_truncated === true || retained.dropped > 0,
     },
     ha: { status: "not_connected" },
   };
@@ -128,21 +144,35 @@ async function parseRss(text) {
     throw new Error("Feed parsing failed.");
   return { items: response.items, items_available: response.items_available };
 }
-async function refresh(force) {
+async function refresh(force, alarmClockAt = null) {
   await initialize();
   if (state.collector.paused) return state;
-  const now = new Date();
+  // Count periodic alarm slots independently of request and storage latency. Chrome
+  // may deliver early or late; the observed delivery clock catches up after sleep.
+  if (Number.isFinite(alarmClockAt)) {
+    const previous = state.collector.last_alarm_clock_at;
+    const slots =
+      previous === null
+        ? 1
+        : Math.max(1, Math.round((alarmClockAt - previous) / 60000));
+    state.collector.alarm_tick += slots;
+    state.collector.last_alarm_clock_at = alarmClockAt;
+  }
   const due = state.config.sources.filter((s) => {
     const previous = state.sources.find((p) => p.id === s.id);
     return (
       s.enabled &&
       (force ||
-        !previous?.last_attempt_at ||
-        now.getTime() - Date.parse(previous.last_attempt_at) >=
-          s.interval_minutes * 60000)
+        previous?.last_alarm_tick == null ||
+        (Number.isFinite(alarmClockAt) &&
+          state.collector.alarm_tick - previous.last_alarm_tick >=
+            s.interval_minutes))
     );
   });
-  if (!due.length) return state;
+  if (!due.length) {
+    if (Number.isFinite(alarmClockAt)) await persist();
+    return state;
+  }
   state.collector.running = true;
   await persist();
   try {
@@ -161,14 +191,20 @@ async function refresh(force) {
         )),
       );
     }
-    for (const result of results)
+    for (const result of results) {
+      if (Number.isFinite(alarmClockAt))
+        result.source.last_alarm_tick = state.collector.alarm_tick;
       state.sources = state.sources.map((s) =>
         s.id === result.source.id ? result.source : s,
       );
-    state.events = markExpired(
-      mergeEvents(state.events, results, new Date()),
+    }
+    const retained = retainEvents(
+      markExpired(state.events, new Date()),
+      results,
       new Date(),
     );
+    state.events = markExpired(retained.events, new Date());
+    state.collector.storage_truncated ||= retained.dropped > 0;
     state.collector.last_run_at = new Date().toISOString();
   } finally {
     state.collector.running = false;
@@ -181,7 +217,8 @@ async function openRoom() {
     contextTypes: ["TAB"],
   });
   const roomContext = contexts.find(
-    (context) => Number.isInteger(context.tabId) && isRoomUrl(context.documentUrl),
+    (context) =>
+      Number.isInteger(context.tabId) && isRoomUrl(context.documentUrl),
   );
   if (roomContext) {
     await chrome.tabs.update(roomContext.tabId, { active: true });
@@ -283,8 +320,15 @@ chrome.action.onClicked.addListener(() => {
   }).catch(() => {});
 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ALARM)
-    void exclusive(() => refresh(false)).catch(() => {});
+  if (alarm.name === ALARM && !alarmPending) {
+    alarmPending = true;
+    const alarmClockAt = Math.max(alarm.scheduledTime, Date.now());
+    void exclusive(() => refresh(false, alarmClockAt))
+      .catch(() => {})
+      .finally(() => {
+        alarmPending = false;
+      });
+  }
 });
 chrome.runtime.onInstalled.addListener(() => {
   void exclusive(async () => {

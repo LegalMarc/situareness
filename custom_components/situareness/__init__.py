@@ -89,21 +89,48 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 activate=live(self.config) and not self.was_live,
             )
             # Carry an undelivered item through equivalent NWS update identifiers.
-            successors = {
-                ref: event["id"] for event in events for ref in event["references"]
-            }
+            successors = {}
+            for event in events:
+                for ref in event["references"]:
+                    successors.setdefault(ref, []).append(event["id"])
             candidates = []
             for item in self.outbox:
                 if not isinstance(item, dict):
                     continue
-                successor = successors.get(item.get("incident_id"))
-                if successor and records.get(successor, {}).get(
-                    "fingerprint"
-                ) == item.get("fingerprint"):
-                    item = {**item, "incident_id": successor}
+                matches = []
+                incident = item.get("incident_id")
+                successor_ids = set(successors.get(incident, []))
+                old = self.records.get(incident, {})
+                if old.get("state") != "cancelled" and isinstance(
+                    old.get("lineage"), list
+                ):
+                    lineage = set(old["lineage"])
+                    successor_ids.update(
+                        event["id"]
+                        for event in events
+                        if lineage.intersection({event["id"], *event["references"]})
+                    )
+                for successor in successor_ids:
+                    candidate = {**item, "incident_id": successor}
+                    if pending_valid(
+                        candidate, records, self.config, now, allow_suspended=True
+                    ):
+                        matches.append(candidate)
+                if matches:
+                    item = sorted(
+                        matches,
+                        key=lambda x: (
+                            records[x["incident_id"]]["state"] != "active",
+                            x["incident_id"],
+                        ),
+                    )[0]
                 candidates.append(item)
             outbox = (
-                [x for x in candidates if pending_valid(x, records, self.config, now)]
+                [
+                    x
+                    for x in candidates
+                    if pending_valid(x, records, self.config, now, allow_suspended=True)
+                ]
                 if live(self.config)
                 else []
             )
@@ -119,7 +146,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             await self._save(records, outbox, list(self.outcomes))
             attempts = failures = 0
             # Each completed attempt is persisted. A crash between service call and save may duplicate it.
-            batch = list(self.outbox)[:100]
+            batch = [
+                x
+                for x in self.outbox
+                if pending_valid(x, self.records, self.config, now)
+            ][:100]
             by_id = {event["id"]: event for event in events}
             deadline = now + timedelta(seconds=30)
             for offset in range(0, len(batch), 10):
@@ -135,7 +166,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         and qualify(event, self.config, current)["qualifies"]
                     ):
                         group.append(item)
-                    else:
+                    elif not pending_valid(
+                        item, self.records, self.config, current, allow_suspended=True
+                    ):
                         remaining = [x for x in self.outbox if x["key"] != item["key"]]
                         await self._save(self.records, remaining, self.outcomes)
                 results = await asyncio.gather(
@@ -213,3 +246,8 @@ async def async_unload_entry(hass, entry):
         hass.data[DOMAIN].pop(entry.entry_id, None)
         return True
     return False
+
+
+async def async_remove_entry(hass, entry):
+    """Delete the private journal when the integration entry is removed."""
+    await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()

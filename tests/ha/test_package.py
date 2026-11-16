@@ -62,6 +62,22 @@ class PackageTest(unittest.TestCase):
                             self.assertIn(
                                 "home-assistant/situareness.example.json", names
                             )
+                            self.assertIn(
+                                "custom_components/situareness/translations/en.json",
+                                names,
+                            )
+                            self.assertEqual(
+                                json.loads(
+                                    archive.read(
+                                        "custom_components/situareness/translations/en.json"
+                                    )
+                                ),
+                                json.loads(
+                                    archive.read(
+                                        "custom_components/situareness/strings.json"
+                                    )
+                                ),
+                            )
             example = source / "home-assistant/situareness.example.json"
             value = json.loads(example.read_text())
             self.assertEqual(

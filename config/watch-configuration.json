@@ -4,7 +4,7 @@
   "live_actions_enabled": false,
   "room": {
     "browser": "Google Chrome",
-    "primary_dashboard": "https://www.worldmonitor.app/dashboard",
+    "context_dashboard": "https://www.worldmonitor.app/dashboard",
     "closing_room_stops_monitoring": false
   },
   "alarm_policy": {
@@ -33,13 +33,7 @@
       "horn_targets": [],
       "awareness_area": {
         "state": "NY",
-        "county_fips": [
-          "36005",
-          "36047",
-          "36061",
-          "36081",
-          "36085"
-        ]
+        "county_fips": ["36005", "36047", "36061", "36081", "36085"]
       }
     },
     {

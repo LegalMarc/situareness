@@ -34,6 +34,7 @@ HA_FILES = (
     "manifest.json",
     "sensor.py",
     "strings.json",
+    "translations/en.json",
 )
 
 

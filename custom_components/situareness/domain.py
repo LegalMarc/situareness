@@ -68,6 +68,11 @@ def normalize(feature):
         ):
             return None
     refs = p.get("references") if isinstance(p.get("references"), list) else []
+    if len(refs) > 100 or any(
+        isinstance(r, dict) and isinstance(r.get("@id"), str) and len(r["@id"]) > 512
+        for r in refs
+    ):
+        return None
     references = [
         r.get("@id") for r in refs if isinstance(r, dict) and safe_url(r.get("@id"))
     ]
@@ -227,33 +232,67 @@ def fingerprint(event, decision):
     ).hexdigest()
 
 
+def action_history(record):
+    """Return the last qualified action(s), including legacy journal records."""
+    if isinstance(record.get("actions"), dict):
+        return record["actions"]
+    action = record.get("action_fingerprint")
+    if not action and record.get("state") in ("active", "ended_or_absent"):
+        action = record.get("fingerprint")
+    return (
+        {action: record.get("action_affected", record.get("affected", []))}
+        if action
+        else {}
+    )
+
+
 def reconcile(previous, events, config, now, baseline=False, activate=False):
     """Return bounded incident journal and plans. Only complete successful polls call this."""
-    records = deepcopy(previous or {})
+    prior = deepcopy(previous or {})
+    records = deepcopy(prior)
     plans = []
     seen = set()
+    # Equivalent siblings can arrive together even when their parent was not
+    # previously observed. Group them by shared identifiers, independent of order.
+    groups = []
+    for event in events:
+        ids = {event["id"], *event.get("references", [])}
+        touching = [g for g in groups if g & ids]
+        for group in touching:
+            ids |= group
+            groups.remove(group)
+        groups.append(ids)
+    planned_in_poll = set()
+    referenced = {}
+    for event in events:
+        for ref in event.get("references", []):
+            if ref != event["id"]:
+                referenced.setdefault(ref, []).append(event)
     for event in events:
         eid = event["id"]
         decision = qualify(event, config, now)
         fp = fingerprint(event, decision)
-        # Compare against the current members of the referenced lineage before
-        # superseding them. Older references can remain in later CAP updates.
-        predecessors = [records.get(eid)] + [
-            records.get(ref) for ref in event.get("references", []) if ref != eid
+        predecessors = [prior.get(eid)] + [
+            prior.get(ref) for ref in event.get("references", []) if ref != eid
         ]
-        equivalent_active = any(
-            record
-            and record.get("state") == "active"
-            and record.get("fingerprint") == fp
-            for record in predecessors
-        )
-        for ref in event.get("references", []):
-            if ref in records and ref != eid:
-                records[ref] = {**records[ref], "state": "superseded"}
+        # Superseded ancestors must not override the latest changed action.
+        candidates = [
+            r
+            for r in predecessors
+            if r and r.get("state") not in ("superseded", "cancelled")
+        ]
+        actions = {}
+        for record in candidates:
+            actions.update(action_history(record))
+        if len(actions) > 100:
+            raise ValueError("incident action history limit reached")
+        group = next(i for i, ids in enumerate(groups) if eid in ids)
+        equivalent = fp in actions or (group, fp) in planned_in_poll
         if (
             decision["qualifies"]
             and not baseline
-            and (activate or not equivalent_active)
+            and (activate or not equivalent)
+            and (group, fp) not in planned_in_poll
         ):
             plans.append(
                 {
@@ -265,14 +304,37 @@ def reconcile(previous, events, config, now, baseline=False, activate=False):
                     "fingerprint": fp,
                 }
             )
+            planned_in_poll.add((group, fp))
+        cancelled = (
+            event.get("status") == "Actual" and event.get("message_type") == "Cancel"
+        )
+        if cancelled:
+            actions = {}
+        elif decision["qualifies"]:
+            actions = {fp: decision["affected"]}
         records[eid] = {
-            "state": "active" if decision["qualifies"] else "ineligible",
+            "state": "cancelled"
+            if cancelled
+            else "active"
+            if decision["qualifies"]
+            else "ineligible",
             "fingerprint": fp,
+            "actions": actions,
+            "lineage": sorted({eid, *event.get("references", [])}),
             "reasons": decision["reasons"],
             "affected": decision["affected"],
             "updated": now.isoformat(),
         }
         seen.add(eid)
+    for ref, successors in referenced.items():
+        if ref in records and ref not in seen:
+            cancelled = all(
+                e.get("status") == "Actual" and e.get("message_type") == "Cancel"
+                for e in successors
+            )
+            records[ref]["state"] = "cancelled" if cancelled else "superseded"
+            if cancelled:
+                records[ref]["actions"] = {}
     for eid, record in records.items():
         if eid not in seen and record.get("state") == "active":
             record["state"] = "ended_or_absent"

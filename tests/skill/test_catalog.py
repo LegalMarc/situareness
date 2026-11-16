@@ -47,6 +47,20 @@ class CatalogTests(unittest.TestCase):
         src["runtime_support"] = "supported"
         catalog.validate(self.data)
 
+    def test_distributor_and_enabled_source_require_authority_url(self):
+        src = self.data["sources"][0]
+        src.update(role="authorized_distributor", enabled=False, authority_evidence_url=None)
+        with self.assertRaises(ValueError):
+            catalog.validate(self.data)
+        src.update(role="originator", enabled=True, authority_evidence_url=None)
+        with self.assertRaises(ValueError):
+            catalog.validate(self.data)
+        src.update(role="authorized_distributor", enabled=True,
+                   authority_evidence_url="https://example.org/authority")
+        catalog.validate(self.data)
+        src["enabled"] = False
+        catalog.validate(self.data)
+
     def test_bad_dates_and_intervals(self):
         src = self.data["sources"][0]
         src["checked_at"] = "2026-02-30"

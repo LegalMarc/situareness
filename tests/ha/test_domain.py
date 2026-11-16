@@ -73,6 +73,9 @@ class Policy(unittest.TestCase):
         bad = feature()
         bad["id"] = "https://evil.test/alerts/123"
         self.assertIsNone(d.normalize(bad))
+        bad = feature()
+        bad["properties"]["references"] = [{"@id": feature()["id"]}] * 101
+        self.assertIsNone(d.normalize(bad))
 
     def test_positive_and_boundary(self):
         e = d.normalize(feature())
@@ -216,8 +219,54 @@ class Policy(unittest.TestCase):
         )
         records, plans = d.reconcile(records, [cancel], cfg, NOW)
         self.assertFalse(plans)
-        self.assertEqual(records[c["id"]]["state"], "superseded")
-        self.assertEqual(records[cancel["id"]]["state"], "ineligible")
+        self.assertEqual(records[c["id"]]["state"], "cancelled")
+        self.assertEqual(records[cancel["id"]]["state"], "cancelled")
+
+    def test_siblings_and_transient_loss(self):
+        a = d.normalize(feature())
+        for reverse in (False, True):
+            for cancelled in (False, True):
+                with self.subTest(reverse=reverse, cancelled=cancelled):
+                    b = copy.deepcopy(a)
+                    b.update(id=a["id"] + "-b", references=[a["id"]])
+                    c = copy.deepcopy(b)
+                    c["id"] = a["id"] + "-c"
+                    if cancelled:
+                        c["message_type"] = "Cancel"
+                    else:
+                        c["geometry"] = None
+                    siblings = [b, c][:: -1 if reverse else 1]
+                    previous, _ = d.reconcile({}, [a], config(), NOW)
+                    records, plans = d.reconcile(previous, siblings, config(), NOW)
+                    self.assertFalse(plans)
+                    self.assertEqual(records[b["id"]]["state"], "active")
+                    # A first-observed pair with the same qualifying action plans once.
+                    c = copy.deepcopy(b)
+                    c["id"] = a["id"] + "-c"
+                    siblings = [b, c][:: -1 if reverse else 1]
+                    _, plans = d.reconcile({}, siblings, config(), NOW)
+                    self.assertEqual(len(plans), 1)
+        records, _ = d.reconcile({}, [a], config(), NOW)
+        records, _ = d.reconcile(records, [], config(), NOW)
+        records, plans = d.reconcile(records, [a], config(), NOW)
+        self.assertFalse(plans)
+        stale = copy.deepcopy(a)
+        stale["expires"] = "2026-11-15T19:59:00Z"
+        records, plans = d.reconcile(records, [stale], config(), NOW)
+        self.assertFalse(plans)
+        update = copy.deepcopy(a)
+        update.update(id=a["id"] + "-update", references=[a["id"]])
+        records, plans = d.reconcile(records, [update], config(), NOW)
+        self.assertFalse(plans)
+        cancel = copy.deepcopy(update)
+        cancel.update(
+            id=a["id"] + "-cancel", references=[update["id"]], message_type="Cancel"
+        )
+        records, _ = d.reconcile(records, [cancel], config(), NOW)
+        renewed = copy.deepcopy(a)
+        renewed.update(id=a["id"] + "-new", references=[cancel["id"]])
+        _, plans = d.reconcile(records, [renewed], config(), NOW)
+        self.assertEqual(len(plans), 1)
 
     def test_inconsistent_windows_fail_closed(self):
         for changes in (
@@ -236,6 +285,17 @@ class Policy(unittest.TestCase):
         before = copy.deepcopy(records)
         d.reconcile(records, [], config(), NOW)
         self.assertEqual(records, before)
+
+    def test_merged_action_history_is_bounded(self):
+        e = d.normalize(feature())
+        e["references"] = [str(i) for i in range(101)]
+        records = {
+            str(i): {"state": "ineligible", "actions": {str(i): ["new_york_ny"]}}
+            for i in range(101)
+        }
+        e["geometry"] = None
+        with self.assertRaises(ValueError):
+            d.reconcile(records, [e], config(), NOW)
 
     def test_antimeridian_fails_closed(self):
         g = {

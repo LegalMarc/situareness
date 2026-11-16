@@ -6,6 +6,7 @@ import { normalizeJson, normalizeRss } from "../../extension/lib/normalize.js";
 import {
   collectSource,
   mergeEvents,
+  retainEvents,
   markExpired,
   readBounded,
   MAX_BYTES,
@@ -130,9 +131,25 @@ test("normalizes official and news records with stable IDs and honest unknowns",
 });
 
 test("unknown weather status labels cannot resolve through Object prototype properties", () => {
-  const fixture = { features: [{ id: 'status-edge', properties: { id: 'status-edge', headline: 'Status edge', status: 'constructor', sent: timestamp } }] };
-  const [event] = normalizeJson({ id: 'nws', name: 'Weather', kind: 'nws' }, fixture, timestamp);
-  assert.equal(event.status, 'unknown');
+  const fixture = {
+    features: [
+      {
+        id: "status-edge",
+        properties: {
+          id: "status-edge",
+          headline: "Status edge",
+          status: "constructor",
+          sent: timestamp,
+        },
+      },
+    ],
+  };
+  const [event] = normalizeJson(
+    { id: "nws", name: "Weather", kind: "nws" },
+    fixture,
+    timestamp,
+  );
+  assert.equal(event.status, "unknown");
 });
 
 test("bounded responses reject declared and streamed excessive content", async () => {
@@ -202,10 +219,16 @@ test("county awareness is validated, round trips, and matches only SAME county c
   const roundtrip = validateConfig(
     JSON.parse(JSON.stringify(validateConfig(value))),
   );
-  assert.deepEqual(roundtrip.locations.map((l) => l.awareness_area), [
-    { state: "NY", county_fips: ["36005", "36047", "36061", "36081", "36085"] },
-    { state: "DC", county_fips: "11001" },
-  ]);
+  assert.deepEqual(
+    roundtrip.locations.map((l) => l.awareness_area),
+    [
+      {
+        state: "NY",
+        county_fips: ["36005", "36047", "36061", "36081", "36085"],
+      },
+      { state: "DC", county_fips: "11001" },
+    ],
+  );
   for (const area of [
     { state: "NY", county_fips: "11001" },
     { state: "NY", county_fips: ["36061", "3606"] },
@@ -221,7 +244,18 @@ test("county awareness is validated, round trips, and matches only SAME county c
         id: "x",
         properties: {
           status: "Actual",
-          geocode: { SAME: ["136005", "136047", "136061", "136081", "136085", "111001", "999999", "bad"] },
+          geocode: {
+            SAME: [
+              "136005",
+              "136047",
+              "136061",
+              "136081",
+              "136085",
+              "111001",
+              "999999",
+              "bad",
+            ],
+          },
         },
       },
     ],
@@ -397,4 +431,31 @@ test("NWS source links prefer safe HTTPS feature ID over provider URN", () => {
     normalize("http://api.weather.gov/alerts/x", "urn:oid:fixture").url,
     null,
   );
+});
+
+test("global retention prioritizes current alerts and reports any omitted records", () => {
+  const currentTime = new Date("2026-11-15T12:00:00Z");
+  const oldAlert = {
+    id: "nws:old",
+    source_id: "nws",
+    collected_at: "2026-11-14T00:00:00Z",
+    published_at: "2026-11-14T00:00:00Z",
+    awareness_lifecycle: "current",
+  };
+  const newer = Array.from({ length: 600 }, (_, i) => ({
+    id: `news:${i}`,
+    collected_at: currentTime.toISOString(),
+    published_at: currentTime.toISOString(),
+  }));
+  const retained = retainEvents([oldAlert, ...newer], [], currentTime);
+  assert.equal(retained.events.length, 500);
+  assert.equal(retained.dropped, 101);
+  assert.ok(retained.events.some((event) => event.id === oldAlert.id));
+  const manyAlerts = Array.from({ length: 550 }, (_, i) => ({
+    ...oldAlert,
+    id: `nws:${i}`,
+  }));
+  const overflow = retainEvents(manyAlerts, [], currentTime);
+  assert.equal(overflow.events.length, 500);
+  assert.equal(overflow.dropped, 50);
 });

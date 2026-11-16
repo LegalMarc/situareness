@@ -8,6 +8,7 @@ import pytest
 from homeassistant import loader
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers.translation import async_get_translations
 from pytest_homeassistant.common import MockConfigEntry
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -82,9 +83,25 @@ async def test_flow_sensor_storage_and_unload(hass, monkeypatch):
     assert (
         Path(hass.config.path(".storage")) / ("situareness." + entry.entry_id)
     ).exists()
+    translations = await async_get_translations(hass, "en", "config", {"situareness"})
+    assert translations["component.situareness.config.step.user.title"] == "Situareness"
+    assert (
+        "shadow"
+        in translations["component.situareness.config.step.user.description"].lower()
+    )
+    sensor = hass.data["situareness"][entry.entry_id]
+    from custom_components.situareness.sensor import SituarenessSensor
+
+    assert {"events", "last_success"} <= SituarenessSensor(
+        sensor, entry.entry_id
+    )._unrecorded_attributes
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert hass.states.get("sensor.situareness_monitoring").state == "unavailable"
     assert entry.entry_id not in hass.data["situareness"]
+    await hass.config_entries.async_remove(entry.entry_id)
+    assert not (
+        Path(hass.config.path(".storage")) / ("situareness." + entry.entry_id)
+    ).exists()
 
 
 async def test_real_service_registry_and_shadow_gate(hass, monkeypatch):

@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta
 import hashlib
 import json
+from .domain import action_history
 
 MAX_ATTEMPTS = 3
 MAX_AGE = timedelta(minutes=15)
@@ -54,7 +55,7 @@ def targets(plan, config, now):
     return items
 
 
-def pending_valid(item, records, config, now):
+def pending_valid(item, records, config, now, *, allow_suspended=False):
     try:
         created = datetime.fromisoformat(item["created"])
         record = records.get(item["incident_id"], {})
@@ -65,10 +66,16 @@ def pending_valid(item, records, config, now):
             or not 0 <= item["attempts"] < MAX_ATTEMPTS
         ):
             return False
-        if (
-            record.get("state") != "active"
-            or record.get("fingerprint") != item["fingerprint"]
-        ):
+        active = (
+            record.get("state") == "active"
+            and record.get("fingerprint") == item["fingerprint"]
+        )
+        suspended = (
+            allow_suspended
+            and record.get("state") in ("ineligible", "ended_or_absent")
+            and item["fingerprint"] in action_history(record)
+        )
+        if not (active or suspended):
             return False
         if item["kind"] == "phone":
             return item["target"] in config["phones"]
@@ -76,7 +83,12 @@ def pending_valid(item, records, config, now):
             location = item["location"]
             return (
                 bool(config.get("tts_entity"))
-                and location in record.get("affected", [])
+                and location
+                in (
+                    record.get("affected", [])
+                    if active
+                    else action_history(record).get(item["fingerprint"], [])
+                )
                 and item["target"]
                 in config["locations"].get(location, {}).get("speakers", [])
             )

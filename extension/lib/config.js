@@ -141,7 +141,8 @@ export function validateConfig(config) {
             typeof county !== "string" ||
             !/^[0-9]{5}$/.test(county) ||
             !county.startsWith(STATE_FIPS[area.state]),
-        )))
+        ))
+    )
       throw new Error("Invalid location awareness area.");
     locationIds.add(location.id);
   }
@@ -185,7 +186,9 @@ export function validateConfig(config) {
     live_actions_enabled: false,
     room: {
       browser: String(config.room.browser || "Google Chrome").slice(0, 300),
-      primary_dashboard: safeUrl(config.room.primary_dashboard),
+      context_dashboard: safeUrl(
+        config.room.context_dashboard ?? config.room.primary_dashboard,
+      ),
       closing_room_stops_monitoring: false,
     },
     alarm_policy: {

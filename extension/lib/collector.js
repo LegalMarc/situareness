@@ -40,6 +40,9 @@ export function sourceState(source, previous) {
     enabled: source.enabled,
     status: previous?.status || "idle",
     last_attempt_at: previous?.last_attempt_at || null,
+    last_alarm_tick: Number.isSafeInteger(previous?.last_alarm_tick)
+      ? previous.last_alarm_tick
+      : null,
     last_success_at: previous?.last_success_at || null,
     last_error: previous?.last_error || null,
     event_count: previous?.event_count || 0,
@@ -134,14 +137,17 @@ export async function collectSource(
     clearTimeout(timer);
   }
 }
-export function mergeEvents(existing, results, now) {
+export function retainEvents(existing, results, now) {
   const cutoff = now.getTime() - RETAIN_MS;
   const byId = new Map();
   for (const item of existing) {
     if (
       item &&
       typeof item.id === "string" &&
-      Date.parse(item.collected_at) >= cutoff
+      (Date.parse(item.collected_at) >= cutoff ||
+        (item.awareness_lifecycle === "current" &&
+          (!Number.isFinite(Date.parse(item.expires_at)) ||
+            Date.parse(item.expires_at) > now.getTime())))
     )
       byId.set(item.id, item);
   }
@@ -160,13 +166,27 @@ export function mergeEvents(existing, results, now) {
     }
     for (const item of result.events || []) byId.set(item.id, item);
   }
-  return [...byId.values()]
-    .sort(
-      (a, b) =>
-        (Date.parse(b.updated_at || b.published_at || b.collected_at) || 0) -
-        (Date.parse(a.updated_at || a.published_at || a.collected_at) || 0),
-    )
-    .slice(0, MAX_EVENTS);
+  const ordered = [...byId.values()].sort((a, b) => {
+    const priority = (item) =>
+      item.awareness_lifecycle === "current" &&
+      (!Number.isFinite(Date.parse(item.expires_at)) ||
+        Date.parse(item.expires_at) > now.getTime())
+        ? 1
+        : 0;
+    return (
+      priority(b) - priority(a) ||
+      (Date.parse(b.updated_at || b.published_at || b.collected_at) || 0) -
+        (Date.parse(a.updated_at || a.published_at || a.collected_at) || 0)
+    );
+  });
+  return {
+    events: ordered.slice(0, MAX_EVENTS),
+    dropped: Math.max(0, ordered.length - MAX_EVENTS),
+  };
+}
+
+export function mergeEvents(existing, results, now) {
+  return retainEvents(existing, results, now).events;
 }
 
 // Expiry is local clock-based information, independent of source availability.
