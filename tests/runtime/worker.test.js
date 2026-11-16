@@ -1,0 +1,214 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+
+const defaults = JSON.parse(
+  await readFile(
+    new URL("../../extension/defaults/config.json", import.meta.url),
+  ),
+);
+const room = "chrome-extension://test/room.html";
+const persisted = {};
+const listeners = {};
+let created = [];
+let currentTabs = [];
+let tabContexts = [];
+let failure = false;
+let alarm = null;
+const emitter = (name) => ({
+  addListener(fn) {
+    listeners[name] = fn;
+  },
+});
+globalThis.chrome = {
+  runtime: {
+    id: "test",
+    getURL: (path) => `chrome-extension://test/${path}`,
+    onMessage: emitter("message"),
+    onInstalled: emitter("installed"),
+    onStartup: emitter("startup"),
+    getContexts: async (filter) =>
+      filter?.contextTypes?.includes("TAB")
+        ? tabContexts
+        : [{ contextType: "OFFSCREEN_DOCUMENT" }],
+    sendMessage: async () => ({
+      ok: true,
+      items: [
+        {
+          id: "bbc-one",
+          url: "https://www.bbc.com/news/one",
+          title: "Headline",
+        },
+      ],
+      items_available: 1,
+    }),
+  },
+  storage: {
+    local: {
+      get: async (key) => ({ [key]: structuredClone(persisted[key]) }),
+      set: async (value) => Object.assign(persisted, structuredClone(value)),
+    },
+  },
+  alarms: {
+    get: async () => alarm,
+    create: async (name, options) => {
+      alarm = { name, ...options };
+    },
+    onAlarm: emitter("alarm"),
+  },
+  offscreen: { createDocument: async () => {} },
+  action: { onClicked: emitter("action") },
+  tabs: {
+    query: async () => currentTabs,
+    create: async (tab) => {
+      created.push(tab);
+    },
+    update: async (id, tab) => {
+      created.push({ id, ...tab });
+    },
+  },
+  windows: {
+    update: async (id, props) => {
+      created.push({ windowId: id, ...props });
+    },
+  },
+};
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (url) => {
+  if (url.startsWith("chrome-extension:"))
+    return new Response(JSON.stringify(defaults));
+  if (failure && url.includes("weather.gov")) throw new Error("network secret");
+  return new Response(
+    url.includes("bbci.co.uk")
+      ? "<rss></rss>"
+      : JSON.stringify({
+          features: [
+            {
+              id: "id1",
+              properties: {
+                id: "https://api.weather.gov/alerts/id1",
+                title: "Quake",
+                headline: "Weather",
+                status: "Actual",
+              },
+            },
+          ],
+        }),
+  );
+};
+await import("../../extension/background.js?first");
+const send = (message, sender = { id: "test", url: room }) =>
+  new Promise((resolve) => {
+    const keep = listeners.message(message, sender, resolve);
+    if (!keep && message.type === "PARSE_RSS_INTERNAL") resolve(undefined);
+  });
+
+test("worker initializes, collects, isolates failures and restores state after restart", async () => {
+  const initial = await send({ type: "GET_STATE" });
+  assert.equal(initial.ok, true);
+  assert.equal(initial.state.collector.running, false);
+  assert.equal(alarm.periodInMinutes, 1);
+  const first = await send({ type: "REFRESH" });
+  assert.equal(first.ok, true);
+  assert.equal(first.state.sources.filter((s) => s.status === "ok").length, 4);
+  assert.equal(first.state.events.length, 4);
+  failure = true;
+  const second = await send({ type: "REFRESH" });
+  assert.equal(second.state.sources[0].status, "error");
+  assert.ok(second.state.sources[0].last_success_at);
+  assert.equal(second.state.events.length, 4);
+  assert.doesNotMatch(second.state.sources[0].last_error, /secret/);
+  assert.equal(
+    (await send({ type: "SET_PAUSED", paused: true })).state.collector.paused,
+    true,
+  );
+  const before = structuredClone(persisted);
+  await import("../../extension/background.js?restart");
+  const restored = await send({ type: "GET_STATE" });
+  assert.equal(restored.state.collector.paused, true);
+  assert.equal(restored.state.collector.running, false);
+  assert.deepEqual(restored.state.events, before.situareness_state_v1.events);
+  assert.deepEqual(
+    (await send({ type: "REFRESH" })).state.events,
+    restored.state.events,
+  );
+});
+
+test("worker validates trust, configuration, source URLs and reuses room tab", async () => {
+  assert.equal(
+    (await send({ type: "GET_STATE" }, { id: "test", url: `${room}#main` })).ok,
+    true,
+  );
+  assert.equal(
+    (await send({ type: "GET_STATE" }, { id: "other", url: room })).ok,
+    false,
+  );
+  assert.equal(
+    (await send({ type: "OPEN_SOURCE", url: "javascript:alert(1)" })).ok,
+    false,
+  );
+  assert.equal(
+    (
+      await send({
+        type: "OPEN_SOURCE",
+        url: "https://user:password@example.com",
+      })
+    ).ok,
+    false,
+  );
+  assert.equal((await send({ type: "SET_PAUSED", paused: "false" })).ok, false);
+  const config = structuredClone(defaults);
+  config.live_actions_enabled = true;
+  assert.equal((await send({ type: "UPDATE_CONFIG", config })).ok, false);
+  const changed = structuredClone(defaults);
+  changed.locations[0].awareness_area = { state: "NY", county_fips: "36047" };
+  const updated = await send({ type: "UPDATE_CONFIG", config: changed });
+  assert.equal(updated.ok, true);
+  assert.equal(
+    updated.state.config.locations[0].awareness_area.county_fips,
+    "36047",
+  );
+  assert.equal(
+    updated.state.sources.find((s) => s.id === "nws").status,
+    "idle",
+  );
+  assert.ok(!updated.state.events.some((e) => e.source_id === "nws"));
+  created = [];
+  tabContexts = [{ tabId: 9, windowId: 7, documentUrl: room }];
+  assert.equal((await send({ type: "OPEN_ROOM" })).ok, true);
+  assert.deepEqual(created, [
+    { id: 9, active: true },
+    { windowId: 7, focused: true },
+  ]);
+  created = [];
+  tabContexts = [];
+  await send({ type: "OPEN_ROOM" });
+  assert.deepEqual(created, [{ url: room }]);
+  globalThis.fetch = originalFetch;
+});
+
+test("restart ignores corrupt storage entries and derives expiry from the clock", async () => {
+  persisted.situareness_state_v1 = {
+    config: structuredClone(defaults),
+    sources: { not: "an array" },
+    events: [
+      null,
+      "broken",
+      {
+        id: "nws:expired",
+        source_id: "nws",
+        collected_at: new Date().toISOString(),
+        expires_at: "2020-01-01T00:00:00Z",
+        awareness_lifecycle: "current",
+      },
+      { id: 42 },
+    ],
+    collector: { paused: true },
+  };
+  await import("../../extension/background.js?corrupt");
+  const restored = await send({ type: "GET_STATE" });
+  assert.equal(restored.ok, true);
+  assert.equal(restored.state.events.length, 1);
+  assert.equal(restored.state.events[0].awareness_lifecycle, "expired");
+  assert.equal(restored.state.sources[0].status, "idle");
+});

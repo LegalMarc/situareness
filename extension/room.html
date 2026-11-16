@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Situareness | Situation Room</title>
+  <link rel="stylesheet" href="room.css">
+  <script type="module" src="room.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#main" aria-label="Situareness Situation Room">
+      <span class="brand-mark" aria-hidden="true">S</span>
+      <span><strong>situareness</strong><small>SITUATION ROOM</small></span>
+    </a>
+    <div class="topbar-status" aria-live="polite">
+      <span class="status-dot" id="collector-dot"></span>
+      <span id="collector-label">Connecting to local collector…</span>
+    </div>
+    <div class="topbar-actions">
+      <button class="button button-quiet" id="pause-button" type="button" disabled>Pause collection</button>
+      <button class="button button-primary" id="refresh-button" type="button" disabled><span aria-hidden="true">↻</span> Refresh</button>
+      <button class="icon-button" id="settings-button" type="button" aria-label="Open settings" disabled>⚙</button>
+    </div>
+  </header>
+
+  <main id="main" class="shell">
+    <section class="alarm-strip" aria-labelledby="alarm-title">
+      <div class="alarm-icon" aria-hidden="true">◉</div>
+      <div class="alarm-copy">
+        <div class="eyebrow">HOUSEHOLD ALERT SYSTEM</div>
+        <h1 id="alarm-title">Read-only · Shadow mode</h1>
+        <p id="ha-status">Home Assistant is not connected. This room cannot activate household alerts.</p>
+      </div>
+      <span class="mode-pill">LIVE ACTIONS OFF</span>
+    </section>
+
+    <div class="workspace">
+      <aside class="sidebar" aria-label="Watch list and sources">
+        <section class="side-section">
+          <div class="section-heading"><div><span class="eyebrow">YOUR WATCH</span><h2>Places</h2></div><span id="place-count" class="count-badge">—</span></div>
+          <p class="muted side-intro">Awareness coverage only. Proximity does not indicate household exposure.</p>
+          <div id="place-list" class="place-list" aria-label="Filter events by place"></div>
+        </section>
+        <section class="side-section source-section">
+          <div class="section-heading"><div><span class="eyebrow">FEED STATUS</span><h2>Sources</h2></div><span id="source-count" class="count-badge">—</span></div>
+          <div id="source-list" class="source-list"></div>
+          <p id="source-empty" class="muted empty-note" hidden>No sources are configured yet.</p>
+        </section>
+        <div class="side-foot"><span class="lock-icon" aria-hidden="true">▣</span> Local, read-only collection</div>
+      </aside>
+
+      <section class="feed-panel" aria-labelledby="feed-heading">
+        <div class="feed-header">
+          <div><div class="eyebrow">SITUATION BRIEFING</div><h2 id="feed-heading">World &amp; national events</h2><p class="muted" id="feed-subtitle">Collected from your configured sources</p></div>
+          <div class="feed-meta"><span id="event-count">0 items</span><span class="meta-divider">·</span><span id="last-updated">Waiting for first collection</span><span class="meta-divider">·</span><a id="dashboard-link" class="dashboard-link" hidden>Open World Monitor ↗</a></div>
+        </div>
+        <form class="filters" id="filter-form" role="search">
+          <label class="search-box"><span class="sr-only">Search events</span><span aria-hidden="true">⌕</span><input id="search-input" type="search" placeholder="Search events, places, sources…" autocomplete="off"></label>
+          <label class="select-wrap"><span class="sr-only">Filter by category</span><select id="category-filter"><option value="all">All categories</option><option value="news">News</option><option value="weather">Weather</option><option value="earthquake">Earthquakes</option><option value="other">Other</option></select></label>
+          <label class="select-wrap"><span class="sr-only">Filter by event status</span><select id="status-filter"><option value="all">All statuses</option><option value="actual">Actual</option><option value="test">Test</option><option value="exercise">Exercise</option><option value="cancelled">Cancelled</option></select></label>
+        </form>
+        <div class="feed-legend"><span><i class="legend-dot dot-news"></i>News &amp; world</span><span><i class="legend-dot dot-weather"></i>Weather</span><span><i class="legend-dot dot-quake"></i>Earthquake</span><span class="read-only-note">Awareness feed · no automated alarm decisions</span></div>
+        <div id="freshness-note" class="freshness-note" role="status" hidden></div>
+        <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+        <div id="feed-state" class="feed-state" aria-live="polite"><span class="spinner" aria-hidden="true"></span><strong>Connecting to the local collector</strong><span>Event data will appear here after the first successful collection.</span></div>
+        <ol id="event-list" class="event-list" aria-label="Events" hidden></ol>
+        <div id="filtered-empty" class="feed-state" hidden><strong>No matching events</strong><span>Try another search or clear a filter.</span><button id="clear-filters" class="text-button" type="button">Clear filters</button></div>
+      </section>
+    </div>
+    <footer class="page-footer"><span>Situareness is an awareness room, not an emergency service.</span><span id="clock-note">Times shown in your local time zone</span></footer>
+  </main>
+
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <form method="dialog" class="dialog-shell" id="settings-form">
+      <div class="dialog-header"><div><div class="eyebrow">ROOM CONFIGURATION</div><h2 id="settings-title">Settings</h2></div><button type="button" class="icon-button" id="close-settings" aria-label="Close settings">×</button></div>
+      <p class="muted">Edit place names and watch status. Configuration stays local to this browser extension.</p>
+      <fieldset class="locations-fieldset"><legend>Watched places</legend><div id="location-editor"></div></fieldset>
+      <fieldset class="locations-fieldset"><legend>Read-only sources</legend><p class="muted small">Choose which bundled providers to collect. NWS and USGS check every minute by default. USGS records earthquakes after they happen; it does not predict them. BBC feeds provide secondary news context.</p><div id="source-editor"></div></fieldset>
+      <div class="advanced-settings">
+        <details><summary>Import or export browser settings</summary>
+          <p class="muted small">Exports include watched places and source preferences. Treat the file as sensitive. Household footprints, enrolled-device details, speaker and horn targets, and secret-like fields are omitted. Live actions remain disabled.</p>
+          <label for="config-json">Browser settings</label><textarea id="config-json" rows="12" spellcheck="false" aria-describedby="config-help"></textarea>
+          <p id="config-help" class="muted small">Import validates browser settings and keeps live actions disabled.</p>
+          <div class="json-actions"><button type="button" class="button button-quiet" id="export-button">Export settings</button><label class="button button-quiet file-button" for="import-file">Choose settings file</label><input id="import-file" type="file" accept="application/json,.json" hidden></div>
+          <p class="muted small"><a href="https://github.com/LegalMarc/situareness/tree/main/skills/situareness-sources" target="_blank" rel="noopener noreferrer">Source configuration guide ↗</a></p>
+        </details>
+      </div>
+      <div id="settings-error" class="form-error" role="alert" hidden></div>
+      <div class="dialog-actions"><button type="button" class="button button-quiet" id="cancel-settings">Cancel</button><button type="button" class="button button-primary" id="save-settings">Save settings</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

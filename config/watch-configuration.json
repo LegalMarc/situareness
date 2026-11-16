@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "artifact_status": "planning_only_no_runtime_consumer",
+  "live_actions_enabled": false,
+  "room": {
+    "browser": "Google Chrome",
+    "primary_dashboard": "https://www.worldmonitor.app/dashboard",
+    "closing_room_stops_monitoring": false
+  },
+  "alarm_policy": {
+    "required_gates": [
+      "credible_current_evidence",
+      "concrete_watched_household_consequence",
+      "time_relevant_preparation_or_protection"
+    ],
+    "qualifying_events_allowed_overnight": true,
+    "first_phone_delivery": "all_enrolled_iphones",
+    "speaker_and_horn_delivery": "affected_locations_only",
+    "acknowledgement_scope": null,
+    "repeat_and_test_cadence": null
+  },
+  "enrolled_iphones": [],
+  "locations": [
+    {
+      "id": "nyc_sample",
+      "name": "New York City, NY",
+      "watch_enabled": true,
+      "timezone": "America/New_York",
+      "household_exposure": null,
+      "official_alert_enrollment": null,
+      "verified_event_ingestion": null,
+      "google_speaker_targets": [],
+      "horn_targets": [],
+      "awareness_area": {
+        "state": "NY",
+        "county_fips": [
+          "36005",
+          "36047",
+          "36061",
+          "36081",
+          "36085"
+        ]
+      }
+    },
+    {
+      "id": "washington_dc_sample",
+      "name": "Washington, DC",
+      "watch_enabled": true,
+      "timezone": "America/New_York",
+      "household_exposure": null,
+      "official_alert_enrollment": null,
+      "verified_event_ingestion": null,
+      "google_speaker_targets": [],
+      "horn_targets": [],
+      "awareness_area": {
+        "state": "DC",
+        "county_fips": "11001"
+      }
+    }
+  ],
+  "sources": [
+    {
+      "id": "nws",
+      "name": "National Weather Service alerts",
+      "kind": "nws",
+      "url": "https://api.weather.gov/alerts/active?area=NY,DC",
+      "enabled": true,
+      "interval_minutes": 1
+    },
+    {
+      "id": "usgs",
+      "name": "USGS earthquakes (post-event)",
+      "kind": "usgs",
+      "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson",
+      "enabled": true,
+      "interval_minutes": 1
+    },
+    {
+      "id": "bbc_world",
+      "name": "BBC News World",
+      "kind": "rss",
+      "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
+      "enabled": true,
+      "interval_minutes": 5
+    },
+    {
+      "id": "bbc_us_canada",
+      "name": "BBC News US & Canada",
+      "kind": "rss",
+      "url": "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml",
+      "enabled": true,
+      "interval_minutes": 5
+    }
+  ]
+}

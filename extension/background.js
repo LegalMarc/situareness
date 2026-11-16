@@ -1,0 +1,300 @@
+import { safeUrl, validateConfig } from "./lib/config.js";
+import {
+  collectSource,
+  markExpired,
+  mergeEvents,
+  sourceState,
+} from "./lib/collector.js";
+
+const STORAGE_KEY = "situareness_state_v1";
+const ALARM = "situareness_collect";
+const ROOM = chrome.runtime.getURL("room.html");
+function isRoomUrl(value) {
+  try {
+    const expectedRoom = new URL(ROOM);
+    const candidate = new URL(value);
+    return (
+      candidate.protocol === expectedRoom.protocol &&
+      candidate.host === expectedRoom.host &&
+      candidate.pathname === expectedRoom.pathname
+    );
+  } catch {
+    return false;
+  }
+}
+let state;
+let queue = Promise.resolve();
+let offscreenCreating;
+
+function exclusive(task) {
+  const result = queue.then(task);
+  queue = result.catch(() => {});
+  return result;
+}
+async function persist() {
+  await chrome.storage.local.set({ [STORAGE_KEY]: state });
+}
+async function initialize() {
+  if (state) return;
+  const stored = (await chrome.storage.local.get(STORAGE_KEY))[STORAGE_KEY];
+  let config;
+  try {
+    config = validateConfig(stored?.config);
+  } catch {
+    const response = await fetch(chrome.runtime.getURL("defaults/config.json"));
+    config = validateConfig(await response.json());
+  }
+  const storedSources = Array.isArray(stored?.sources) ? stored.sources : [];
+  const nwsIds = new Set(
+    config.sources.filter((s) => s.kind === "nws").map((s) => s.id),
+  );
+  const storedEvents = Array.isArray(stored?.events) ? stored.events : [];
+  const legacyNwsIds = new Set(
+    storedEvents
+      .filter(
+        (e) =>
+          e &&
+          nwsIds.has(e.source_id) &&
+          !["current", "expired", "not_in_latest_fetch"].includes(
+            e.awareness_lifecycle,
+          ),
+      )
+      .map((e) => e.source_id),
+  );
+  const validEvents = storedEvents
+    .filter(
+      (e) =>
+        e &&
+        typeof e === "object" &&
+        !Array.isArray(e) &&
+        typeof e.id === "string" &&
+        typeof e.source_id === "string" &&
+        typeof e.collected_at === "string" &&
+        (!nwsIds.has(e.source_id) || !legacyNwsIds.has(e.source_id)),
+    )
+    .slice(0, 500);
+  state = {
+    schema_version: 1,
+    config,
+    events: markExpired(validEvents, new Date()),
+    sources: config.sources.map((s) =>
+      sourceState(
+        s,
+        legacyNwsIds.has(s.id)
+          ? null
+          : storedSources.find((p) => p && p.id === s.id && p.url === s.url),
+      ),
+    ),
+    collector: {
+      paused: stored?.collector?.paused === true,
+      running: false,
+      last_run_at: stored?.collector?.last_run_at || null,
+    },
+    ha: { status: "not_connected" },
+  };
+  await persist();
+  // Alarms may be cleared by Chrome between sessions; re-establish when the worker starts.
+  if (!(await chrome.alarms.get(ALARM)))
+    await chrome.alarms.create(ALARM, { periodInMinutes: 1 });
+}
+async function parseRss(text) {
+  if (!offscreenCreating)
+    offscreenCreating = (async () => {
+      const contexts = await chrome.runtime.getContexts({
+        contextTypes: ["OFFSCREEN_DOCUMENT"],
+        documentUrls: [chrome.runtime.getURL("offscreen.html")],
+      });
+      if (!contexts.length)
+        await chrome.offscreen.createDocument({
+          url: "offscreen.html",
+          reasons: ["DOM_PARSER"],
+          justification:
+            "Parse read-only RSS feeds without executing feed content.",
+        });
+    })().finally(() => {
+      offscreenCreating = null;
+    });
+  await offscreenCreating;
+  const response = await chrome.runtime.sendMessage({
+    type: "PARSE_RSS_INTERNAL",
+    text,
+  });
+  if (
+    !response?.ok ||
+    !Array.isArray(response.items) ||
+    !Number.isInteger(response.items_available) ||
+    response.items_available < response.items.length
+  )
+    throw new Error("Feed parsing failed.");
+  return { items: response.items, items_available: response.items_available };
+}
+async function refresh(force) {
+  await initialize();
+  if (state.collector.paused) return state;
+  const now = new Date();
+  const due = state.config.sources.filter((s) => {
+    const previous = state.sources.find((p) => p.id === s.id);
+    return (
+      s.enabled &&
+      (force ||
+        !previous?.last_attempt_at ||
+        now.getTime() - Date.parse(previous.last_attempt_at) >=
+          s.interval_minutes * 60000)
+    );
+  });
+  if (!due.length) return state;
+  state.collector.running = true;
+  await persist();
+  try {
+    // Batch requests to bound concurrency even with a user-edited source list.
+    const results = [];
+    for (let i = 0; i < due.length; i += 4) {
+      results.push(
+        ...(await Promise.all(
+          due.slice(i, i + 4).map((s) =>
+            collectSource(
+              s,
+              state.sources.find((p) => p.id === s.id),
+              { parseRss, locations: state.config.locations },
+            ),
+          ),
+        )),
+      );
+    }
+    for (const result of results)
+      state.sources = state.sources.map((s) =>
+        s.id === result.source.id ? result.source : s,
+      );
+    state.events = markExpired(
+      mergeEvents(state.events, results, new Date()),
+      new Date(),
+    );
+    state.collector.last_run_at = new Date().toISOString();
+  } finally {
+    state.collector.running = false;
+    await persist();
+  }
+  return state;
+}
+async function openRoom() {
+  const contexts = await chrome.runtime.getContexts({
+    contextTypes: ["TAB"],
+  });
+  const roomContext = contexts.find(
+    (context) => Number.isInteger(context.tabId) && isRoomUrl(context.documentUrl),
+  );
+  if (roomContext) {
+    await chrome.tabs.update(roomContext.tabId, { active: true });
+    if (Number.isInteger(roomContext.windowId))
+      await chrome.windows.update(roomContext.windowId, { focused: true });
+  } else await chrome.tabs.create({ url: ROOM });
+}
+async function handle(message) {
+  await initialize();
+  const updated = markExpired(state.events, new Date());
+  if (updated.some((event, index) => event !== state.events[index])) {
+    state.events = updated;
+    await persist();
+  }
+  switch (message?.type) {
+    case "GET_STATE":
+      return { ok: true, state };
+    case "REFRESH":
+      return { ok: true, state: await refresh(true) };
+    case "SET_PAUSED":
+      if (typeof message.paused !== "boolean")
+        throw new Error("Paused must be a boolean.");
+      state.collector.paused = message.paused;
+      await persist();
+      return { ok: true, state };
+    case "UPDATE_CONFIG": {
+      const config = validateConfig(message.config);
+      const oldAreas = JSON.stringify(
+        state.config.locations.map((l) => [
+          l.id,
+          l.watch_enabled,
+          l.awareness_area,
+        ]),
+      );
+      const newAreas = JSON.stringify(
+        config.locations.map((l) => [l.id, l.watch_enabled, l.awareness_area]),
+      );
+      const keep = new Set(
+        config.sources
+          .filter(
+            (s) =>
+              !(s.kind === "nws" && oldAreas !== newAreas) &&
+              state.config.sources.some(
+                (old) =>
+                  old.id === s.id && old.kind === s.kind && old.url === s.url,
+              ),
+          )
+          .map((s) => s.id),
+      );
+      state.events = state.events.filter((e) => keep.has(e.source_id));
+      state.sources = config.sources.map((s) =>
+        sourceState(
+          s,
+          keep.has(s.id) ? state.sources.find((p) => p.id === s.id) : null,
+        ),
+      );
+      state.config = config;
+      await persist();
+      return { ok: true, state };
+    }
+    case "OPEN_ROOM":
+      await openRoom();
+      return { ok: true };
+    case "OPEN_SOURCE": {
+      const url = safeUrl(message.url);
+      if (!url) throw new Error("Invalid source URL.");
+      await chrome.tabs.create({ url });
+      return { ok: true };
+    }
+    default:
+      throw new Error("Unknown request.");
+  }
+}
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "PARSE_RSS_INTERNAL") return;
+  const isRoomPage = sender.id === chrome.runtime.id && isRoomUrl(sender.url);
+  if (!isRoomPage) {
+    sendResponse({ ok: false, error: "Untrusted sender." });
+    return;
+  }
+  exclusive(() => handle(message)).then(sendResponse, (error) =>
+    sendResponse({
+      ok: false,
+      error:
+        error instanceof Error &&
+        /^(Configuration|Invalid|Private|Source URL|Paused|Unknown request)/.test(
+          error.message,
+        )
+          ? error.message
+          : "Request failed.",
+    }),
+  );
+  return true;
+});
+chrome.action.onClicked.addListener(() => {
+  void exclusive(async () => {
+    await initialize();
+    await openRoom();
+  }).catch(() => {});
+});
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === ALARM)
+    void exclusive(() => refresh(false)).catch(() => {});
+});
+chrome.runtime.onInstalled.addListener(() => {
+  void exclusive(async () => {
+    await initialize();
+    await refresh(false);
+  }).catch(() => {});
+});
+chrome.runtime.onStartup.addListener(() => {
+  void exclusive(async () => {
+    await initialize();
+    await refresh(false);
+  }).catch(() => {});
+});

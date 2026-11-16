@@ -1,0 +1,23 @@
+{
+  "name": "situareness",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local situation room with independent Home Assistant alerting.",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "test": "node --test tests/runtime/*.test.js tests/ui/*.test.js",
+    "test:ha": "python3 -m unittest discover -s tests/ha -p 'test_*.py'",
+    "test:browser": "playwright test",
+    "check:static": "node tools/check.mjs",
+    "check": "npm run check:static && npm test && npm run test:ha && npm run test:skill",
+    "package": "python3 tools/package.py",
+    "test:ha:real": "work/ha-venv/bin/python -m pytest tests/ha/real -p no:respx -o asyncio_mode=auto -o asyncio_default_fixture_loop_scope=function --basetemp=work/ha-pytest -q",
+    "test:skill": "python3 -m unittest discover -s tests/skill -p 'test_*.py'"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1"
+  }
+}

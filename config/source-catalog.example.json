@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "locations": [
+    {
+      "id": "nyc_sample",
+      "name": "New York City",
+      "country": "US",
+      "state": "NY"
+    },
+    {
+      "id": "washington_dc_sample",
+      "name": "Washington, DC",
+      "country": "US",
+      "state": "DC"
+    }
+  ],
+  "sources": [
+    {
+      "id": "nws_active_alerts",
+      "name": "National Weather Service active alerts",
+      "issuer": "National Weather Service",
+      "issuer_jurisdiction": "United States",
+      "hazard_coverage": [
+        "weather"
+      ],
+      "authority_evidence_url": "https://www.weather.gov/documentation/services-web-api",
+      "channel_url": "https://www.weather.gov/",
+      "endpoint_url": "https://api.weather.gov/alerts/active?area=NY,DC",
+      "format": "JSON",
+      "role": "originator",
+      "location_ids": [
+        "nyc_sample",
+        "washington_dc_sample"
+      ],
+      "access_status": "public_api/feed",
+      "runtime_support": "supported",
+      "enabled": false,
+      "checked_at": "2026-11-16",
+      "evidence_urls": [
+        "https://www.weather.gov/documentation/services-web-api"
+      ],
+      "poll_interval_seconds": null,
+      "latency_seconds": null,
+      "notes": "Statewide query; individual alerts require geographic filtering. Availability and delivery timing are not guaranteed."
+    },
+    {
+      "id": "notify_nyc",
+      "name": "Notify NYC recent notifications",
+      "issuer": "New York City Emergency Management",
+      "issuer_jurisdiction": "New York City, NY",
+      "hazard_coverage": [
+        "emergency notifications"
+      ],
+      "authority_evidence_url": "https://a858-nycnotify.nyc.gov/Home/FAQ",
+      "channel_url": "https://a858-nycnotify.nyc.gov/notifynyc#Recent_Notifications",
+      "endpoint_url": null,
+      "format": "HTML",
+      "role": "originator",
+      "location_ids": [
+        "nyc_sample"
+      ],
+      "access_status": "manual_only",
+      "runtime_support": "proposed",
+      "enabled": false,
+      "checked_at": "2026-11-16",
+      "evidence_urls": [
+        "https://a858-nycnotify.nyc.gov/Home/FAQ"
+      ],
+      "poll_interval_seconds": null,
+      "latency_seconds": null,
+      "notes": "FAQ advertises RSS, but its RSS link led to the HTML homepage; a working RSS endpoint was not verified."
+    },
+    {
+      "id": "alert_dc",
+      "name": "Alert DC recent alerts",
+      "issuer": "District of Columbia Homeland Security and Emergency Management Agency",
+      "issuer_jurisdiction": "District of Columbia",
+      "hazard_coverage": [
+        "emergency notifications"
+      ],
+      "authority_evidence_url": "https://hsema.dc.gov/page/alertdc-stay-informed-stay-safe",
+      "channel_url": "https://hsema.dc.gov/alerts",
+      "endpoint_url": null,
+      "format": "HTML",
+      "role": "originator",
+      "location_ids": [
+        "washington_dc_sample"
+      ],
+      "access_status": "manual_only",
+      "runtime_support": "proposed",
+      "enabled": false,
+      "checked_at": "2026-11-16",
+      "evidence_urls": [
+        "https://hsema.dc.gov/page/alertdc-stay-informed-stay-safe",
+        "https://hsema.dc.gov/alerts"
+      ],
+      "poll_interval_seconds": null,
+      "latency_seconds": null,
+      "notes": "Official page describes Everbridge delivery by email, SMS, and app; the recent alerts page is HTML and no public API was verified."
+    },
+    {
+      "id": "usgs_all_hour",
+      "name": "USGS all earthquakes past hour",
+      "issuer": "U.S. Geological Survey",
+      "issuer_jurisdiction": "United States",
+      "hazard_coverage": [
+        "earthquakes"
+      ],
+      "authority_evidence_url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/geojson.php",
+      "channel_url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/geojson.php",
+      "endpoint_url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson",
+      "format": "GeoJSON",
+      "role": "originator",
+      "location_ids": [
+        "nyc_sample",
+        "washington_dc_sample"
+      ],
+      "access_status": "public_api/feed",
+      "runtime_support": "supported",
+      "enabled": false,
+      "checked_at": "2026-11-16",
+      "evidence_urls": [
+        "https://earthquake.usgs.gov/earthquakes/feed/v1.0/geojson.php"
+      ],
+      "poll_interval_seconds": null,
+      "latency_seconds": null,
+      "notes": "Feed documentation describes one-minute updates; delivery latency remains unknown."
+    },
+    {
+      "id": "noaa_swpc_alerts",
+      "name": "NOAA space weather alerts",
+      "issuer": "NOAA Space Weather Prediction Center",
+      "issuer_jurisdiction": "United States",
+      "hazard_coverage": [
+        "space weather"
+      ],
+      "authority_evidence_url": "https://www.spaceweather.gov/products/alerts-watches-and-warnings",
+      "channel_url": "https://www.spaceweather.gov/products/alerts-watches-and-warnings",
+      "endpoint_url": "https://services.swpc.noaa.gov/products/alerts.json",
+      "format": "JSON",
+      "role": "originator",
+      "location_ids": [
+        "nyc_sample",
+        "washington_dc_sample"
+      ],
+      "access_status": "public_api/feed",
+      "runtime_support": "proposed",
+      "enabled": false,
+      "checked_at": "2026-11-16",
+      "evidence_urls": [
+        "https://www.spaceweather.gov/products/alerts-watches-and-warnings",
+        "https://services.swpc.noaa.gov/products/alerts.json"
+      ],
+      "poll_interval_seconds": null,
+      "latency_seconds": null,
+      "notes": "Verified JSON channel; an adapter is not implemented."
+    }
+  ]
+}

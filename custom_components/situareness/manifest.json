@@ -1,0 +1,9 @@
+{
+  "domain": "situareness",
+  "name": "Situareness",
+  "version": "0.1.0",
+  "config_flow": true,
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "documentation": "https://github.com/LegalMarc/situareness/blob/main/docs/ha/README.md"
+}

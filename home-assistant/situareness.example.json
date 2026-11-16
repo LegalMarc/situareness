@@ -1,0 +1,15 @@
+{
+  "states": [
+    "NY",
+    "DC"
+  ],
+  "locations": {
+    "nyc_sample": {},
+    "washington_dc_sample": {}
+  },
+  "approved_rules": {},
+  "phones": [],
+  "tts_entity": null,
+  "live_enabled": false,
+  "commissioning_passed": false
+}

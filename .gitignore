@@ -1,0 +1,21 @@
+# Local configuration, records, archives and generated output never belong in Git.
+ignored-resources/
+work/
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+*.local.json
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-*
+home-assistant/situareness.json
+.DS_Store
+playwright-report/
+test-results/

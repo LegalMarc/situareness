@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Situareness",
+  "version": "0.1.0",
+  "description": "A read-only situation room. Household alarms operate separately.",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "alarms", "offscreen"],
+  "host_permissions": [
+    "https://api.weather.gov/*",
+    "https://earthquake.usgs.gov/*",
+    "https://feeds.bbci.co.uk/*"
+  ],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Open Situareness" }
+}
