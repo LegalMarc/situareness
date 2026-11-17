@@ -577,35 +577,7 @@ def cancellation_evidence(records, events, groups, now=None):
     return direct_ids, uncertain_ids
 
 
-def reconcile(
-    previous,
-    events,
-    config,
-    now,
-    baseline=False,
-    activate=False,
-    partial=False,
-    quarantine_lineages=(),
-    quarantine_all=False,
-    graph_events=None,
-):
-    """Reconcile bounded history; quarantined inputs cannot end unrelated records."""
-    graph_events = list(events if graph_events is None else graph_events)
-    # Cancels are source evidence even when a later message references them.
-    present = {event["id"] for event in events}
-    events = list(events) + [
-        event
-        for event in graph_events
-        if event["id"] not in present
-        and event.get("status") == "Actual"
-        and event.get("message_type") == "Cancel"
-    ]
-    prior = deepcopy(previous or {})
-    records = deepcopy(prior)
-    plans = []
-    quarantine_events = [
-        {"id": ids[0], "references": ids[1:]} for ids in quarantine_lineages if ids
-    ]
+def _invalid_graph_ids(prior, graph_events):
     known_identities = {
         eid: record.get("cap_identity")
         for eid, record in prior.items()
@@ -631,6 +603,79 @@ def reconcile(
             )
         ):
             invalid_ids.add(source["id"])
+    return invalid_ids
+
+
+def resolve_candidates(previous, events, graph_events=None):
+    """Restore predecessors hidden by a graph update rejected against prior state."""
+    if graph_events is None:
+        return list(events)
+    graph_list = list(graph_events)
+    invalid_ids = _invalid_graph_ids(previous or {}, graph_list)
+    by_graph_id = {e["id"]: e for e in graph_list}
+    valid_superseded = set()
+    for source in graph_list:
+        if source["id"] in invalid_ids:
+            continue
+        references = list(
+            zip(source.get("references", []), source.get("reference_identities", []))
+        )
+        if any(
+            (existing := by_graph_id.get(ref)) is not None
+            and (
+                existing["id"] in invalid_ids
+                or existing.get("cap_identity") != identity
+            )
+            for ref, identity in references
+        ):
+            continue
+        valid_superseded.update(ref for ref, _ in references)
+    result = []
+    seen_ids = set()
+    for e in events:
+        eid = e["id"]
+        if eid not in valid_superseded and eid not in seen_ids:
+            result.append(e)
+            seen_ids.add(eid)
+    for e in graph_list:
+        eid = e["id"]
+        if eid not in valid_superseded and eid not in seen_ids:
+            result.append(e)
+            seen_ids.add(eid)
+    return result
+
+
+def reconcile(
+    previous,
+    events,
+    config,
+    now,
+    baseline=False,
+    activate=False,
+    partial=False,
+    quarantine_lineages=(),
+    quarantine_all=False,
+    graph_events=None,
+):
+    """Reconcile bounded history; quarantined inputs cannot end unrelated records."""
+    graph_events = list(events if graph_events is None else graph_events)
+    prior = deepcopy(previous or {})
+    events = resolve_candidates(prior, events, graph_events)
+    # Cancels are source evidence even when a later message references them.
+    present = {event["id"] for event in events}
+    events = list(events) + [
+        event
+        for event in graph_events
+        if event["id"] not in present
+        and event.get("status") == "Actual"
+        and event.get("message_type") == "Cancel"
+    ]
+    records = deepcopy(prior)
+    plans = []
+    quarantine_events = [
+        {"id": ids[0], "references": ids[1:]} for ids in quarantine_lineages if ids
+    ]
+    invalid_ids = _invalid_graph_ids(prior, graph_events)
 
     def actual_cancel(source):
         return (

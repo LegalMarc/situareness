@@ -22,6 +22,7 @@ from .domain import (
     lineage_index,
     qualify,
     reconcile,
+    resolve_candidates,
     timestamp,
 )
 
@@ -44,7 +45,7 @@ def _valid_persisted_store(persisted):
         return False
     if "degraded" in persisted and not isinstance(persisted["degraded"], bool):
         return False
-    for key in ("degraded_at", "degraded_until"):
+    for key in ("degraded_at", "degraded_until", "acknowledged_degraded_at"):
         val = persisted.get(key)
         if val is not None and (not isinstance(val, str) or timestamp(val) is None):
             return False
@@ -62,6 +63,17 @@ def _valid_persisted_store(persisted):
                 return False
             if "state" in record and not isinstance(record["state"], str):
                 return False
+            if "updated" in record and not isinstance(record["updated"], str):
+                return False
+            if (
+                "inactive_since" in record
+                and record["inactive_since"] is not None
+                and not isinstance(record["inactive_since"], str)
+            ):
+                return False
+            for bool_key in ("cancel_message", "cancellation_expired"):
+                if bool_key in record and not isinstance(record[bool_key], bool):
+                    return False
             for list_key in ("lineage", "reasons", "affected"):
                 if list_key in record and (
                     not isinstance(record[list_key], list)
@@ -111,6 +123,12 @@ def _valid_persisted_store(persisted):
             ):
                 if not isinstance(item.get(str_key), str):
                     return False
+            if timestamp(item.get("created")) is None:
+                return False
+            if "location" not in item or not (
+                item["location"] is None or isinstance(item["location"], str)
+            ):
+                return False
             attempts = item.get("attempts")
             if not isinstance(attempts, int) or isinstance(attempts, bool):
                 return False
@@ -136,14 +154,25 @@ def _outbox_signature(groups, item):
 def _is_conflicting_cancel(event, old):
     if old is None:
         return False
+    event_refs = (
+        event.get("reference_identities") if event.get("cap_references_valid") else None
+    )
+    event_lineage = sorted({event["id"], *event.get("references", [])})
     matches = (
         event.get("status") == "Actual"
         and event.get("message_type") == "Cancel"
         and event.get("cap_identity") == old.get("cap_identity")
-        and event.get("reference_identities") == old.get("cap_references")
+        and event_refs == old.get("cap_references")
+        and (
+            event_refs is not None
+            or old.get("lineage") is None
+            or event_lineage == old.get("lineage")
+        )
     )
     if old.get("cancel_message") or old.get("cancellation_expired"):
         return not matches
+    if "cancel_message" not in old:
+        return False
     return event.get("status") == "Actual" and event.get("message_type") == "Cancel"
 
 
@@ -154,7 +183,6 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
         self.config = config
         self.store = store
-        self._store_recovered = False
         if not _valid_persisted_store(persisted):
             self.records = {}
             self.outbox = []
@@ -165,6 +193,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.degraded_reason = "malformed_store"
             self.degraded_at = None
             self.degraded_until = None
+            self.acknowledged_degraded_at = None
         else:
             persisted = persisted if isinstance(persisted, dict) else {}
             self.records = persisted.get("records", {})
@@ -187,24 +216,32 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.degraded_until = (
                 persisted.get("degraded_until") if self.degraded else None
             )
-        ack = config.get("acknowledge_degraded_at")
-        if self.degraded and ack is not None:
-            degraded_at_ts = timestamp(self.degraded_at)
-            ack_ts = timestamp(ack)
-            if (
-                self.degraded_reason == "malformed_store"
-                or degraded_at_ts is None
-                or (ack_ts is not None and ack_ts >= degraded_at_ts)
-            ):
-                if self.degraded_reason == "malformed_store":
-                    self._store_recovered = True
-                self.degraded = False
-                self.degraded_reason = None
-                self.degraded_at = None
-                self.degraded_until = None
+            self.acknowledged_degraded_at = persisted.get("acknowledged_degraded_at")
+        self._try_acknowledge(datetime.now(timezone.utc))
         self.session = async_get_clientsession(hass)
         self._refresh_lock = asyncio.Lock()
         self._stopping = False
+
+    def _try_acknowledge(self, current_now):
+        if not self.degraded or self.degraded_reason == "malformed_store":
+            return False
+        ack = self.config.get("acknowledge_degraded_at")
+        if ack is None or ack == self.acknowledged_degraded_at:
+            return False
+        degraded_at_ts = timestamp(self.degraded_at)
+        ack_ts = timestamp(ack)
+        if (
+            degraded_at_ts is None
+            or ack_ts is None
+            or not (degraded_at_ts <= ack_ts <= current_now)
+        ):
+            return False
+        self.acknowledged_degraded_at = ack
+        self.degraded = False
+        self.degraded_reason = None
+        self.degraded_at = None
+        self.degraded_until = None
+        return True
 
     async def _save(self, records, outbox, outcomes):
         await self.store.async_save(
@@ -218,6 +255,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 "degraded_reason": self.degraded_reason,
                 "degraded_at": self.degraded_at,
                 "degraded_until": self.degraded_until,
+                "acknowledged_degraded_at": self.acknowledged_degraded_at,
             }
         )
         self.records, self.outbox, self.outcomes, self.initialized = (
@@ -227,7 +265,6 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             True,
         )
         self.was_live = live(self.config)
-        self._store_recovered = False
 
     async def async_stop(self):
         self._stopping = True
@@ -240,16 +277,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 raise UpdateFailed("integration is stopping")
             return await self._update_once()
 
-    def _degraded_health(self, events=None, records=None, now=None):
+    def _degraded_health(
+        self, events=None, candidate_events=None, records=None, now=None
+    ):
         """Expose a redacted durable degraded state without delivering."""
         previous = getattr(self, "data", None) or {}
+        shown = candidate_events if candidate_events is not None else events
         quarantined_count = 0
         event_summaries = []
-        if events is not None:
+        if shown is not None:
             record_map = records or {}
             quarantined_count = getattr(events, "quarantined", 0) + sum(
-                record_map.get(e["id"], {}).get("state") == "quarantined"
-                for e in events
+                record_map.get(e["id"], {}).get("state") == "quarantined" for e in shown
             )
             event_summaries = [
                 {
@@ -261,15 +300,22 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     "state": record_map.get(e["id"], {}).get("state", "unknown"),
                     "reasons": record_map.get(e["id"], {}).get("reasons", []),
                 }
-                for e in events[:25]
+                for e in shown[:25]
             ]
-        quarantine_ambiguous = self.degraded_reason == "malformed_cancellation" or bool(
-            getattr(events, "quarantine_ambiguous", False)
-        )
-        cancellation_uncertain = self.degraded_reason in (
-            "cancellation_evidence_overflow",
-            "malformed_cancellation",
-            "conflicting_cancellation",
+        quarantine_ambiguous = bool(getattr(events, "quarantine_ambiguous", False))
+        triggered_now = now is not None and self.degraded_at == now.isoformat()
+        cancellation_uncertain = (
+            triggered_now
+            and self.degraded_reason
+            in (
+                "cancellation_evidence_overflow",
+                "malformed_cancellation",
+                "conflicting_cancellation",
+            )
+        ) or any(
+            r.get("state") == "quarantined"
+            and "cancellation scope uncertain" in r.get("reasons", [])
+            for r in (records or {}).values()
         )
         return {
             "last_success": (
@@ -277,7 +323,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 if events is not None and now is not None
                 else previous.get("last_success")
             ),
-            "event_count": len(events) if events is not None else 0,
+            "event_count": len(shown) if shown is not None else 0,
             "source_feature_count": (
                 getattr(events, "source_count", len(events))
                 if events is not None
@@ -296,6 +342,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "output_blocked": True,
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
+            "degraded_until": self.degraded_until,
             "shadow": not live(self.config),
             "events": event_summaries,
             "planned_count": 0,
@@ -368,11 +415,19 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 return self._degraded_health()
             events = await fetch(self.session, self.config["states"])
             source_events = getattr(events, "all_events", events)
+            candidate_events = resolve_candidates(self.records, events, source_events)
             conflicting_cancel = any(
                 _is_conflicting_cancel(event, self.records.get(event["id"]))
                 for event in source_events
             )
-            malformed_cancel = bool(getattr(events, "uncertain_cancellation", False))
+            malformed_cancel = bool(
+                getattr(events, "uncertain_cancellation", False)
+            ) or any(
+                event.get("status") == "Actual"
+                and event.get("message_type") == "Cancel"
+                and not event.get("references")
+                for event in source_events
+            )
             now = datetime.now(timezone.utc)
             # Initial shadow setup establishes a baseline; every subsequent restart reconciles normally.
             baseline = not self.initialized and not live(self.config)
@@ -387,7 +442,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             try:
                 records, plans = reconcile(
                     self.records,
-                    events,
+                    candidate_events,
                     self.config,
                     now,
                     baseline=baseline,
@@ -395,7 +450,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     partial=bool(getattr(events, "quarantined", 0)),
                     quarantine_lineages=getattr(events, "quarantined_lineages", ()),
                     quarantine_all=getattr(events, "quarantine_ambiguous", False),
-                    graph_events=getattr(events, "all_events", events),
+                    graph_events=source_events,
                 )
             except CancellationEvidenceOverflow as err:
                 records = err.records if err.records is not None else self.records
@@ -403,33 +458,47 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if degraded_trigger is not None:
                 self.degraded = True
                 self.degraded_reason = degraded_trigger
-                self.degraded_at = self.degraded_at or now.isoformat()
+                self.degraded_at = now.isoformat()
                 self.degraded_until = (now + MAX_ACCEPTANCE_AGE).isoformat()
             elif self.degraded:
-                if self.degraded_until is None:
-                    self.degraded_at = self.degraded_at or now.isoformat()
+                if self.degraded_at is None:
+                    self.degraded_at = now.isoformat()
+                    self.degraded_until = (now + MAX_ACCEPTANCE_AGE).isoformat()
+                elif self.degraded_until is None:
                     self.degraded_until = (
                         (timestamp(self.degraded_at) or now) + MAX_ACCEPTANCE_AGE
                     ).isoformat()
-                until = timestamp(self.degraded_until)
-                if until is not None and now > until:
-                    self.degraded = False
-                    self.degraded_reason = None
-                    self.degraded_at = None
-                    self.degraded_until = None
+                if not self._try_acknowledge(now):
+                    until = timestamp(self.degraded_until)
+                    if until is not None and now > until:
+                        self.degraded = False
+                        self.degraded_reason = None
+                        self.degraded_at = None
+                        self.degraded_until = None
             # Carry an undelivered item through equivalent NWS update identifiers.
             # Reconciled records contain only trusted Alert/Update edges;
             # raw source references could reconnect a quarantined forgery.
             groups, _ = lineage_index(records, [])
-            outbox = self._migrate_and_prune_outbox(records, events, now, groups)
+            outbox = self._migrate_and_prune_outbox(
+                records, candidate_events, now, groups
+            )
             if self.degraded:
+                for plan in plans:
+                    records.get(plan["id"], {}).get("actions", {}).pop(
+                        plan["fingerprint"], None
+                    )
                 try:
                     await self._save(records, outbox, list(self.outcomes))
                 except Exception as save_err:
                     raise UpdateFailed(
                         "Could not persist cancellation evidence safety state"
                     ) from save_err
-                return self._degraded_health(events=events, records=records, now=now)
+                return self._degraded_health(
+                    events=events,
+                    candidate_events=candidate_events,
+                    records=records,
+                    now=now,
+                )
             if live(self.config):
                 existing = {_outbox_signature(groups, item) for item in outbox}
                 for plan in plans:
@@ -447,7 +516,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 for x in self.outbox
                 if pending_valid(x, self.records, self.config, now)
             ][:100]
-            by_id = {event["id"]: event for event in events}
+            by_id = {event["id"]: event for event in candidate_events}
             deadline = now + timedelta(seconds=30)
             for offset in range(0, len(batch), 10):
                 if self._stopping:
@@ -501,7 +570,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(
                 f"NWS collection or state persistence failed: {type(err).__name__}"
             ) from err
-        by_id = {event["id"]: event for event in events}
+        by_id = {event["id"]: event for event in candidate_events}
         health_now = datetime.now(timezone.utc)
         current_eligible = {
             eid
@@ -515,26 +584,12 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             for item in self.outbox
         )
         quarantine_count = getattr(events, "quarantined", 0) + sum(
-            records[e["id"]]["state"] == "quarantined" for e in events
+            records[e["id"]]["state"] == "quarantined" for e in candidate_events
         )
-        cancellation_uncertain = (
-            any(
-                records[e["id"]].get("state") == "quarantined"
-                and "cancellation scope uncertain"
-                in records[e["id"]].get("reasons", [])
-                for e in events
-            )
-            or any(
-                record.get("state") == "quarantined"
-                and "cancellation scope uncertain" in record.get("reasons", [])
-                and record.get("updated") == now.isoformat()
-                for record in records.values()
-            )
-            or any(
-                "cancellation scope uncertain"
-                in records.get(item.get("incident_id"), {}).get("reasons", [])
-                for item in self.outbox
-            )
+        cancellation_uncertain = any(
+            record.get("state") == "quarantined"
+            and "cancellation scope uncertain" in record.get("reasons", [])
+            for record in records.values()
         )
         quarantine_ambiguous = bool(getattr(events, "quarantine_ambiguous", False))
         partial = (
@@ -542,15 +597,20 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
         return {
             "last_success": now.isoformat(),
-            "event_count": len(events),
-            "source_feature_count": getattr(events, "source_count", len(events)),
-            "active_count": sum(records[e["id"]]["state"] == "active" for e in events),
+            "event_count": len(candidate_events),
+            "source_feature_count": getattr(
+                events, "source_count", len(candidate_events)
+            ),
+            "active_count": sum(
+                records[e["id"]]["state"] == "active" for e in candidate_events
+            ),
             "partial": partial,
             "cancellation_uncertain": cancellation_uncertain,
             "evidence_degraded": False,
             "output_blocked": False,
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
+            "degraded_until": self.degraded_until,
             "quarantined_count": quarantine_count,
             "quarantine_ambiguous": quarantine_ambiguous,
             "shadow": not live(self.config),
@@ -564,7 +624,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     "state": records[e["id"]]["state"],
                     "reasons": records[e["id"]]["reasons"],
                 }
-                for e in events[:25]
+                for e in candidate_events[:25]
             ],
             "planned_count": len(plans),
             "pending_count": len(self.outbox),

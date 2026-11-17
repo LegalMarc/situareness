@@ -14,8 +14,10 @@ The release gate is open until the current candidate has zero supported unresolv
 | `847d0e56853f4d9bfdf4cdf3d1812f836bf58eba` | Standards | Claude Opus 5.5, medium effort | Ten findings; repaired on WIP branch |
 | `847d0e56853f4d9bfdf4cdf3d1812f836bf58eba` | Specification | Claude Opus 5.5, medium effort | Nine findings; repaired on WIP branch |
 | `63da80f6660667a529a3c4e0d1a0b7bc368760b5` | Focused browser/package | OpenAI `gpt-6-astra`, ultra | One P2 finding (`BROWSE-01`); repaired in `5ec38ac` |
-| `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Standards | Claude Opus 5.5, medium effort | Seven findings (`run_id`: `20261117T164428Z-8b628a`, 260.4s); repaired for next candidate |
-| `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Specification | Claude Opus 5.5, medium effort | Twelve findings (`run_id`: `20261117T164428Z-8b628a`, 225.2s); repaired for next candidate |
+| `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Standards | Claude Opus 5.5, medium effort | Seven findings (`run_id`: `20261117T164428Z-8b628a`, 260.4s); repaired in `e38a7fd` |
+| `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Specification | Claude Opus 5.5, medium effort | Twelve findings (`run_id`: `20261117T164428Z-8b628a`, 225.2s); repaired in `e38a7fd` |
+| `e38a7fdd88ff4877bf2969bad2658c5025ed583d` | Standards | Claude Opus 5.5, medium effort | Ten findings (`run_id`: `20261117T171412Z-dfb683`, 214.2s; zero browser/packaging defects); repaired for next candidate |
+| `e38a7fdd88ff4877bf2969bad2658c5025ed583d` | Specification | Claude Opus 5.5, medium effort | Eight findings (`run_id`: `20261117T171412Z-dfb683`, 204.1s; zero browser/packaging defects); repaired for next candidate |
 
 The exact model reported by completed CLI result metadata was `claude-opus-5-5`. The second standards/specification passes took 204.4 and 205.3 seconds respectively. They independently read an immutable full-source snapshot, complete change diff from the public root, documented contract/standards, and raw local test evidence. They executed no code or physical output.
 
@@ -125,4 +127,21 @@ Candidate `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` passed 128 local tests, but
 | SIT-L2 | Low | Disabled/failed/overdue USGS and BBC items lack visible cached badges, drifting from `o3-mvp.md`. | Extended `"cached"` badge to non-weather items when `sourceStates` is unavailable/overdue and updated `docs/setup.md`; re-review pending. |
 | SIT-N1 | Nit | Superseded records in cancellation groups hardcode `prior_state: "active"`. | Removed the hardcode and guarded `referenced` updates; re-review pending. |
 
-All 19 findings from `fcc9072` are repaired and pass 141 local automated tests, Ruff, deterministic packaging, and live anonymous smoke. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.
+### Candidate e38a7fd Opus review findings
+
+Candidate `e38a7fdd88ff4877bf2969bad2658c5025ed583d` passed 141 local tests and had zero supported defects in the browser room, UI, packaging, and source skill. Independent Claude Opus 5.5 medium-effort reviews (`run_id`: `20261117T171412Z-dfb683`; 214.2s standards, 204.1s specification) reported ten standards and eight specification findings in Home Assistant and HA documentation:
+
+| Axis | Code | Severity | Finding | Current disposition |
+| --- | --- | --- | --- | --- |
+| Standards | SIT-H1 | High | Alerts first qualifying while degraded mark `actions` and fail to deliver after recovery. | Strip withheld plan fingerprints from `actions` while degraded; re-review pending. |
+| Standards / Spec | SIT-M2, SIT-M3 / SIT-R1 | High / Medium | `acknowledge_degraded_at` accepts future timestamps, can be reused, and clears `malformed_store` or `degraded_at=None` legacies. | Enforced one-shot `degraded_at <= ack <= now`, backfilled `degraded_at` for legacy degraded stores, and kept `malformed_store` unacknowledged until store repair/replacement; re-review pending. |
+| Spec | SIT-R2 | High | Normalized `Actual Cancel` with no recoverable references avoids `malformed_cancellation`. | Trigger `malformed_cancellation` for normalized `Actual Cancel` with empty `references`; re-review pending. |
+| Spec | SIT-R3 | High | Update valid in collector but rejected against journal in `reconcile` still hides predecessor `P`. | Added `resolve_candidates` in `domain.py` and coordinator so rejected Updates restore valid predecessors; re-review pending. |
+| Standards / Spec | SIT-M1 / SIT-R4 | Medium | Upgrading legacy Cancel records or replaying Cancel with `cap_references_valid=False` latches false `conflicting_cancellation`. | Normalized incoming `cap_references` and lineage matching, and treated pre-upgrade records lacking `cancel_message` as legacy uncertainty; re-review pending. |
+| Standards / Spec | SIT-L1 / SIT-R5 | Low | `degraded_at` keeps only the earliest trigger timestamp when re-triggered. | Always update `degraded_at` and `degraded_until` on each active trigger; re-review pending. |
+| Standards / Spec | SIT-L4 / SIT-R6 | Low | Deep store validation omits outbox `location`/`created` and record `updated`/`inactive_since`/`cancel_message` checks. | Completed `_valid_persisted_store` validation across all dereferenced fields; re-review pending. |
+| Standards / Spec | SIT-L2, SIT-L3 / SIT-R7 | Low | `cancellation_uncertain` persists on resolved outbox items, `_degraded_health()` keeps `quarantine_ambiguous=True` across clean polls, and docs misstate `malformed_cancellation` triggers. | Scoped `cancellation_uncertain` and `quarantine_ambiguous` to active/current-poll evidence and synchronized docs; re-review pending. |
+| Standards / Spec | SIT-N1 / SIT-R8 | Nit | Dead `_store_recovered` attribute. | Removed `_store_recovered`; re-review pending. |
+| Standards | SIT-N2 | Nit | Documented `degraded_until` missing from sensor attributes. | Exposed `degraded_until` on normal and degraded sensor health; re-review pending. |
+
+All findings from `fcc9072` and `e38a7fd` are repaired and pass 143 local automated tests, Ruff, deterministic packaging, and live anonymous smoke. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.

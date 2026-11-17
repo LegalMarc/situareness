@@ -317,14 +317,18 @@ async def test_real_ha_degraded_collection_withholds_output_and_recovers_on_ack(
     assert state.attributes["output_blocked"] is True
     assert calls == []
 
-    # Reload with acknowledge_degraded_at restores normal monitoring and output.
-    ack_time = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    # Reload with a valid non-future acknowledge_degraded_at (>= degraded_at) restores normal output.
+    ack_time = datetime.now(timezone.utc).isoformat()
+    assert state.attributes["degraded_at"] <= ack_time
     config_path.write_text(json.dumps({**cfg, "acknowledge_degraded_at": ack_time}))
     fresh_ev = alert()
     fresh_ev["id"] += "-fresh"
     fresh_ev["cap_identity"][1] += "-fresh"
     await hass.config_entries.async_reload(entry.entry_id)
     await hass.async_block_till_done()
+    # Withheld alert `ev` from the degraded poll is delivered once recovery occurs.
+    assert len(calls) == 1
+    assert calls[0]["data"]["url"] == ev["id"]
     monkeypatch.setattr(
         component,
         "fetch",
@@ -337,5 +341,6 @@ async def test_real_ha_degraded_collection_withholds_output_and_recovers_on_ack(
     assert state.attributes["evidence_degraded"] is False
     assert state.attributes["output_blocked"] is False
     assert state.attributes["degraded_reason"] is None
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert calls[1]["data"]["url"] == fresh_ev["id"]
     assert await hass.config_entries.async_unload(entry.entry_id)

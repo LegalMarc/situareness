@@ -1301,6 +1301,78 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(events_cancel.quarantine_ambiguous)
         self.assertEqual((len(events_cancel), events_cancel.quarantined), (1, 1))
 
+        empty_ref_cancel = feature()
+        empty_ref_cancel["id"] += "-empty-ref-cancel"
+        empty_ref_cancel["properties"].update(
+            id=feature()["properties"]["id"] + "-empty-ref-cancel",
+            messageType="Cancel",
+            references=[],
+        )
+        events_empty_cancel = await collector.fetch(
+            Session(
+                Response(
+                    json.dumps(
+                        {
+                            "type": "FeatureCollection",
+                            "features": [empty_ref_cancel, feature()],
+                        }
+                    ).encode()
+                )
+            ),
+            ["NY"],
+        )
+        self.assertTrue(events_empty_cancel.uncertain_cancellation)
+
+    async def test_update_rejected_against_prior_restores_hidden_predecessor(self):
+        first = feature()
+        second = copy.deepcopy(first)
+        second["id"] += "-update"
+        second["properties"].update(
+            id=first["properties"]["id"] + "-update",
+            messageType="Update",
+            sent="2026-11-15T19:56:00Z",
+            references=[
+                {
+                    "@id": first["id"],
+                    "identifier": first["properties"]["id"],
+                    "sender": first["properties"]["sender"],
+                    "sent": first["properties"]["sent"],
+                }
+            ],
+        )
+        # Collector sees [first, second] cleanly and hides `first`.
+        events = await collector.fetch(
+            Session(
+                Response(
+                    json.dumps(
+                        {"type": "FeatureCollection", "features": [first, second]}
+                    ).encode()
+                )
+            ),
+            ["NY"],
+        )
+        self.assertEqual([e["id"] for e in events], [second["id"]])
+        # Prior state had a conflicting identity for `second`, so `second` is invalid in reconcile.
+        prior = {
+            second["id"]: {
+                "state": "ineligible",
+                "cap_identity": [
+                    "other@example.test",
+                    second["properties"]["id"],
+                    second["properties"]["sent"],
+                ],
+                "updated": NOW.isoformat(),
+            }
+        }
+        restored = d.resolve_candidates(prior, events, events.all_events)
+        self.assertEqual({e["id"] for e in restored}, {first["id"], second["id"]})
+        records, plans = d.reconcile(
+            prior, events, config(), NOW, graph_events=events.all_events
+        )
+        self.assertEqual(records[first["id"]]["state"], "active")
+        self.assertEqual(records[second["id"]]["state"], "quarantined")
+        self.assertEqual([p["id"] for p in plans], [first["id"]])
+
     async def test_malformed_actual_cancel_is_not_lost_as_a_simple_poll_error(self):
         bad = feature()
         bad["id"] = "not-a-valid-nws-id"

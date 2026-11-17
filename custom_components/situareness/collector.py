@@ -140,6 +140,12 @@ async def fetch(session, states):
             if event["id"] in events and events[event["id"]] != event:
                 raise ValueError("conflicting duplicate NWS message identity")
             events[event["id"]] = event
+            if (
+                event.get("status") == "Actual"
+                and event.get("message_type") == "Cancel"
+                and not event.get("references")
+            ):
+                uncertain_cancellation = True
             if len(events) > 1000:
                 raise ValueError("NWS event limit reached")
         pagination = payload.get("pagination") or {}
