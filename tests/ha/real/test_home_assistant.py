@@ -435,7 +435,6 @@ async def test_real_ha_journal_lost_first_poll_failure_and_remove_dismisses_noti
     await hass.async_block_till_done()
     assert entry.data.get("journal_lost_at") is not None
     assert "situareness_degraded" in hass.data.get("persistent_notification", {})
-    # Give HA Store delayed write time or read flushed storage once entry is removed? Check store via Store.async_load!
     from homeassistant.helpers.storage import Store
 
     saved = await Store(hass, 1, "situareness." + entry.entry_id).async_load()
@@ -448,3 +447,46 @@ async def test_real_ha_journal_lost_first_poll_failure_and_remove_dismisses_noti
     assert await hass.config_entries.async_remove(entry.entry_id)
     await hass.async_block_till_done()
     assert "situareness_degraded" not in hass.data.get("persistent_notification", {})
+
+
+async def test_real_ha_corrupt_json_store_latches_malformed_store(hass, monkeypatch):
+    cfg = {
+        "states": ["NY"],
+        "locations": {"new_york_ny": {"name": "New York", "point": [0.5, 0.5]}},
+        "approved_rules": {"Tornado Warning": ["Take shelter immediately"]},
+        "phones": ["mobile_app_test"],
+        "live_enabled": True,
+        "commissioning_passed": True,
+    }
+    Path(hass.config.path("situareness.json")).write_text(json.dumps(cfg))
+    calls = []
+    hass.services.async_register(
+        "notify", "mobile_app_test", lambda call: calls.append(call.data)
+    )
+    await integration_module(hass, monkeypatch, [])
+    entry = MockConfigEntry(domain="situareness", title="Situareness", data={})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+    storage_dir = Path(hass.config.path(".storage"))
+    storage_file = storage_dir / ("situareness." + entry.entry_id)
+    storage_file.write_text("{not valid json", encoding="utf-8")
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    state = hass.states.get("sensor.situareness_monitoring")
+    assert state is not None and state.state == "unknown"
+    assert state.attributes["evidence_degraded"] is True
+    assert state.attributes["output_blocked"] is True
+    assert state.attributes["degraded_reason"] == "malformed_store"
+    assert state.attributes["degraded_until"] is None
+    assert entry.data.get("journal_initialized") is True
+    assert "situareness_degraded" in hass.data.get("persistent_notification", {})
+    assert calls == []
+
+    assert await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert "situareness_degraded" not in hass.data.get("persistent_notification", {})
+    assert not list(storage_dir.glob(f"situareness.{entry.entry_id}.corrupt.*"))

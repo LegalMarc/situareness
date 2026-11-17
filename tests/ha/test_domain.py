@@ -1451,7 +1451,7 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(events_cancel.conflicting_cancellation)
 
     async def test_conflicting_identical_triplicate_and_5000_id_cap(self):
-        # SIT-SPEC-03: [A, A, A_conflict] reports quarantined == 3.
+        # Duplicate copies plus a conflicting third copy quarantine all three instances.
         a1 = feature()
         a2 = copy.deepcopy(a1)
         a_conflict = copy.deepcopy(a1)
@@ -1476,8 +1476,7 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.quarantined, 3)
         self.assertEqual(res.source_count, 4)
 
-        # SIT-R6 / SIT-DOC-04: 5000-ID cap counts feature_id AND reference IDs across
-        # quarantined features including conflicting duplicates.
+        # 5000-ID cap counts feature_id and reference IDs across quarantined features.
         many_bad = []
         # 50 features * 100 IDs (1 feature_id + 99 refs) = 5000 IDs (fits cleanly),
         # plus 1 more feature pushing past 5000 -> quarantine_ambiguous = True.
@@ -1503,9 +1502,32 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         total_retained = sum(len(lineage) for lineage in res_cap.quarantined_lineages)
         self.assertEqual(total_retained, 5000)
 
+        # Shared roots/references across quarantined features are counted once per poll.
+        shared_bad = []
+        shared_refs = [
+            {"@id": f"https://api.weather.gov/alerts/shared-r-{j}"} for j in range(99)
+        ]
+        for i in range(51):
+            bad = feature()
+            bad["id"] = f"https://api.weather.gov/alerts/sq-{i}"
+            bad["properties"]["headline"] = 123
+            bad["properties"]["references"] = shared_refs
+            shared_bad.append(bad)
+        res_shared = await collector.fetch(
+            Session(
+                Response(
+                    json.dumps(
+                        {"type": "FeatureCollection", "features": shared_bad}
+                    ).encode()
+                )
+            ),
+            ["NY"],
+        )
+        self.assertFalse(res_shared.quarantine_ambiguous)
+        self.assertEqual(len(res_shared.quarantined_lineages), 51)
+
     def test_scoped_non_cancel_quarantine_and_scoped_cancel_quarantine(self):
-        # SIT-SPEC-01: Malformed/oversized non-Cancel X referencing root R does NOT taint
-        # independently valid sibling S referencing R.
+        # Malformed or oversized non-Cancel referencing root R leaves sibling S active.
         root = cap_event("spec01-root", -10, message_type="Alert")
         sibling = cap_event("spec01-sibling", -5, [root])
         sibling["instruction"] = "Take shelter in a basement now."
@@ -1522,8 +1544,7 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(plans), 1)
         self.assertEqual(records[root["id"]]["state"], "superseded")
 
-        # SIT-R1: Scoped Cancel quarantine (quarantine_cancel_lineages) quarantines
-        # target & its descendants while keeping unrelated/root sibling active.
+        # Scoped Cancel quarantine blocks target and descendants while sibling stays active.
         target = cap_event("r1-target", -8, [root])
         target_child = cap_event("r1-target-child", -6, [target])
         recs2, _ = d.reconcile({}, [root, target, target_child], config(), NOW)
@@ -1590,8 +1611,13 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p["id"] for p in plans], [sibling["id"]])
         self.assertEqual(records[bad_cancel["id"]]["lineage"], [bad_cancel["id"]])
         self.assertEqual(records[bad_cancel["id"]]["uncertain_targets"], [target["id"]])
-        self.assertIsNone(records[bad_cancel["id"]]["cap_identity"])
+        self.assertEqual(
+            records[bad_cancel["id"]]["cap_identity"], bad_cancel["cap_identity"]
+        )
         self.assertIsNone(records[bad_cancel["id"]]["cap_references"])
+        self.assertFalse(
+            d.conflicting_prior_cancel(bad_cancel, records[bad_cancel["id"]])
+        )
 
         # Poll 2: bad_cancel is only in prior records; target stays quarantined while sibling remains active.
         records2, plans2 = d.reconcile(

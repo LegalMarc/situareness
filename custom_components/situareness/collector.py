@@ -47,32 +47,34 @@ async def fetch(session, states):
     quarantined = 0
     quarantined_lineages = []
     quarantined_cancel_lineages = []
-    quarantine_ids_count = 0
+    seen_quarantine_ids = set()
     quarantine_ambiguous = False
     uncertain_cancellation = False
     conflicting_cancellation = False
     feature_count = 0
 
     def add_quarantined_lineage(ids, is_cancel=False):
-        nonlocal quarantine_ids_count, quarantine_ambiguous
+        nonlocal quarantine_ambiguous
         if not ids:
             return True
         unique_ids = [ids[0], *dict.fromkeys(r for r in ids[1:] if r != ids[0])]
-        remaining = MAX_QUARANTINE_IDS - quarantine_ids_count
-        if len(unique_ids) <= remaining:
-            quarantine_ids_count += len(unique_ids)
-            quarantined_lineages.append(unique_ids)
+        retained = []
+        fits = True
+        for qid in unique_ids:
+            if qid in seen_quarantine_ids:
+                retained.append(qid)
+            elif len(seen_quarantine_ids) < MAX_QUARANTINE_IDS:
+                seen_quarantine_ids.add(qid)
+                retained.append(qid)
+            else:
+                quarantine_ambiguous = True
+                fits = False
+                break
+        if retained:
+            quarantined_lineages.append(retained)
             if is_cancel:
-                quarantined_cancel_lineages.append(unique_ids)
-            return True
-        if remaining > 0:
-            sliced = unique_ids[:remaining]
-            quarantined_lineages.append(sliced)
-            if is_cancel:
-                quarantined_cancel_lineages.append(sliced)
-            quarantine_ids_count = MAX_QUARANTINE_IDS
-        quarantine_ambiguous = True
-        return False
+                quarantined_cancel_lineages.append(retained)
+        return fits
 
     url = "https://api.weather.gov/alerts/active?" + urlencode(
         {"area": ",".join(states)}

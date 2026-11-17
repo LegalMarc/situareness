@@ -2,6 +2,20 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 seventh Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `f0e8a08` (`run_id`: `20261117T190130Z-35fadb`, 311.6s standards and 283.6s specification) reported **0 browser/UI/packaging/catalog findings**, and identified 9 unique findings in Home Assistant, docs, and tests (`SIT-H1` High, `SIT-HA-01` Medium, `SIT-HA-02`/`SIT-HA-03`/`SIT-L1` Low, `SIT-HA-04`/`SIT-HA-05`/`SIT-N1`/`SIT-DOC-01`/`SIT-TEST-01`/`SIT-N2` Nit).
+
+All 9 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor spec/reference/report updates:
+- **`SIT-H1` & `SIT-L1`**: Persisted incoming Cancel's `cap_identity`/`cap_references` + `uncertain_targets` on first save, matched `uncertain_targets` in `conflicting_prior_cancel`, routed invalid-Cancel `records` cleanly in `cancellation_evidence()` without poisoning `ambiguous_groups`, and extracted `_expire_cancellation_horizons`, `_cancel_record_identity`, `_quarantined_record`, `_bound_records`, `_latch_degraded`, and `_persist_degraded_poll`.
+- **`SIT-HA-01` & `SIT-HA-02`**: Wrapped `store.async_load()` exceptions and detected HA `.corrupt.*` backup files in `async_setup_entry()` so corrupt/unparseable JSON files latch `malformed_store`, cleared `.corrupt.*` backups on clean save/remove, and set `entry.data["journal_initialized"] = True` when loading any non-empty or malformed store.
+- **`SIT-HA-03`**: Replaced uncaught `ValueError` on `len(outbox) > 5000` with bounding the outbox at 5,000 targets, saving reconciled records/outbox under durable `outbox_overflow` degraded state, and raising `situareness_degraded`.
+- **`SIT-HA-04`, `SIT-HA-05`/`SIT-N1`, `SIT-DOC-01`, `SIT-TEST-01`/`SIT-N2`**: Set `_stopped_health()` `suspended_count = len(self.outbox)`, dismissed `situareness_degraded` before `Store.async_remove()` in `async_remove_entry()` (matching `o3-mvp.md`), tracked per-poll `seen_quarantine_ids` against the 5,000-ID limit, updated `docs/ha/README.md:45` to `Ten tests passed`, and replaced all inline review-code tags and drafting comments across `tests/ha/**` with behavioral descriptions.
+
+The complete local gates passed: 43 Node, 81 stdlib HA (`-W error`), 7 source-skill, 21 Chromium browser, and 10 actual-HA tests (162 total), plus static checks, Ruff lint/format, and two identical deterministic ZIP builds (`823de6d0...` extension, `76f0abc4...` HA). Actual HA reports five known upstream deprecations without suppression. Live anonymous smoke (`node tools/live-browser-smoke.mjs`) passed at `2026-11-17T19:22:26.316Z` with HTTP 200 across NWS (0 alerts), USGS (7 items), BBC World (24 items), and BBC US & Canada (23 items).
+
+Next: run `audit_private.py`, commit and push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, run independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews, and once both pass, run a fresh independent Opus `adversarial` review on that immutable candidate. Household outputs remain disabled and no commissioning occurred. `main` remains at `847d0e5`; once all release gates pass, fast-forward `main` and advance roadmap **S0** and **S1**.
+
 ## Continuation update: November 17 sixth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `120c3c4` (`run_id`: `20261117T184436Z-6d91c1`, 260.7s standards and 244.0s specification) reported **0 Critical, 0 High, and 0 browser/UI/packaging/catalog findings**, leaving 5 unique actionable findings (+1 non-blocking doc nit): `SIT-HA-01` (Medium), `SIT-SPEC-01`/`SIT-HA-02` (Low), `SIT-HA-03` (Nit), `SIT-DOC-03` (Low), `SIT-DOC-01`/`SIT-DOC-02` (Low), and non-blocking `SIT-DOC-02` (Nit).
