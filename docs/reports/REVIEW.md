@@ -34,8 +34,10 @@ The release gate is open until the current candidate has zero supported unresolv
 | `c0a909c3309f1fc9f88ec967d6765df977ed8ca2` | Specification | Claude Opus 5.5, medium effort | Three findings (0 Critical, 0 High, 2 Medium, 1 Low, 0 Nit; `run_id`: `20261117T194649Z-7a1803`, 390.8s; zero browser/UI/packaging/catalog defects); repaired in `221ed9b` |
 | `221ed9b037ea72e826f88716e14826c28e95a3df` | Standards | Claude Opus 5.5, medium effort | Seven findings (0 Critical, 0 High, 1 Medium, 4 Low, 2 Nit; `run_id`: `20261117T203507Z-d741fd`, 316.3s; zero CAP/browser/packaging/catalog/gate defects); repaired in `ad93ead` |
 | `221ed9b037ea72e826f88716e14826c28e95a3df` | Specification | Claude Opus 5.5, medium effort | Three findings (0 Critical, 0 High, 1 Medium, 2 Low, 0 Nit; `run_id`: `20261117T203507Z-d741fd`, 287.4s; zero CAP/browser/UI/packaging/catalog defects); repaired in `ad93ead` |
-| `ad93eada5a9222fe3120707180b24c2704dc5e7c` | Standards | Claude Opus 5.5, medium effort | Five findings (0 Critical, 0 High, 1 Medium, 2 Low, 2 Nit; `run_id`: `20261117T214931Z-ca8e85`, 318.6s; zero CAP/browser/packaging/catalog/quarantine defects); repaired in next candidate |
-| `ad93eada5a9222fe3120707180b24c2704dc5e7c` | Specification | Claude Opus 5.5, medium effort | Three findings (0 Critical, 0 High, 1 Medium, 1 Low-Medium, 1 Low; `run_id`: `20261117T214931Z-ca8e85`, 291.6s; zero CAP/qualification/quarantine/lifecycle/room/catalog defects); repaired in next candidate |
+| `ad93eada5a9222fe3120707180b24c2704dc5e7c` | Standards | Claude Opus 5.5, medium effort | Five findings (0 Critical, 0 High, 1 Medium, 2 Low, 2 Nit; `run_id`: `20261117T214931Z-ca8e85`, 318.6s; zero CAP/browser/packaging/catalog/quarantine defects); repaired in `3d18093` |
+| `ad93eada5a9222fe3120707180b24c2704dc5e7c` | Specification | Claude Opus 5.5, medium effort | Three findings (0 Critical, 0 High, 1 Medium, 1 Low-Medium, 1 Low; `run_id`: `20261117T214931Z-ca8e85`, 291.6s; zero CAP/qualification/quarantine/lifecycle/room/catalog defects); repaired in `3d18093` |
+| `3d1809327eafc2bb09c88ef104622e9eacb4b7cc` | Standards | Claude Opus 5.5, medium effort | Six findings (0 Critical, 0 High, 0 Medium, 3 Low, 3 Nit; `run_id`: `20261117T221552Z-4d6117`, 309.4s; zero browser/packaging/catalog/gate defects); repaired in next candidate |
+| `3d1809327eafc2bb09c88ef104622e9eacb4b7cc` | Specification | Claude Opus 5.5, medium effort | Two findings (0 Critical, 0 High, 0 Medium, 2 Low, 0 Nit + 1 capacity advisory; `run_id`: `20261117T221552Z-4d6117`, 308.7s; zero room/CAP/quarantine/outbox/lifecycle defects); repaired in next candidate |
 
 The exact model reported by completed CLI result metadata was `claude-opus-5-5`. The second standards/specification passes took 204.4 and 205.3 seconds respectively. They independently read an immutable full-source snapshot, complete change diff from the public root, documented contract/standards, and raw local test evidence. They executed no code or physical output.
 
@@ -314,4 +316,22 @@ Candidate `ad93eada5a9222fe3120707180b24c2704dc5e7c` passed 168 local tests (wit
 | Standards | SIT-R4 | Nit | `situareness_degraded` notification text hardcodes a "seven-day horizon" and omits `acknowledge_degraded_at` recovery instructions. | Differentiated `outbox_overflow`, horizon-extended evidence/journal degradations (`degraded_until` + `acknowledge_degraded_at` + reload), and `malformed_store` manual repair guidance; re-review pending. |
 | Standards | SIT-R5 | Nit | `test_reconcile_thousand_record_bounded_latency` uses a tight `< 0.5s` wall-clock assertion. | Asserted `d.deepcopy` `call_count == 1` deterministically and relaxed the wall-clock sanity bound to `< 5.0s`; re-review pending. |
 
-All findings from candidate `ad93ead` are being repaired on `wip/supervisor-handoff-20261117`. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.
+All findings from candidate `ad93ead` were verified fixed at `3d18093`.
+
+### Candidate 3d18093 Opus review findings
+
+Candidate `3d1809327eafc2bb09c88ef104622e9eacb4b7cc` passed 169 local tests (with zero asyncio slow-callback warnings), Ruff, deterministic packaging, and live anonymous smoke, with **0 Critical, 0 High, and 0 Medium findings**. Independent Claude Opus 5.5 medium-effort reviews (`run_id`: `20261117T221552Z-4d6117`; 309.4s standards, 308.7s specification) reported 3 Low + 3 Nit standards findings and 2 Low specification findings (7 unique findings total, plus 1 capacity advisory):
+
+| Axis | Code | Severity | Finding | Current disposition |
+| --- | --- | --- | --- | --- |
+| Standards / Spec | SIT-HA-01 / HA-JLOST-01 | Low | Reusing a stale `journal_lost_at` across repeat store loss or `malformed_store` deletion shortens the 7-day `journal_lost` hold. | Extended `degraded_until` from `max(lost_ts, detect_now) + MAX_ACCEPTANCE_AGE`, rotated stale timestamps older than 7 days, and cleared `journal_lost_at` on post-fetch saves, non-empty store loads, and `malformed_store` entry; re-review pending. |
+| Spec | HA-NOTIFY-01 | Low | `_sync_degraded_notification` picks `.storage` manual-repair text whenever `degraded_until` is null even for non-`malformed_store` reasons. | Selected notification copy by `degraded_reason` (`malformed_store` vs `outbox_overflow` vs `degraded_until`/`acknowledge_degraded_at`); re-review pending. |
+| Standards | SIT-HA-02 | Low | Persisted outboxes over 5,000 items pass validation and are truncated silently in `_queue_outbox_plans`. | Rejected `len(outbox) > 5000` in `_valid_persisted_store` as `malformed_store` and removed silent truncation; re-review pending. |
+| Standards | SIT-TOOL-01 | Low | `tools/live-browser-smoke.mjs` polling promise can reject unhandled after a timeout before `live-browser-smoke.json` writes. | Added a `stopped` flag checked in the polling loop and `smokePromise.catch(() => {})` before `Promise.race`; re-review pending. |
+| Standards | SIT-HA-03 | Nit | `async_setup_entry` assigns private `store._async_migrate_func`. | Removed the private attribute assignment; HA's default `NotImplementedError` and `UnsupportedStorageVersionError` continue mapping version mismatches to `malformed_store`; re-review pending. |
+| Standards | SIT-DOC-01 | Nit | `docs/spec/o3-mvp.md` §Home Assistant uses dense single-paragraph blocks restated across READMEs and `docs/CONTEXT.md`. | Reformatted `docs/spec/o3-mvp.md#home-assistant` as structured bulleted subsections and slimmed `docs/ha/README.md`, `home-assistant/README.md`, and `docs/CONTEXT.md` to concise links/summaries; re-review pending. |
+| Standards | SIT-HA-04 | Nit | Degraded notifications say "output is blocked" even in shadow mode. | Qualified degraded notification text when `live(self.config)` is false; re-review pending. |
+
+Advisory note `HA-CAP-01` (multi-state feeds near 1,000 features plus retained tombstones reaching the 1,000-record `cancellation_evidence_overflow` bound) is documented in `docs/spec/o3-mvp.md#home-assistant` and `docs/ha/README.md`.
+
+All findings from candidate `3d18093` are being repaired on `wip/supervisor-handoff-20261117`. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.

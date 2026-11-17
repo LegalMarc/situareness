@@ -533,12 +533,6 @@ async def test_real_ha_storage_version_mismatch_latches_malformed_store(
             "key": "situareness." + entry.entry_id,
             "data": {"records": {}},
         },
-        {
-            "version": 1,
-            "minor_version": 2,
-            "key": "situareness." + entry.entry_id,
-            "data": {"records": {}},
-        },
     ):
         raw_text = json.dumps(bad_envelope)
         storage_file.write_text(raw_text, encoding="utf-8")

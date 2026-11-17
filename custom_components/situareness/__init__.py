@@ -154,7 +154,7 @@ def _valid_persisted_store(persisted):
                     return False
     if "outbox" in persisted:
         outbox = persisted["outbox"]
-        if not isinstance(outbox, list):
+        if not isinstance(outbox, list) or len(outbox) > 5000:
             return False
         for item in outbox:
             if not isinstance(item, dict):
@@ -295,14 +295,16 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if self._entry is not None and (
                 self._entry.data.get("malformed_store_at") != stable_at
                 or self._entry.data.get("journal_initialized") is not True
+                or "journal_lost_at" in self._entry.data
             ):
+                new_data = {
+                    k: v for k, v in self._entry.data.items() if k != "journal_lost_at"
+                }
+                new_data["malformed_store_at"] = stable_at
+                new_data["journal_initialized"] = True
                 self.hass.config_entries.async_update_entry(
                     self._entry,
-                    data={
-                        **self._entry.data,
-                        "malformed_store_at": stable_at,
-                        "journal_initialized": True,
-                    },
+                    data=new_data,
                 )
         elif (
             self._entry is not None
@@ -311,13 +313,15 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         ):
             detect_now = datetime.now(timezone.utc)
             entry_lost_at = self._entry.data.get("journal_lost_at")
-            stable_lost_at = (
-                entry_lost_at
-                if isinstance(entry_lost_at, str)
-                and timestamp(entry_lost_at) is not None
-                else detect_now.isoformat()
+            entry_ts = (
+                timestamp(entry_lost_at) if isinstance(entry_lost_at, str) else None
             )
-            lost_ts = timestamp(stable_lost_at) or detect_now
+            if entry_ts is not None and detect_now - entry_ts <= MAX_ACCEPTANCE_AGE:
+                stable_lost_at = entry_lost_at
+                lost_ts = entry_ts
+            else:
+                stable_lost_at = detect_now.isoformat()
+                lost_ts = detect_now
             self.records = {}
             self.outbox = []
             self.outcomes = []
@@ -326,7 +330,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.degraded = True
             self.degraded_reason = "journal_lost"
             self.degraded_at = stable_lost_at
-            self.degraded_until = (lost_ts + MAX_ACCEPTANCE_AGE).isoformat()
+            self.degraded_until = (
+                max(lost_ts, detect_now) + MAX_ACCEPTANCE_AGE
+            ).isoformat()
             self.acknowledged_degraded_at = None
             self.last_degraded_poll = detect_now.isoformat()
             if self._entry.data.get("journal_lost_at") != stable_lost_at:
@@ -365,11 +371,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if (
                 self._entry is not None
                 and bool(persisted)
-                and self._entry.data.get("journal_initialized") is not True
+                and (
+                    self._entry.data.get("journal_initialized") is not True
+                    or "journal_lost_at" in self._entry.data
+                )
             ):
+                new_data = {
+                    k: v for k, v in self._entry.data.items() if k != "journal_lost_at"
+                }
+                new_data["journal_initialized"] = True
                 self.hass.config_entries.async_update_entry(
                     self._entry,
-                    data={**self._entry.data, "journal_initialized": True},
+                    data=new_data,
                 )
         self._needs_corrupt_cleanup = bool(
             has_corrupt_backup
@@ -414,7 +427,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.degraded_until = None
         return True
 
-    async def _save(self, records, outbox, outcomes):
+    async def _save(self, records, outbox, outcomes, *, preserve_lost_at=False):
         await self.store.async_save(
             {
                 "records": records,
@@ -445,48 +458,73 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     f"{DOMAIN}.{self._entry.entry_id}",
                 )
             self._needs_corrupt_cleanup = False
+        clear_lost_at = not preserve_lost_at
         if self._entry is not None and (
             self._entry.data.get("journal_initialized") is not True
             or "malformed_store_at" in self._entry.data
-            or (not self.degraded and "journal_lost_at" in self._entry.data)
+            or (clear_lost_at and "journal_lost_at" in self._entry.data)
         ):
             new_data = {
                 k: v
                 for k, v in self._entry.data.items()
                 if k != "malformed_store_at"
-                and (self.degraded or k != "journal_lost_at")
+                and (not clear_lost_at or k != "journal_lost_at")
             }
             new_data["journal_initialized"] = True
             self.hass.config_entries.async_update_entry(self._entry, data=new_data)
 
     def _sync_degraded_notification(self, quarantine_ambiguous=False):
         if self.degraded:
-            state = self.degraded_reason
+            is_live = live(self.config)
+            state = (self.degraded_reason, is_live)
             if self._notified_degraded_state != state:
                 if self.degraded_reason == "outbox_overflow":
                     title = "Situareness delivery outbox full"
-                    message = (
-                        "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld "
-                        "while already-queued targets continue bounded delivery until outbox space frees up, "
-                        "the 15-minute degraded_until horizon expires, or acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
-                        "Continue using independent official alert channels."
-                    )
-                elif self.degraded_until:
-                    title = "Situareness monitoring degraded"
-                    message = (
-                        f"Situareness output is blocked (reason: {self.degraded_reason}). "
-                        "Output remains withheld until the triggering condition clears and degraded_until "
-                        "(at least seven days or the latest evicted component horizon) expires, "
-                        "or until acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
-                        "Continue using independent official alert channels."
-                    )
+                    if is_live:
+                        message = (
+                            "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld "
+                            "while already-queued targets continue bounded delivery until outbox space frees up, "
+                            "the 15-minute degraded_until horizon expires, or acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
+                            "Continue using independent official alert channels."
+                        )
+                    else:
+                        message = (
+                            "Situareness monitoring is degraded in shadow mode (live output disabled): "
+                            "the outbox reached the 5,000-target limit and overflowing alert plans are withheld "
+                            "until outbox space frees up, the 15-minute degraded_until horizon expires, or "
+                            "acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
+                            "Continue using independent official alert channels."
+                        )
                 else:
                     title = "Situareness monitoring degraded"
-                    message = (
+                    prefix = (
                         f"Situareness output is blocked (reason: {self.degraded_reason}). "
-                        "Manual store repair or replacement in .storage (or removing and re-adding the integration entry) is required. "
-                        "Continue using independent official alert channels."
+                        if is_live
+                        else (
+                            "Situareness monitoring is degraded in shadow mode with live output disabled "
+                            f"(reason: {self.degraded_reason}). "
+                        )
                     )
+                    if self.degraded_reason == "malformed_store":
+                        message = (
+                            prefix
+                            + "Manual store repair or replacement in .storage (or removing and re-adding the integration entry) is required. "
+                            + "Continue using independent official alert channels."
+                        )
+                    else:
+                        tail = (
+                            "Output remains withheld until "
+                            if is_live
+                            else "Monitoring remains degraded in shadow mode until "
+                        )
+                        message = (
+                            prefix
+                            + tail
+                            + "the triggering condition clears and degraded_until "
+                            "(at least seven days or the latest evicted component horizon) expires, "
+                            "or until acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
+                            "Continue using independent official alert channels."
+                        )
                 persistent_notification.async_create(
                     self.hass,
                     message,
@@ -830,8 +868,6 @@ class SituarenessCoordinator(DataUpdateCoordinator):
     ):
         """Queue plans atomically up to 5,000 targets; drain pending deliverable work first if needed."""
         attempts = failures = 0
-        if len(outbox) > 5000:
-            return outbox[:5000], True, list(plans), records, attempts, failures, False
         if not live(self.config) or not plans:
             return outbox, False, [], records, attempts, failures, False
 
@@ -1042,7 +1078,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if self.degraded_reason == "journal_lost" and not self._journal_lost_saved:
                 try:
                     await self._save(
-                        dict(self.records), list(self.outbox), list(self.outcomes)
+                        dict(self.records),
+                        list(self.outbox),
+                        list(self.outcomes),
+                        preserve_lost_at=True,
                     )
                 except Exception as save_err:
                     raise UpdateFailed(
@@ -1255,12 +1294,6 @@ async def async_setup_entry(hass, entry):
         raise ConfigEntryNotReady(f"Invalid situareness.json: {err}") from err
     prefix = f"{DOMAIN}.{entry.entry_id}"
     store = Store(hass, 1, prefix, private=True)
-    if hasattr(store, "_async_migrate_func"):
-
-        async def _reject_migrate(old_major, old_minor, old_data):
-            raise ValueError(f"Unsupported storage version {old_major}.{old_minor}")
-
-        store._async_migrate_func = _reject_migrate
     has_corrupt_backup = False
     try:
         persisted = await store.async_load()

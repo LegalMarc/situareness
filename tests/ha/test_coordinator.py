@@ -2355,49 +2355,130 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
             ),
         )
+        t0 = datetime.now(timezone.utc)
+
+        class Clock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        Clock.current = t0
         store = Store()
-        coordinator = mod.SituarenessCoordinator(
-            hass, config(), store, None, entry=entry
-        )
-        self.assertTrue(coordinator.degraded)
-        self.assertEqual(coordinator.degraded_reason, "journal_lost")
-        self.assertIn("situareness_degraded", notifications)
-        lost_at = entry.data.get("journal_lost_at")
-        self.assertIsNotNone(lost_at)
-        expected_until = coordinator.degraded_until
+        with patch.object(mod, "datetime", Clock):
+            coordinator = mod.SituarenessCoordinator(
+                hass, config(), store, None, entry=entry
+            )
+            self.assertTrue(coordinator.degraded)
+            self.assertEqual(coordinator.degraded_reason, "journal_lost")
+            self.assertIn("situareness_degraded", notifications)
+            lost_at = entry.data.get("journal_lost_at")
+            self.assertEqual(lost_at, t0.isoformat())
+            expected_until = coordinator.degraded_until
 
-        async def failing_fetch(*args):
-            raise RuntimeError("NWS outage")
+            async def failing_fetch(*args):
+                raise RuntimeError("NWS outage")
 
-        with patch.object(mod, "fetch", failing_fetch):
-            with self.assertRaises(UpdateFailed):
-                await coordinator._async_update_data()
-        # Even though the first fetch failed, journal_lost was already persisted.
-        self.assertEqual(len(store.saved), 1)
-        self.assertTrue(store.saved[0]["degraded"])
-        self.assertEqual(store.saved[0]["degraded_reason"], "journal_lost")
-        self.assertEqual(store.saved[0]["degraded_at"], lost_at)
+            with patch.object(mod, "fetch", failing_fetch):
+                with self.assertRaises(UpdateFailed):
+                    await coordinator._async_update_data()
+            # Pre-fetch save preserves journal_lost_at on entry.data so failed poll 1 stays anchored.
+            self.assertEqual(len(store.saved), 1)
+            self.assertTrue(store.saved[0]["degraded"])
+            self.assertEqual(store.saved[0]["degraded_reason"], "journal_lost")
+            self.assertEqual(store.saved[0]["degraded_at"], lost_at)
+            self.assertEqual(entry.data.get("journal_lost_at"), lost_at)
 
-        # Reload with missing persisted store preserves original journal_lost_at / degraded_until.
-        reloaded = mod.SituarenessCoordinator(
-            hass, config(), Store(), None, entry=entry
-        )
-        self.assertEqual(reloaded.degraded_at, lost_at)
-        self.assertEqual(reloaded.degraded_until, expected_until)
+            # Same-instant reload preserves exact journal_lost_at and degraded_until.
+            reloaded = mod.SituarenessCoordinator(
+                hass, config(), Store(), None, entry=entry
+            )
+            self.assertEqual(reloaded.degraded_at, lost_at)
+            self.assertEqual(reloaded.degraded_until, expected_until)
 
-        await reloaded.async_stop()
-        self.assertNotIn("situareness_degraded", notifications)
+            await reloaded.async_stop()
+            self.assertNotIn("situareness_degraded", notifications)
+
+            # Without a poll-1 post-fetch save, Day-6 repeat loss retains lost_at but gives
+            # a full 7-day horizon from Day 6, while Day-8 rotates stale journal_lost_at.
+            day6 = t0 + timedelta(days=6)
+            Clock.current = day6
+            reloaded_day6 = mod.SituarenessCoordinator(
+                hass, config(), Store(), None, entry=entry
+            )
+            self.assertEqual(reloaded_day6.degraded_at, lost_at)
+            self.assertEqual(
+                reloaded_day6.degraded_until, (day6 + timedelta(days=7)).isoformat()
+            )
+            self.assertEqual(entry.data.get("journal_lost_at"), lost_at)
+
+            day8 = t0 + timedelta(days=8)
+            Clock.current = day8
+            reloaded_day8 = mod.SituarenessCoordinator(
+                hass, config(), Store(), None, entry=entry
+            )
+            self.assertEqual(reloaded_day8.degraded_at, day8.isoformat())
+            self.assertEqual(entry.data.get("journal_lost_at"), day8.isoformat())
+            self.assertEqual(
+                reloaded_day8.degraded_until, (day8 + timedelta(days=7)).isoformat()
+            )
+
+            # Post-fetch degraded save clears journal_lost_at so a subsequent Day-6 loss starts fresh.
+            Clock.current = t0
+            repeat_entry = types.SimpleNamespace(
+                entry_id="lost-repeat", data={"journal_initialized": True}
+            )
+            repeat_store = Store()
+            repeat_coord = mod.SituarenessCoordinator(
+                hass, config(), repeat_store, None, entry=repeat_entry
+            )
+            with patch.object(mod, "fetch", return_value=[]):
+                await repeat_coord._async_update_data()
+            self.assertNotIn("journal_lost_at", repeat_entry.data)
+            Clock.current = day6
+            repeat_day6 = mod.SituarenessCoordinator(
+                hass, config(), Store(), None, entry=repeat_entry
+            )
+            self.assertEqual(repeat_day6.degraded_at, day6.isoformat())
+            self.assertEqual(
+                repeat_day6.degraded_until, (day6 + timedelta(days=7)).isoformat()
+            )
+
+            # journal_lost -> malformed_store clears stale journal_lost_at; subsequent store
+            # deletion latches a fresh 7-day journal_lost horizon.
+            transition_entry = types.SimpleNamespace(
+                entry_id="lost-mal-lost", data={"journal_initialized": True}
+            )
+            Clock.current = t0
+            mod.SituarenessCoordinator(
+                hass, config(), Store(), None, entry=transition_entry
+            )
+            self.assertIn("journal_lost_at", transition_entry.data)
+            Clock.current = day6
+            mal_transition = mod.SituarenessCoordinator(
+                hass, config(), Store(), ["corrupt"], entry=transition_entry
+            )
+            self.assertEqual(mal_transition.degraded_reason, "malformed_store")
+            self.assertNotIn("journal_lost_at", transition_entry.data)
+            day7 = t0 + timedelta(days=7)
+            Clock.current = day7
+            fresh_after_mal = mod.SituarenessCoordinator(
+                hass, config(), Store(), None, entry=transition_entry
+            )
+            self.assertEqual(fresh_after_mal.degraded_reason, "journal_lost")
+            self.assertEqual(fresh_after_mal.degraded_at, day7.isoformat())
+            self.assertEqual(
+                fresh_after_mal.degraded_until, (day7 + timedelta(days=7)).isoformat()
+            )
 
         # Valid acknowledgement on reload clears degraded state, preserves journal_lost_at
         # until a clean save succeeds, and clears journal_lost_at once saved.
         ack_cfg = config()
-        ack_cfg["acknowledge_degraded_at"] = (
-            datetime.now(timezone.utc) + timedelta(seconds=1)
-        ).isoformat()
+        ack_cfg["acknowledge_degraded_at"] = (day8 + timedelta(seconds=1)).isoformat()
         store_ack = Store()
-        with patch.object(mod, "datetime") as mock_dt:
-            mock_dt.now.return_value = datetime.now(timezone.utc) + timedelta(seconds=2)
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        with patch.object(mod, "datetime", Clock):
+            Clock.current = day8 + timedelta(seconds=2)
             acked = mod.SituarenessCoordinator(
                 hass, ack_cfg, store_ack, None, entry=entry
             )
@@ -3248,3 +3329,119 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             h3 = await coord._async_update_data()
         self.assertEqual(h3["active_count"], 1)
         self.assertEqual(len(services.calls), 2)
+
+    async def test_notification_reason_selection_shadow_qualification_and_oversized_outbox(
+        self,
+    ):
+        from datetime import datetime, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        hass = types.SimpleNamespace(data={}, services=Services())
+        shadow_cfg = config()
+
+        # Legacy store with degraded_reason="cancellation_evidence_overflow" and degraded_until=None
+        # uses degraded_until / acknowledge_degraded_at guidance rather than .storage repair,
+        # and qualifies shadow mode truthfully.
+        legacy_coord = mod.SituarenessCoordinator(
+            hass,
+            shadow_cfg,
+            Store(),
+            {
+                "degraded": True,
+                "degraded_reason": "cancellation_evidence_overflow",
+                "degraded_until": None,
+            },
+        )
+        self.assertTrue(legacy_coord.degraded)
+        legacy_msg = notifications["situareness_degraded"]["message"]
+        self.assertIn("shadow mode", legacy_msg.lower())
+        self.assertIn("live output disabled", legacy_msg.lower())
+        self.assertNotIn("output is blocked", legacy_msg.lower())
+        self.assertIn("degraded_until", legacy_msg)
+        self.assertIn("acknowledge_degraded_at", legacy_msg)
+        self.assertNotIn(".storage", legacy_msg)
+
+        # Shadow-mode outbox_overflow and malformed_store also qualify shadow mode truthfully.
+        mod.SituarenessCoordinator(
+            hass,
+            shadow_cfg,
+            Store(),
+            {
+                "degraded": True,
+                "degraded_reason": "outbox_overflow",
+                "degraded_until": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        ov_note = notifications["situareness_degraded"]
+        self.assertEqual(ov_note["title"], "Situareness delivery outbox full")
+        self.assertIn("shadow mode", ov_note["message"].lower())
+        self.assertNotIn("continue bounded delivery", ov_note["message"].lower())
+
+        mod.SituarenessCoordinator(hass, shadow_cfg, Store(), ["corrupt"])
+        mal_msg = notifications["situareness_degraded"]["message"]
+        self.assertIn("shadow mode", mal_msg.lower())
+        self.assertNotIn("output is blocked", mal_msg.lower())
+        self.assertIn(".storage", mal_msg)
+
+        # Persisted outbox longer than 5,000 items is rejected as malformed_store without truncation.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        oversized_outbox = [
+            {
+                "key": f"k-{i}",
+                "incident_id": f"https://api.weather.gov/alerts/ov-{i}",
+                "fingerprint": f"fp-{i}",
+                "kind": "notify",
+                "target": "mobile_app_one",
+                "created": now_iso,
+                "event": "Tornado Warning",
+                "instruction": "Take shelter immediately",
+                "source_url": f"https://api.weather.gov/alerts/ov-{i}",
+                "affected_names": ["New York"],
+                "location": "New York",
+                "attempts": 0,
+            }
+            for i in range(5001)
+        ]
+        oversized_store = {"records": {}, "outbox": oversized_outbox}
+        self.assertFalse(mod._valid_persisted_store(oversized_store))
+        ov_store = Store()
+        ov_coord = mod.SituarenessCoordinator(
+            hass, shadow_cfg, ov_store, oversized_store
+        )
+        self.assertTrue(ov_coord.degraded)
+        self.assertEqual(ov_coord.degraded_reason, "malformed_store")
+        h_ov = await ov_coord._async_update_data()
+        self.assertEqual(h_ov["degraded_reason"], "malformed_store")
+        self.assertTrue(h_ov["output_blocked"])
+        self.assertEqual(ov_store.saved, [])
+        self.assertEqual(len(oversized_outbox), 5001)

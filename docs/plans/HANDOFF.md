@@ -2,6 +2,18 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 twelfth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `3d18093` (`run_id`: `20261117T221552Z-4d6117`, 309.4s standards and 308.7s specification) reported **0 Critical, 0 High, and 0 Medium findings**, leaving 7 small Low/Nit findings (`SIT-HA-01`/`HA-JLOST-01`, `HA-NOTIFY-01`, `SIT-HA-02`, `SIT-HA-03`, `SIT-TOOL-01`, `SIT-DOC-01`, `SIT-HA-04`) plus 1 advisory capacity note (`HA-CAP-01`).
+
+All 7 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor tool/doc/report updates:
+- **`SIT-HA-01` & `HA-JLOST-01`**: Extended `journal_lost` `degraded_until` from `max(lost_ts, detect_now) + MAX_ACCEPTANCE_AGE`, rotated stale `journal_lost_at` older than 7 days, cleared `journal_lost_at` on post-fetch saves (`preserve_lost_at=True` only on pre-fetch safety save), non-empty store loads, and `malformed_store` entry.
+- **`HA-NOTIFY-01` & `SIT-HA-04`**: Switched `_sync_degraded_notification()` selection strictly to `degraded_reason` (so legacy non-`malformed_store` entries with `degraded_until: None` receive `degraded_until`/`acknowledge_degraded_at` guidance instead of `.storage` instructions) and qualified degraded notifications when `live(self.config)` is false.
+- **`SIT-HA-02` & `SIT-HA-03`**: Rejected persisted outboxes over 5,000 items in `_valid_persisted_store()` as `malformed_store` (removing silent truncation), and removed private `store._async_migrate_func` patching while retaining `NotImplementedError`/`UnsupportedStorageVersionError` handling.
+- **`SIT-TOOL-01` & `SIT-DOC-01` / `HA-CAP-01`**: Added timeout cancellation guards (`stopped` + `smokePromise.catch`) in `tools/live-browser-smoke.mjs`, formatted `docs/spec/o3-mvp.md#home-assistant` as structured bulleted subsections (including the `HA-CAP-01` multi-state headroom note), and slimmed `docs/ha/README.md`, `home-assistant/README.md`, and `docs/CONTEXT.md` to concise links.
+
+Next: run complete local gates (`43` Node, `88` stdlib HA, `7` skill, `21` Chromium, `11` actual HA = `170` total), deterministic packaging (`823de6d0...` extension, `d7bc1dad...` HA), live anonymous smoke (`2026-11-17T22:27:51.635Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, and run Opus `axes` + fresh `adversarial` reviews. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 17 eleventh Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `ad93ead` (`run_id`: `20261117T214931Z-ca8e85`, 318.6s standards and 291.6s specification) reported **0 Critical, 0 High, and 0 CAP/qualification/quarantine/lifecycle/browser/packaging/catalog findings**, leaving 7 unique Home Assistant, test, and doc findings (`SIT-R1`/`HA-OVF-01` Medium, `HA-STORE-01` Low–Medium, `SIT-R2` Low, `SIT-R3` Low, `HA-IO-01` Low, `SIT-R4` Nit, `SIT-R5` Nit).
