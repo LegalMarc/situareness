@@ -2,6 +2,17 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 thirteenth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `6236ea8` (`run_id`: `20261117T223104Z-7fe723`, 215.8s standards and 202.2s specification) reported **0 Critical, 0 High, and zero room/live-gate/routing/quarantine/overflow defects**, leaving 7 HA/documentation findings (`SIT-HA-ACK-01`/`SIT-HA-02` Medium/Low, `SIT-DOC-01` Medium, `SIT-HA-CANCEL-02` Low, `SIT-HA-STORE-03` Low, `SIT-DOC-RETRY-04` Low, `SIT-NIT-05` Nit, `SIT-DOC-03` Nit).
+
+All 7 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor bundle-doc/contract/report updates:
+- **`SIT-HA-ACK-01` & `SIT-HA-02`**: Preserved initial `degraded_at` while extending `degraded_until` across unchanged degraded reasons, exposed `acknowledge_rejected` across snapshots and `situareness_degraded` notifications (including Poll 1 re-latch after load-time acknowledgement on a still-active trigger), and explicitly documented `>= degraded_at` and trigger-clear prerequisites.
+- **`SIT-DOC-01`, `SIT-DOC-RETRY-04`, `SIT-NIT-05`, & `SIT-DOC-03`**: Made `home-assistant/README.md` fully self-contained for the HA ZIP bundle (replacing external `../docs/` links), documented degraded-mode `last_degraded_poll` retry-age preservation up to 7+ days, added `event_count`/`source_feature_count`/`acknowledge_rejected` to `docs/ha/README.md`, and documented expired-item pruning saves alongside per-10-target-group delivery persistence.
+- **`SIT-HA-CANCEL-02` & `SIT-HA-STORE-03`**: Propagated external outer-task `asyncio.CancelledError` (`current_task.cancelling() > 0`) during `async_stop()`, and narrowed `store.async_load()` catch in `async_setup_entry()` so internal `TypeError`/`KeyError` raise `ConfigEntryNotReady` instead of latching `malformed_store`.
+
+Next: run complete local gates (`43` Node, `89` stdlib HA, `7` skill, `21` Chromium, `11` actual HA = `171` total), deterministic packaging (`823de6d0...` extension, `b50926c6...` HA), live anonymous smoke (`2026-11-17T22:41:41.061Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, and run Opus `axes` + fresh `adversarial` reviews. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 17 twelfth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `3d18093` (`run_id`: `20261117T221552Z-4d6117`, 309.4s standards and 308.7s specification) reported **0 Critical, 0 High, and 0 Medium findings**, leaving 7 small Low/Nit findings (`SIT-HA-01`/`HA-JLOST-01`, `HA-NOTIFY-01`, `SIT-HA-02`, `SIT-HA-03`, `SIT-TOOL-01`, `SIT-DOC-01`, `SIT-HA-04`) plus 1 advisory capacity note (`HA-CAP-01`).

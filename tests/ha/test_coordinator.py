@@ -2308,6 +2308,24 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result2["evidence_degraded"])
         self.assertTrue(result2["output_blocked"])
         self.assertEqual(result2["degraded_reason"], "journal_lost")
+        self.assertFalse(result2["acknowledge_rejected"])
+
+        # External cancellation of _async_update_data raises CancelledError even if _stopping is True.
+        started3 = asyncio.Event()
+
+        async def blocking_fetch3(*args):
+            started3.set()
+            await asyncio.sleep(60)
+            return []
+
+        ext_coord = mod.SituarenessCoordinator(hass, config(), Store(), {})
+        with patch.object(mod, "fetch", blocking_fetch3):
+            task3 = asyncio.create_task(ext_coord._async_update_data())
+            await asyncio.wait_for(started3.wait(), 2)
+            ext_coord._stopping = True
+            task3.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task3, 2)
 
     async def test_journal_lost_persists_before_first_fetch_and_stabilizes_horizon(
         self,
@@ -2749,8 +2767,13 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
 
             perm_err = RuntimeError("storage error")
             perm_err.__cause__ = PermissionError("denied")
-            for io_err in (OSError("read failure"), perm_err):
-                load_error = io_err
+            for non_corrupt_err in (
+                OSError("read failure"),
+                perm_err,
+                TypeError("unexpected type"),
+                KeyError("unexpected key"),
+            ):
+                load_error = non_corrupt_err
                 io_entry = types.SimpleNamespace(entry_id="io-load", data={})
                 with self.assertRaises(ConfigEntryNotReady):
                     await mod.async_setup_entry(setup_hass, io_entry)
@@ -3445,3 +3468,191 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(h_ov["output_blocked"])
         self.assertEqual(ov_store.saved, [])
         self.assertEqual(len(oversized_outbox), 5001)
+
+    async def test_acknowledge_stability_relatch_and_rejection_visibility(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        t0 = datetime.now(timezone.utc) - timedelta(minutes=20)
+
+        class Clock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        def make_bad_cancel(ts):
+            ev = d.normalize(feature())
+            ev["id"] = "https://api.weather.gov/alerts/bad-cancel-ack"
+            ev["message_type"] = "Cancel"
+            ev["references"] = []
+            for key, sec in [
+                ("sent", -60),
+                ("effective", -60),
+                ("onset", 0),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                ev[key] = (ts + timedelta(seconds=sec)).isoformat()
+            return ev
+
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+        services = Services()
+        store = Store()
+        hass = types.SimpleNamespace(data={}, services=services)
+
+        Clock.current = t0
+        bad_cancel = make_bad_cancel(t0)
+        with patch.object(mod, "datetime", Clock):
+            coord = mod.SituarenessCoordinator(hass, cfg, store, {})
+            with patch.object(mod, "fetch", return_value=[bad_cancel]):
+                h1 = await coord._async_update_data()
+            Clock.current = t0 + timedelta(minutes=2)
+            with patch.object(mod, "fetch", return_value=[bad_cancel]):
+                h2 = await coord._async_update_data()
+
+        # degraded_at stays pinned to initial latch t0 while degraded_until advances.
+        self.assertEqual(h1["degraded_reason"], "malformed_cancellation")
+        self.assertEqual(h1["degraded_at"], t0.isoformat())
+        self.assertEqual(h2["degraded_at"], t0.isoformat())
+        self.assertGreater(
+            d.timestamp(h2["degraded_until"]), d.timestamp(h1["degraded_until"])
+        )
+        self.assertFalse(h2["acknowledge_rejected"])
+
+        # Setting acknowledge_degraded_at to initial degraded_at recovers cleanly after trigger leaves feed.
+        cfg_pin_ack = {**cfg, "acknowledge_degraded_at": t0.isoformat()}
+        Clock.current = t0 + timedelta(minutes=3)
+        with patch.object(mod, "datetime", Clock):
+            recovered = mod.SituarenessCoordinator(
+                hass, cfg_pin_ack, Store(), store.saved[-1]
+            )
+            self.assertFalse(recovered.degraded)
+            self.assertFalse(recovered.acknowledge_rejected)
+            with patch.object(mod, "fetch", return_value=[]):
+                h_rec = await recovered._async_update_data()
+        self.assertFalse(h_rec["degraded_reason"] is not None)
+        self.assertFalse(h_rec["acknowledge_rejected"])
+
+        # Reloading with valid ack while trigger STILL persists re-latches on Poll 1
+        # with new degraded_at == Poll1_now and acknowledge_rejected == True.
+        cfg_active_ack = {
+            **cfg,
+            "acknowledge_degraded_at": (t0 + timedelta(minutes=3)).isoformat(),
+        }
+        Clock.current = t0 + timedelta(minutes=4)
+        with patch.object(mod, "datetime", Clock):
+            re_coord = mod.SituarenessCoordinator(
+                hass, cfg_active_ack, Store(), store.saved[-1]
+            )
+            self.assertFalse(re_coord.degraded)
+            Clock.current = t0 + timedelta(minutes=5)
+            with patch.object(mod, "fetch", return_value=[bad_cancel]):
+                h_relatch = await re_coord._async_update_data()
+        self.assertTrue(re_coord.degraded)
+        self.assertEqual(
+            h_relatch["degraded_at"], (t0 + timedelta(minutes=5)).isoformat()
+        )
+        self.assertTrue(h_relatch["acknowledge_rejected"])
+        relatch_msg = notifications["situareness_degraded"]["message"]
+        self.assertIn("re-latched", relatch_msg.lower())
+        self.assertIn("degraded_at", relatch_msg)
+
+        # Rejected acks (pre-degraded_at, already consumed, or malformed_store) expose acknowledge_rejected=True.
+        persisted_deg = {
+            "records": {},
+            "outbox": [],
+            "degraded": True,
+            "degraded_reason": "cancellation_evidence_overflow",
+            "degraded_at": (t0 + timedelta(minutes=5)).isoformat(),
+            "degraded_until": (t0 + timedelta(days=7)).isoformat(),
+            "acknowledged_degraded_at": (t0 + timedelta(minutes=6)).isoformat(),
+        }
+        Clock.current = t0 + timedelta(minutes=7)
+        with patch.object(mod, "datetime", Clock):
+            # Pre-degradation ack
+            early_coord = mod.SituarenessCoordinator(
+                hass,
+                {
+                    **cfg,
+                    "acknowledge_degraded_at": (t0 + timedelta(minutes=4)).isoformat(),
+                },
+                Store(),
+                persisted_deg,
+            )
+            self.assertTrue(early_coord.acknowledge_rejected)
+            self.assertIn(
+                "did not clear", notifications["situareness_degraded"]["message"]
+            )
+            with patch.object(mod, "fetch", return_value=[]):
+                h_early = await early_coord._async_update_data()
+            self.assertTrue(h_early["acknowledge_rejected"])
+
+            # Already-consumed ack
+            same_coord = mod.SituarenessCoordinator(
+                hass,
+                {
+                    **cfg,
+                    "acknowledge_degraded_at": (t0 + timedelta(minutes=6)).isoformat(),
+                },
+                Store(),
+                persisted_deg,
+            )
+            self.assertTrue(same_coord.acknowledge_rejected)
+            with patch.object(mod, "fetch", return_value=[]):
+                h_same = await same_coord._async_update_data()
+            self.assertTrue(h_same["acknowledge_rejected"])
+
+            # malformed_store with configured ack
+            mal_coord = mod.SituarenessCoordinator(
+                hass,
+                {
+                    **cfg,
+                    "acknowledge_degraded_at": (t0 + timedelta(minutes=6)).isoformat(),
+                },
+                Store(),
+                ["corrupt"],
+            )
+            self.assertTrue(mal_coord.acknowledge_rejected)
+            mal_msg = notifications["situareness_degraded"]["message"]
+            self.assertIn("did not clear", mal_msg)
+            self.assertIn(".storage", mal_msg)
+            h_mal = await mal_coord._async_update_data()
+            self.assertTrue(h_mal["acknowledge_rejected"])

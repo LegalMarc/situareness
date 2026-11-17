@@ -393,6 +393,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             and self.degraded_reason == "journal_lost"
             and (persisted is None or persisted == {})
         )
+        self.acknowledge_rejected = False
+        self._ack_cleared_on_load = False
         self._try_acknowledge(datetime.now(timezone.utc))
         self.session = async_get_clientsession(hass)
         self._refresh_lock = asyncio.Lock()
@@ -403,13 +405,19 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self._sync_degraded_notification()
 
     def _try_acknowledge(self, current_now):
-        if self.degraded_reason == "malformed_store":
-            return False
         ack = self.config.get("acknowledge_degraded_at")
-        if ack is None or ack == self.acknowledged_degraded_at:
+        if ack is None:
+            self.acknowledge_rejected = False
             return False
         if not self.degraded:
             self.acknowledged_degraded_at = ack
+            self.acknowledge_rejected = False
+            return False
+        if (
+            self.degraded_reason == "malformed_store"
+            or ack == self.acknowledged_degraded_at
+        ):
+            self.acknowledge_rejected = True
             return False
         degraded_at_ts = timestamp(self.degraded_at)
         ack_ts = timestamp(ack)
@@ -419,8 +427,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             or not (degraded_at_ts <= ack_ts <= current_now)
         ):
             self.acknowledged_degraded_at = ack
+            self.acknowledge_rejected = True
             return False
         self.acknowledged_degraded_at = ack
+        self.acknowledge_rejected = False
+        self._ack_cleared_on_load = True
         self.degraded = False
         self.degraded_reason = None
         self.degraded_at = None
@@ -476,23 +487,37 @@ class SituarenessCoordinator(DataUpdateCoordinator):
     def _sync_degraded_notification(self, quarantine_ambiguous=False):
         if self.degraded:
             is_live = live(self.config)
-            state = (self.degraded_reason, is_live)
+            state = (self.degraded_reason, is_live, self.acknowledge_rejected)
             if self._notified_degraded_state != state:
+                rej_note = (
+                    "Configured acknowledge_degraded_at did not clear this state "
+                    "(malformed_store cannot be acknowledged, or acknowledge_degraded_at preceded degraded_at, "
+                    "was already consumed, or the triggering condition remained active and re-latched). "
+                    if self.acknowledge_rejected
+                    else ""
+                )
                 if self.degraded_reason == "outbox_overflow":
                     title = "Situareness delivery outbox full"
                     if is_live:
                         message = (
                             "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld "
-                            "while already-queued targets continue bounded delivery until outbox space frees up, "
-                            "the 15-minute degraded_until horizon expires, or acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
+                            "while already-queued targets continue bounded delivery. "
+                            + rej_note
+                            + "This clears automatically once outbox space frees up or the 15-minute degraded_until horizon expires; "
+                            "one-shot acknowledge_degraded_at in situareness.json "
+                            "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                            "only once outbox overflow has cleared (otherwise the next poll re-latches with a new degraded_at). "
                             "Continue using independent official alert channels."
                         )
                     else:
                         message = (
                             "Situareness monitoring is degraded in shadow mode (live output disabled): "
-                            "the outbox reached the 5,000-target limit and overflowing alert plans are withheld "
-                            "until outbox space frees up, the 15-minute degraded_until horizon expires, or "
-                            "acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
+                            "the outbox reached the 5,000-target limit and overflowing alert plans are withheld. "
+                            + rej_note
+                            + "This clears automatically once outbox space frees up or the 15-minute degraded_until horizon expires; "
+                            "one-shot acknowledge_degraded_at in situareness.json "
+                            "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                            "only once outbox overflow has cleared (otherwise the next poll re-latches with a new degraded_at). "
                             "Continue using independent official alert channels."
                         )
                 else:
@@ -508,6 +533,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     if self.degraded_reason == "malformed_store":
                         message = (
                             prefix
+                            + rej_note
                             + "Manual store repair or replacement in .storage (or removing and re-adding the integration entry) is required. "
                             + "Continue using independent official alert channels."
                         )
@@ -519,10 +545,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         )
                         message = (
                             prefix
+                            + rej_note
                             + tail
                             + "the triggering condition clears and degraded_until "
                             "(at least seven days or the latest evicted component horizon) expires, "
-                            "or until acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
+                            "or until one-shot acknowledge_degraded_at in situareness.json "
+                            "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                            "once the triggering feed condition has left the feed "
+                            "(otherwise the next poll re-latches with a new degraded_at). "
                             "Continue using independent official alert channels."
                         )
                 persistent_notification.async_create(
@@ -680,6 +710,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
             "degraded_until": self.degraded_until,
+            "acknowledge_rejected": self.acknowledge_rejected,
             "shadow": not live(self.config),
             "events": event_summaries,
             "planned_count": planned_count,
@@ -709,6 +740,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "degraded_reason": None,
             "degraded_at": None,
             "degraded_until": None,
+            "acknowledge_rejected": False,
             "shadow": not live(self.config),
             "events": [],
             "planned_count": 0,
@@ -795,9 +827,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
     def _latch_degraded(self, reason, now, until=None):
         default_window = MAX_AGE if reason == "outbox_overflow" else MAX_ACCEPTANCE_AGE
         candidate_until = until or (now + default_window)
-        if self.degraded and (
-            self.degraded_reason == reason or reason != "outbox_overflow"
-        ):
+        same_reason = self.degraded and self.degraded_reason == reason
+        if self.degraded and (same_reason or reason != "outbox_overflow"):
             existing_until = timestamp(self.degraded_until)
         else:
             existing_until = None
@@ -806,9 +837,12 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if existing_until is not None
             else candidate_until
         )
+        if not (same_reason and timestamp(self.degraded_at) is not None):
+            self.degraded_at = now.isoformat()
+        if self._ack_cleared_on_load:
+            self.acknowledge_rejected = True
         self.degraded = True
         self.degraded_reason = reason
-        self.degraded_at = now.isoformat()
         self.degraded_until = new_until.isoformat()
 
     @staticmethod
@@ -928,7 +962,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
     async def _deliver_outbox_batch(self, candidate_events, now):
         """Deliver one bounded poll batch (max 100 targets, 30s deadline)."""
         attempts = failures = 0
-        # Each completed attempt is persisted. A crash between service call and save may duplicate it.
+        # Expired items and each completed 10-target delivery group are persisted; a crash between service call and save may duplicate that group.
         batch = list(
             islice(
                 (
@@ -1045,6 +1079,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
             "degraded_until": self.degraded_until,
+            "acknowledge_rejected": False,
             "quarantined_count": quarantine_count,
             "quarantine_ambiguous": quarantine_ambiguous,
             "shadow": not live(self.config),
@@ -1094,7 +1129,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             try:
                 events = await self._fetch_task
             except asyncio.CancelledError:
-                if self._stopping:
+                current_task = asyncio.current_task()
+                if self._stopping and (
+                    current_task is None or current_task.cancelling() == 0
+                ):
                     return (
                         self.data
                         if getattr(self, "data", None) is not None
@@ -1194,6 +1232,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     self.degraded_reason = None
                     self.degraded_at = None
                     self.degraded_until = None
+                    self.acknowledge_rejected = False
             degraded_delta = (
                 now - last_ts
                 if (
@@ -1212,6 +1251,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 records, candidate_events, now, groups, degraded_delta=degraded_delta
             )
             if self.degraded and self.degraded_reason != "outbox_overflow":
+                self._ack_cleared_on_load = False
                 return await self._persist_degraded_poll(
                     records,
                     plans,
@@ -1236,6 +1276,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             )
             if outbox_overflow:
                 self._latch_degraded("outbox_overflow", now, now + MAX_AGE)
+                self._ack_cleared_on_load = False
                 self._strip_withheld_actions(records, dropped_plans, groups, now)
                 self.last_degraded_poll = None
                 await self._save(records, outbox, list(self.outcomes))
@@ -1261,6 +1302,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self.degraded_reason = None
                 self.degraded_at = None
                 self.degraded_until = None
+                self.acknowledge_rejected = False
+            self._ack_cleared_on_load = False
             self.last_degraded_poll = None
             await self._save(records, outbox, list(self.outcomes))
             if not already_delivered:
@@ -1297,7 +1340,7 @@ async def async_setup_entry(hass, entry):
     has_corrupt_backup = False
     try:
         persisted = await store.async_load()
-    except (json.JSONDecodeError, ValueError, TypeError, KeyError, NotImplementedError):
+    except (json.JSONDecodeError, ValueError, NotImplementedError):
         persisted = ["unreadable"]
     except Exception as err:
         cause = getattr(err, "__cause__", None)
