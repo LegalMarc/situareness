@@ -481,3 +481,37 @@ test("old current alerts without expiry age out and failed sources lose priority
     false,
   );
 });
+
+test("retention priority agrees with source freshness", () => {
+  const now = new Date("2026-11-15T12:00:00Z");
+  const alert = {
+    id: "alert",
+    source_id: "nws",
+    collected_at: "2026-11-15T11:00:00Z",
+    awareness_lifecycle: "current",
+  };
+  const newer = Array.from({ length: 500 }, (_, i) => ({
+    id: `news-${i}`,
+    collected_at: now.toISOString(),
+  }));
+  const source = {
+    id: "nws",
+    enabled: true,
+    status: "ok",
+    interval_minutes: 1,
+    last_success_at: "2026-11-15T11:00:00Z",
+  };
+  assert.equal(
+    retainEvents([alert, ...newer], [], now, [source]).events.some(
+      (event) => event.id === "alert",
+    ),
+    false,
+  );
+  source.last_success_at = now.toISOString();
+  assert.equal(
+    retainEvents([alert, ...newer], [], now, [source]).events.some(
+      (event) => event.id === "alert",
+    ),
+    true,
+  );
+});

@@ -86,6 +86,10 @@ body {
   background:#788899;
   box-shadow:0 0 0 3px #78889922
 }
+.status-dot.neutral {
+  background:#788899;
+  box-shadow:0 0 0 3px #78889922
+}
 .status-dot.ok {
   background:var(--green);
   box-shadow:0 0 0 3px #75d7aa22
@@ -316,6 +320,9 @@ button:disabled {
   width:7px;
   border-radius:50%;
   flex:none;
+  background:#66798b
+}
+.source-status.disabled {
   background:#66798b
 }
 .source-status.ok {
@@ -957,6 +964,7 @@ dialog::backdrop {
   padding: 3px 6px;
   text-transform: uppercase;
 }
+.presence-pill.cached { border-color: #5e4b36; background: #2c241c; color: #d1b07c; }
 .presence-pill.current { border-color: #315b55; background: #1b302e; color: #9ad6c7; }
 .presence-pill.expired { border-color: #5e4b36; background: #2c241c; color: #d1b07c; }
 .presence-pill.not_in_latest_fetch { border-color: #4b475e; background: #242332; color: #b6b0d4; }

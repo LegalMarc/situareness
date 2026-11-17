@@ -241,13 +241,30 @@ def action_history(record):
     if isinstance(record.get("actions"), dict):
         return record["actions"]
     action = record.get("action_fingerprint")
-    if not action and record.get("state") in ("active", "ended_or_absent"):
+    if not action and semantic_state(record) in ("active", "ended_or_absent"):
         action = record.get("fingerprint")
     return (
         {action: record.get("action_affected", record.get("affected", []))}
         if action
         else {}
     )
+
+
+def semantic_state(record):
+    """Keep local collection uncertainty separate from source inactivity."""
+    state = record.get("state")
+    if state in ("quarantined", "unconfirmed"):
+        return record.get("prior_state") or "ineligible"
+    return state
+
+
+def suspend_record(record, state, now):
+    previous = semantic_state(record)
+    inactive_since = record.get("inactive_since")
+    if previous in ("ineligible", "ended_or_absent") and not inactive_since:
+        inactive_since = record.get("updated")
+    return {**record, "actions": action_history(record), "state": state, "prior_state": previous,
+            "inactive_since": inactive_since, "updated": now.isoformat()}
 
 
 def action_identity(event):
@@ -341,7 +358,7 @@ def reconcile(
         for record_id in ids:
             record = prior[record_id]
             summary["tombstone"] |= bool(record.get("cancel_message"))
-            state = record.get("state")
+            state = semantic_state(record)
             if state in ("superseded", "cancelled"):
                 continue
             bucket = "inactive" if state in inactive_states else "active"
@@ -364,10 +381,7 @@ def reconcile(
     for group in quarantine_groups:
         for eid in members.get(group, []):
             if records[eid].get("state") not in ("cancelled", "superseded"):
-                records[eid]["state"] = "quarantined"
-                records[eid]["inactive_since"] = (
-                    records[eid].get("inactive_since") or now.isoformat()
-                )
+                records[eid] = suspend_record(records[eid], "quarantined", now)
     for event in events:
         eid = event["id"]
         group = groups[eid]
@@ -385,16 +399,14 @@ def reconcile(
         )
         if group in quarantine_groups:
             old_record = records.get(eid, {})
-            records[eid] = {
-                "state": "quarantined",
+            records[eid] = {**suspend_record(old_record, "quarantined", now),
                 "fingerprint": fp,
                 "actions": action_history(old_record),
                 "action_identity": old_record.get("action_identity"),
                 "lineage": sorted({eid, *refs}),
                 "reasons": ["lineage quarantined"],
+                "cancel_message": cancelled or old_record.get("cancel_message", False),
                 "affected": [],
-                "inactive_since": old_record.get("inactive_since") or now.isoformat(),
-                "updated": now.isoformat(),
             }
             seen.add(eid)
             quarantined = True
@@ -406,7 +418,6 @@ def reconcile(
                 merge_bounded(actions, summary.get(bucket, {}))
             else:
                 indexed = summary.get(bucket + "_identity", {})
-                merge_bounded(actions, indexed.get(None, {}))
                 merge_bounded(actions, indexed.get(identity, {}))
 
         include_bucket("active")
@@ -418,30 +429,24 @@ def reconcile(
         else:
             for record_id in {eid, *refs}:
                 record = prior.get(record_id, {})
-                if record.get("state") not in inactive_states:
+                if semantic_state(record) not in inactive_states:
                     continue
                 since = timestamp(record.get("inactive_since") or record.get("updated"))
                 if not since or since > now or now - since > timedelta(minutes=15):
                     continue
                 inactive_dates.append(since)
-                if decision["qualifies"] or record.get("action_identity") in (
-                    None,
-                    identity,
-                ):
+                if decision["qualifies"] or record.get("action_identity") == identity:
                     merge_bounded(actions, action_history(record))
         if len(actions) > 100:
             quarantined = True
             old_record = records.get(eid, {})
-            records[eid] = {
-                "state": "quarantined",
+            records[eid] = {**suspend_record(old_record, "quarantined", now),
                 "fingerprint": fp,
                 "actions": action_history(old_record),
                 "action_identity": old_record.get("action_identity"),
                 "lineage": sorted({eid, *refs}),
                 "reasons": ["action history limit exceeded"],
                 "affected": [],
-                "inactive_since": old_record.get("inactive_since") or now.isoformat(),
-                "updated": now.isoformat(),
             }
             seen.add(eid)
             continue
@@ -512,14 +517,16 @@ def reconcile(
             records[ref]["state"] = "superseded"
     for eid, record in records.items():
         if eid not in seen and record.get("state") == "active":
-            record["state"] = (
-                "unconfirmed" if partial or quarantined else "ended_or_absent"
-            )
-            record["inactive_since"] = now.isoformat()
-            record["updated"] = now.isoformat()
+            if partial or quarantined:
+                records[eid] = suspend_record(record, "unconfirmed", now)
+            else:
+                record.update(state="ended_or_absent", inactive_since=now.isoformat(), updated=now.isoformat())
+        elif eid not in seen and not (partial or quarantined) and record.get("state") in ("unconfirmed", "quarantined"):
+            since = record.get("inactive_since") if semantic_state(record) in ("ineligible", "ended_or_absent") else now.isoformat()
+            record.update(state="ended_or_absent", inactive_since=since, updated=now.isoformat())
     records = dict(
         sorted(
-            records.items(), key=lambda item: item[1].get("updated", ""), reverse=True
+            records.items(), key=lambda item: (item[0] in seen, item[1].get("updated", "")), reverse=True
         )[:1000]
     )
     return records, plans

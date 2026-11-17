@@ -1,3 +1,6 @@
+import { sourceFreshness } from "../lib/freshness.js";
+export { sourceFreshness } from "../lib/freshness.js";
+
 const SECRET_KEY = /(?:token|secret|password|credential|api[_-]?key)/i;
 const PRIVATE_KEYS = new Set([
   "household_exposure",
@@ -156,18 +159,6 @@ export function parsePublicConfig(jsonText) {
   return cleaned;
 }
 
-export function sourceFreshness(source, now = Date.now()) {
-  if (source?.enabled === false) return "disabled";
-  if (!source || source.status === "error") return "error";
-  const stamp = Date.parse(source.last_success_at || "");
-  if (!Number.isFinite(stamp)) return source.status === "ok" ? "stale" : "idle";
-  const interval = Number(source.interval_minutes);
-  const staleAfterMinutes =
-    Number.isFinite(interval) && interval > 0 ? Math.max(2, interval * 2) : 30;
-  const staleAfter = staleAfterMinutes * 60_000;
-  return now - stamp > staleAfter ? "stale" : "ok";
-}
-
 export function relativeAge(value, now = Date.now()) {
   const time = Date.parse(value || "");
   if (!Number.isFinite(time)) return "No successful fetch";
@@ -242,10 +233,12 @@ export function nwsAwarenessLifecycle(
     return "not_in_latest_fetch";
   if (event.awareness_lifecycle === "current") {
     if (sourceStates) {
-      const state = sourceStates.find(
+      const state = (Array.isArray(sourceStates) ? sourceStates : []).find(
         (source) => source.id === event.source_id,
       );
-      const config = sources.find((source) => source.id === event.source_id);
+      const config = Array.isArray(sources)
+        ? sources.find((source) => source.id === event.source_id)
+        : undefined;
       if (
         !state ||
         sourceFreshness(

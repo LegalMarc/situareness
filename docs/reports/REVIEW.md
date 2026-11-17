@@ -50,6 +50,39 @@ Codes preserve the specification reviewer's separate axis. Repairs are implement
 | SPEC-RM-04 | Low | An all-disabled room appears healthy and busy. |
 | SPEC-RM-05 | Nit | Manual/install refreshes do not reset collection cadence. |
 
+## Third candidate findings
+
+Candidate `847d0e56853f4d9bfdf4cdf3d1812f836bf58eba` passed 93 local automated tests, but independent Opus 5.5 medium-effort reviews found the following. Workers were interrupted by account usage limits; partial repairs and preliminary primary-source captures are preserved in the WIP handoff, with supported findings still open. This is not release approval. Previous narratives were deliberately omitted from the review packets, while executable code, contracts, tests and standards were included.
+
+### Standards
+
+| Code | Severity | Finding |
+| --- | --- | --- |
+| SR-01 | Medium-high | Long quarantine can erase delivered-action history and cause duplicate alarms. |
+| SR-02 | Low | Quarantined/unconfirmed states fail to resolve and can revive legacy history. |
+| SR-03 | Low-medium | Reload can discard acceptance records for in-flight delivery. |
+| SR-04 | Low | Carried retry items are not deduplicated against each other after a merge. |
+| SR-05 | Low | The journal cap can evict a current record and cause persistent refresh failure. |
+| SR-06 | Low | Backward clock correction can stall Chrome alarm collection. |
+| SR-07 | Low | Whole-component cancellation may stop a continuing sibling segment; source semantics need verification. |
+| SR-08 | Low | The HA guide contradicts itself about partial collections. |
+| SR-09 | Nit | Retention priority ignores source freshness. |
+| SR-10 | Nit | Dashboard setting instructions and UI label drift. |
+
+### Specification
+
+| Code | Severity | Finding |
+| --- | --- | --- |
+| SPEC-01 | Medium | Quarantine can discard a cancellation tombstone. |
+| SPEC-02 | Low | Legacy journal migration can lose or misapply action history. |
+| SPEC-03 | Low | The journal cap can evict current records and cancellation evidence. |
+| SPEC-04 | Low | Reload can duplicate in-flight deliveries. |
+| SPEC-05 | Low | Room retention priority ignores freshness. |
+| SPEC-06 | Low | Worker-side bundled-configuration failure is not identified clearly. |
+| SPEC-07 | Nit | New neutral/disabled/cached classes lack distinct visual styles. |
+| SPEC-08 | Nit | Dashboard documentation label differs from the UI. |
+| SPEC-09 | Nit | A helper assumes an array without validating it. |
+
 ## Evidence limits
 
-The candidate passed 79 automated tests, a live anonymous browser read, and deterministic packaging before these findings were discovered. Those successes did not cover the reported triggers. Home Assistant source and delivery targets were simulated. The live smoke returned no NWS alerts, so it cannot validate real CAP lineage. Physical commissioning, broader primary-source adapters, automatic health escalation and the browser-to-HA health bridge remain separate work.
+Candidate `2c0f1e1` passed 79 automated tests and `847d0e5` passed 93, plus live anonymous browser reads and deterministic packaging, before their respective findings were discovered. These results do not describe the newer failing WIP. Those successes did not cover the reported triggers. Home Assistant source and delivery targets were simulated. The live smoke returned no NWS alerts, so it cannot validate real CAP lineage. Physical commissioning, broader primary-source adapters, automatic health escalation and the browser-to-HA health bridge remain separate work.

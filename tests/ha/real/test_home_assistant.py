@@ -215,11 +215,12 @@ async def test_removal_cannot_recreate_store_during_refresh(hass, monkeypatch):
     monkeypatch.setattr(component, "fetch", slow_fetch)
     refresh = asyncio.create_task(coordinator._async_update_data())
     await started.wait()
-    assert await hass.config_entries.async_unload(entry.entry_id)
-    await hass.config_entries.async_remove(entry.entry_id)
+    unloading = asyncio.create_task(hass.config_entries.async_unload(entry.entry_id))
+    await asyncio.sleep(0)
     release.set()
-    with pytest.raises(Exception, match="state persistence failed"):
-        await refresh
+    await refresh
+    assert await unloading
+    await hass.config_entries.async_remove(entry.entry_id)
     assert not (
         Path(hass.config.path(".storage")) / ("situareness." + entry.entry_id)
     ).exists()

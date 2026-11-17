@@ -391,3 +391,18 @@ test("weather presence is marked cached when its source is unavailable or overdu
     "current",
   );
 });
+
+test("weather lifecycle tolerates absent source configuration", () => {
+  const event = {
+    source_id: "nws",
+    awareness_lifecycle: "current",
+    category: "weather",
+    official: true,
+  };
+  assert.equal(
+    nwsAwarenessLifecycle(event, Date.now(), null, [
+      { id: "nws", status: "error" },
+    ]),
+    "cached",
+  );
+});

@@ -55,14 +55,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.initialized = persisted.get("initialized") is True
         self.was_live = persisted.get("was_live") is True
         self.session = async_get_clientsession(hass)
-        self._save_lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
         self._stopping = False
 
     async def _save(self, records, outbox, outcomes):
-        async with self._save_lock:
-            if self._stopping:
-                raise RuntimeError("integration is stopping")
-            await self.store.async_save(
+        await self.store.async_save(
                 {
                     "records": records,
                     "outbox": outbox,
@@ -70,20 +67,27 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     "initialized": True,
                     "was_live": live(self.config),
                 }
-            )
-            self.records, self.outbox, self.outcomes, self.initialized = (
-                records,
-                outbox,
-                outcomes[-100:],
-                True,
-            )
-            self.was_live = live(self.config)
+        )
+        self.records, self.outbox, self.outcomes, self.initialized = (
+            records,
+            outbox,
+            outcomes[-100:],
+            True,
+        )
+        self.was_live = live(self.config)
 
     async def async_stop(self):
-        async with self._save_lock:
-            self._stopping = True
+        self._stopping = True
+        async with self._refresh_lock:
+            pass
 
     async def _async_update_data(self):
+        async with self._refresh_lock:
+            if self._stopping:
+                raise UpdateFailed("integration is stopping")
+            return await self._update_once()
+
+    async def _update_once(self):
         try:
             events = await fetch(self.session, self.config["states"])
             now = datetime.now(timezone.utc)
@@ -153,7 +157,21 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         x["location"],
                     )
 
-                existing = {signature(x) for x in outbox}
+                unique = {}
+                for item in outbox:
+                    key = signature(item)
+                    if key in unique:
+                        prior_item = unique[key]
+                        # Keep the strictest retry bounds when lineages merge.
+                        unique[key] = {
+                            **prior_item,
+                            "created": min(prior_item["created"], item["created"]),
+                            "attempts": max(prior_item["attempts"], item["attempts"]),
+                        }
+                    else:
+                        unique[key] = item
+                outbox = list(unique.values())
+                existing = set(unique)
                 for plan in plans:
                     for item in targets(plan, self.config, now):
                         if signature(item) not in existing:

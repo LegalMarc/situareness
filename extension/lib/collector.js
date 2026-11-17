@@ -1,4 +1,5 @@
 import { MAX_SOURCE_ITEMS, normalizeJson, normalizeRss } from "./normalize.js";
+import { sourceFreshness } from "./freshness.js";
 
 export const MAX_BYTES = 8_000_000;
 export const MAX_EVENTS = 500;
@@ -38,6 +39,7 @@ export function sourceState(source, previous) {
     name: source.name,
     url: source.url,
     enabled: source.enabled,
+    interval_minutes: source.interval_minutes,
     status: previous?.status || "idle",
     last_attempt_at: previous?.last_attempt_at || null,
     last_alarm_tick: Number.isSafeInteger(previous?.last_alarm_tick)
@@ -171,7 +173,8 @@ export function retainEvents(existing, results, now, sources = null) {
           (source) =>
             source.id === item.source_id &&
             source.enabled !== false &&
-            source.status === "ok",
+            source.status === "ok" &&
+            sourceFreshness(source, now.getTime()) === "ok",
         )) &&
       (!Number.isFinite(Date.parse(item.expires_at)) ||
         Date.parse(item.expires_at) > now.getTime())

@@ -418,3 +418,77 @@ test("disabled cached events age out even without any collection", async () => {
     Date.now = originalNow;
   }
 });
+
+test("clock rollback does not suppress recurring alarms", async () => {
+  const now = Date.now();
+  const originalNow = Date.now;
+  const requests = [];
+  Date.now = () => now;
+  globalThis.fetch = async (url) => {
+    if (url.startsWith("chrome-extension:"))
+      return new Response(JSON.stringify(defaults));
+    requests.push(url);
+    return new Response(
+      url.includes("bbci.co.uk")
+        ? "<rss></rss>"
+        : JSON.stringify({ features: [] }),
+    );
+  };
+  persisted.situareness_state_v1 = {
+    config: structuredClone(defaults),
+    events: [],
+    sources: defaults.sources.map((source) => ({
+      ...source,
+      status: "ok",
+      last_alarm_tick: 10,
+    })),
+    collector: {
+      alarm_tick: 10,
+      last_alarm_clock_at: now + 3600_000,
+      last_non_alarm_clock_at: now + 3600_000,
+    },
+  };
+  try {
+    await import("../../extension/background.js?rollback");
+    listeners.alarm({ name: "situareness_collect", scheduledTime: now - 100 });
+    await send({ type: "GET_STATE" });
+    assert.equal(
+      requests.filter((url) => url.includes("weather.gov")).length,
+      1,
+    );
+    assert.equal(
+      persisted.situareness_state_v1.collector.last_non_alarm_clock_at,
+      null,
+    );
+    Date.now = () => now + 60_000;
+    listeners.alarm({
+      name: "situareness_collect",
+      scheduledTime: now + 60_000,
+    });
+    await send({ type: "GET_STATE" });
+    assert.equal(
+      requests.filter((url) => url.includes("weather.gov")).length,
+      2,
+    );
+  } finally {
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("worker identifies invalid bundled defaults explicitly", async () => {
+  persisted.situareness_state_v1 = { config: { schema_version: 99 } };
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ schema_version: 99 }));
+  try {
+    await import("../../extension/background.js?invalid-bundled");
+    const response = await send({ type: "GET_STATE" });
+    assert.equal(response.ok, false);
+    assert.equal(
+      response.error,
+      "Bundled configuration is unavailable or invalid.",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

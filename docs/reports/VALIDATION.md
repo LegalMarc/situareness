@@ -2,11 +2,13 @@
 
 ## Current status
 
-Public-release preparation, November 16, 2026. This is a locally tested prototype with household outputs disabled by default. Production installation and audible commissioning have not been performed. Independent standards and specification reviews identified issues in two candidates. The further repair pass is locally tested; fresh review and the final adversarial pass remain pending; see the [separate review record](REVIEW.md). A complete independent release review is still pending; interrupted or timed-out review attempts are not approvals.
+November 17, 2026 UTC handoff: public `main` remains at `847d0e5`, a locally tested prototype with household outputs disabled. That candidate passed 93 automated tests but failed independent standards/specification review. The interrupted repairs are preserved separately on `wip/supervisor-handoff-20261117`. The WIP is not fully tested or approved: static checks and 38 Node tests pass, one of 33 HA tests fails, two Python files need formatting, and the new freshness module is missing from the installation allowlist. See [the supervisor handoff](../plans/HANDOFF.md) and [separate review findings](REVIEW.md).
+
+No production installation, audible commissioning or clean final adversarial review has occurred. Interrupted or quota-limited attempts are not approvals.
 
 ## Automated evidence
 
-The new repair checkpoint passed static checks, 34 Node tests, 33 standard-library Home Assistant policy/boundary/packaging tests, seven companion-catalog tests, and 14 isolated Chromium browser tests. Five additional tests passed against Home Assistant 2026.11.1, including the actual loader, entity/service registries, disk-backed private storage, recorder SQLite exclusions, and removal during an in-flight refresh. Source events and output targets were simulated locally. This is 93 automated tests total, with no household device delivery.
+Candidate `847d0e56853f4d9bfdf4cdf3d1812f836bf58eba` passed static checks, 34 Node tests, 33 standard-library Home Assistant policy/boundary/packaging tests, seven companion-catalog tests, and 14 isolated Chromium browser tests. Five additional tests passed against Home Assistant 2026.11.1, including the actual loader, entity/service registries, disk-backed private storage, recorder SQLite exclusions, and removal during an in-flight refresh. Source events and output targets were simulated locally. This is 93 automated tests total, with no household device delivery.
 
 Ruff lint and formatting passed, and the standard-library HA suite passed with warnings treated as errors. A read-only live browser smoke test on November 16 received HTTP 200 from NWS, USGS and both BBC endpoints; NWS returned no current items in the sample NY/DC query. Two installation archive builds produced identical manifests and SHA-256 hashes. These checks cannot validate real CAP lineage or source availability beyond that observation.
 
@@ -14,7 +16,7 @@ The real Home Assistant test dependency stack emitted five upstream deprecation 
 
 ## Required release checks
 
-The initial public root was published after a verified privacy review with zero findings. Its clean history contains generic examples and approved public material. Review-driven changes are being checkpointed publicly with release review still pending; this is not a commissioned release. Before a release, recheck the complete tree and Git history. Check local-data exclusions and installation archives, run the complete current test commands, and perform a live anonymous read-only source smoke test. Record the exact public candidate SHA and independent reviewer evidence here when those checks finish.
+The initial public root was published after a verified privacy review with zero findings. Its clean history contains generic examples and approved public material. Review-driven changes are being checkpointed publicly with release review still pending; this is not a commissioned release. Before a release, resolve the handoff failures and all supported review findings, then recheck the complete tree and Git history. Check local-data exclusions and installation archives, run the complete current test commands, and perform a live anonymous read-only source smoke test. Record the exact public candidate SHA and independent reviewer evidence here when those checks finish.
 
 ## Limits
 

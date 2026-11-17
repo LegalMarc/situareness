@@ -43,8 +43,15 @@ async function initialize() {
   try {
     config = validateConfig(stored?.config);
   } catch {
-    const response = await fetch(chrome.runtime.getURL("defaults/config.json"));
-    config = validateConfig(await response.json());
+    try {
+      const response = await fetch(
+        chrome.runtime.getURL("defaults/config.json"),
+      );
+      if (!response.ok) throw new Error("Bundled defaults unavailable");
+      config = validateConfig(await response.json());
+    } catch {
+      throw new Error("Bundled configuration is unavailable or invalid.");
+    }
   }
   const storedSources = Array.isArray(stored?.sources) ? stored.sources : [];
   const nwsIds = new Set(
@@ -163,13 +170,15 @@ async function parseRss(text) {
 async function refresh(force, alarmClockAt = null, scheduledTime = null) {
   await initialize();
   if (state.collector.paused) return state;
+  const nowMs = Date.now();
+  if (state.collector.last_non_alarm_clock_at > nowMs)
+    state.collector.last_non_alarm_clock_at = null;
   if (
     Number.isFinite(scheduledTime) &&
     state.collector.last_non_alarm_clock_at !== null &&
     scheduledTime <= state.collector.last_non_alarm_clock_at
   )
     return state;
-  const nowMs = Date.now();
   // Count periodic alarm slots independently of request and storage latency. Chrome
   // may deliver early or late; the observed delivery clock catches up after sleep.
   if (Number.isFinite(alarmClockAt)) {
@@ -364,7 +373,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       ok: false,
       error:
         error instanceof Error &&
-        /^(Configuration|Invalid|Private|Source URL|Paused|Unknown request)/.test(
+        /^(Configuration|Invalid|Private|Source URL|Paused|Unknown request|Bundled configuration)/.test(
           error.message,
         )
           ? error.message
