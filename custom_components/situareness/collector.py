@@ -3,7 +3,12 @@
 import asyncio
 import json
 from urllib.parse import urlencode, urlparse
-from .domain import OversizedFeature, cap_event_valid, normalize, safe_url
+from .domain import (
+    OversizedFeature,
+    normalize,
+    resolve_candidates,
+    safe_url,
+)
 
 MAX_BYTES = 8 * 1024 * 1024
 MAX_PAGES = 10
@@ -145,34 +150,21 @@ async def fetch(session, states):
                     if isinstance(properties, dict)
                     else None
                 )
-                if (
-                    feature_id
-                    and isinstance(properties, dict)
-                    and (raw_refs is None or isinstance(raw_refs, list))
-                ):
-                    refs = raw_refs or []
-                    refs_valid = True
-                    valid_ref_ids = []
-                    for ref in refs:
-                        ref_id = ref.get("@id") if isinstance(ref, dict) else None
-                        if (
-                            not isinstance(ref_id, str)
-                            or len(ref_id) > 512
-                            or not safe_url(ref_id)
-                            or (
-                                is_cancel
-                                and (
-                                    not ref_id.isascii()
-                                    or not ref_id.startswith(
-                                        "https://api.weather.gov/alerts/"
-                                    )
-                                )
-                            )
-                        ):
-                            refs_valid = False
-                            quarantine_ambiguous = True
-                        else:
-                            valid_ref_ids.append(ref_id)
+                if feature_id and isinstance(properties, dict):
+                    refs = raw_refs if isinstance(raw_refs, list) else []
+                    valid_ref_ids = [
+                        ref_id
+                        for ref in refs
+                        if isinstance(ref, dict)
+                        and isinstance(ref_id := ref.get("@id"), str)
+                        and len(ref_id) <= 512
+                        and ref_id.isascii()
+                        and safe_url(ref_id)
+                        and ref_id.startswith("https://api.weather.gov/alerts/")
+                    ]
+                    refs_valid = (
+                        raw_refs is None or isinstance(raw_refs, list)
+                    ) and len(valid_ref_ids) == len(refs)
                     fits = add_quarantined_lineage(
                         [feature_id, *valid_ref_ids], is_cancel=is_cancel
                     )
@@ -249,28 +241,15 @@ async def fetch(session, states):
             raise ValueError("invalid NWS pagination")
     else:
         raise ValueError("NWS pagination limit reached")
-    superseded = set()
-    for event in events.values():
-        if not cap_event_valid(event):
-            continue
-        references = list(zip(event["references"], event["reference_identities"]))
-        if any(
-            (existing := events.get(ref)) is not None
-            and (
-                not cap_event_valid(existing)
-                or existing.get("cap_identity") != identity
-            )
-            for ref, identity in references
-        ):
-            continue
-        superseded.update(ref for ref, _ in references)
+    all_events = list(events.values())
+    candidates = resolve_candidates({}, all_events, all_events)
     return CollectedEvents(
-        [event for eid, event in events.items() if eid not in superseded],
+        candidates,
         quarantined,
         quarantined_lineages,
         quarantine_ambiguous,
         feature_count,
-        all_events=list(events.values()),
+        all_events=all_events,
         uncertain_cancellation=uncertain_cancellation,
         conflicting_cancellation=conflicting_cancellation,
         quarantined_cancel_lineages=quarantined_cancel_lineages,

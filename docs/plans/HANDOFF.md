@@ -2,6 +2,22 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 ninth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `c0a909c` (`run_id`: `20261117T194649Z-7a1803`, 329.5s standards and 390.8s specification) reported **0 Critical, 0 High, and 0 browser/UI/packaging/catalog/output-gate findings**, leaving 10 Home Assistant and documentation findings (3 Medium, 3 Low, 4 Nit).
+
+All 10 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor contract/reference/report updates:
+- **`SAF-01`**: Scoped non-`Cancel` malformed/oversized features with valid `feature_id` to `[feature_id, *valid_refs]` in `collector.py`, raised `situareness_degraded` on `quarantine_ambiguous` with clean recovery dismissal, and aligned `o3-mvp.md`, `cap-cancellation.md`, and HA READMEs.
+- **`SPEC-HA-01`**: Preserved already-queued targets' action fingerprints on initial `outbox_overflow` latching so acknowledged reload recovery delivers the capped 5,000-target outbox cleanly instead of self-relatching on active alerts.
+- **`SPEC-HA-02`**: Distinguished valid unreferenced continuing segments (`sent >= cancelled_at`, via persisted `cancelled_at`) so new qualifying actions plan as `active`, temporary ineligibility preserves continuing actions without false quarantine, superseded continuing records do not pollute `partial`, and repeating pre-cancellation actions stay withheld as `quarantined`.
+- **`SPEC-HA-03`**: Added the `sent <= now + 5m` clock check to `cap_event_valid(event, now)` and graph/cancellation validation so future-dated `Actual Cancel` records isolate `uncertain_targets` without writing raw `lineage` edges or flipping to cancelled after clock catch-up.
+- **`HLT-01`, `PRV-01`, & `CMP-01`**: Replaced timestamp-string equality in `_degraded_health()` with explicit `triggered_now`, `recoverable_prior_conflict`, and `quarantined_cancel_lineages` checks; passed `private=True` to `Store` on load/removal; passed `config_entry=entry` to `DataUpdateCoordinator.__init__`.
+- **`MNT-01`, `DOC-01`, & `DOC-02`**: Reused `resolve_candidates` in `collector.py`, extracted `_deliver_outbox_batch` and `_healthy_snapshot` in `__init__.py`, split `o3-mvp.md` §Home Assistant into readable paragraphs, documented `conflicting_cancellation` vs `malformed_cancellation` for over-cap Cancels, and clarified suspended retry retention past uncertainty resolution in `docs/ha/README.md`.
+
+The complete local gates passed: 43 Node, 85 stdlib HA (`-W error`), 7 source-skill, 21 Chromium browser, and 10 actual-HA tests (166 total), plus static checks, Ruff lint/format, and two identical deterministic ZIP builds (`823de6d0...` extension, `bea4f884...` HA). Actual HA reports five known upstream deprecations without suppression. Live anonymous smoke (`node tools/live-browser-smoke.mjs`) passed at `2026-11-17T20:31:57.387Z` with HTTP 200 across NWS (0 alerts), USGS (10 items), BBC World (25 items), and BBC US & Canada (23 items).
+
+Next: run `audit_private.py`, commit and push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, run independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews, and once both pass, run a fresh independent Opus `adversarial` review on that immutable candidate. Household outputs remain disabled and no commissioning occurred. `main` remains at `847d0e5`; once all release gates pass, fast-forward `main` and advance roadmap **S0** and **S1**.
+
 ## Continuation update: November 17 eighth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `a146710` (`run_id`: `20261117T192723Z-402b20`, 307.7s standards and 340.1s specification) reported **0 Critical and 0 High findings** and zero browser/UI/packaging/catalog/CAP-core/gate defects, leaving 8 unique findings (1 Medium, 4 Low, 3 Nit).

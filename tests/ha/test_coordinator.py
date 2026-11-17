@@ -6,7 +6,7 @@ import sys
 import types
 import unittest
 from unittest.mock import patch
-from test_domain import PACKAGE, config, feature, d, cohere
+from test_domain import PACKAGE, config, feature, d, cohere, collector
 
 
 def module(name, **attrs):
@@ -19,6 +19,7 @@ def module(name, **attrs):
 class BaseCoordinator:
     def __init__(self, hass, *args, **kwargs):
         self.hass = hass
+        self.config_entry = kwargs.get("config_entry")
 
 
 class UpdateFailed(Exception):
@@ -30,9 +31,10 @@ class ConfigEntryNotReady(Exception):
 
 
 class Store:
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         self.saved = []
         self.fail = False
+        self.private = kwargs.get("private")
 
     async def async_save(self, value):
         if self.fail:
@@ -2477,9 +2479,12 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
 
         load_error = ValueError("corrupt json")
 
+        seen_private = []
+
         class RecordingStore(Store):
             def __init__(self, *args, **kwargs):
-                super().__init__()
+                super().__init__(*args, **kwargs)
+                seen_private.append(kwargs.get("private"))
 
             async def async_load(self):
                 raise load_error
@@ -2524,9 +2529,10 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lost.degraded_reason, "journal_lost")
         self.assertIn("situareness_degraded", notifications)
 
-        # async_remove_entry dismisses notification BEFORE calling async_remove().
+        # async_remove_entry dismisses notification BEFORE calling async_remove() and uses private=True.
         await mod.async_remove_entry(hass, entry)
         self.assertEqual(events, ["dismiss", "remove"])
+        self.assertEqual(seen_private, [True])
         self.assertNotIn("situareness_degraded", notifications)
 
         # async_setup_entry treats decode/version errors as malformed_store and I/O errors
@@ -2569,7 +2575,9 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                     await mod.async_setup_entry(setup_hass, err_entry)
                 setup_coord = setup_hass.data[mod.DOMAIN][err_entry.entry_id]
                 self.assertEqual(setup_coord.degraded_reason, "malformed_store")
+                self.assertIs(setup_coord.config_entry, err_entry)
                 self.assertTrue(err_entry.data.get("journal_initialized"))
+                self.assertTrue(all(seen_private))
 
             perm_err = RuntimeError("storage error")
             perm_err.__cause__ = PermissionError("denied")
@@ -2643,6 +2651,39 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(store.saved[-1]["outbox"]), 5000)
         self.assertEqual(services.calls, [])
         self.assertIn("situareness_degraded", notifications)
+
+        # Reloading with acknowledge_degraded_at while the SAME overflowing alert and 5001 phones
+        # remain active within 15m does NOT self-relatch outbox_overflow and delivers the first batch.
+        ack_same_cfg = config()
+        ack_same_cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=[f"mobile_app_{i}" for i in range(5001)],
+            tts_entity=None,
+            acknowledge_degraded_at=(now + timedelta(minutes=1)).isoformat(),
+        )
+
+        class SameWindowClock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        SameWindowClock.current = now + timedelta(minutes=2)
+
+        with patch.object(mod, "datetime", SameWindowClock):
+            same_window_recovered = mod.SituarenessCoordinator(
+                hass, ack_same_cfg, Store(), store.saved[-1]
+            )
+            self.assertFalse(same_window_recovered.degraded)
+            with patch.object(mod, "fetch", return_value=[ev]):
+                h_same = await same_window_recovered._async_update_data()
+        self.assertFalse(h_same["evidence_degraded"])
+        self.assertFalse(h_same["output_blocked"])
+        self.assertEqual(len(services.calls), 100)
+        self.assertEqual(len(same_window_recovered.outbox), 4900)
+        services.calls.clear()
 
         # Once outbox items expire past 15m and user reloads with valid acknowledge_degraded_at,
         # normal delivery recovers cleanly.
@@ -2772,3 +2813,202 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(create_calls), 1)
             self.assertEqual(create_calls[0][0], "situareness_degraded")
             self.assertNotIn("Until:", create_calls[0][1])
+
+    async def test_quarantine_ambiguous_notification_and_degraded_cancel_uncertainty(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        now = datetime.now(timezone.utc)
+        ev = d.normalize(feature())
+        for key, delta in [
+            ("sent", -120),
+            ("effective", -120),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            ev[key] = (now + timedelta(seconds=delta)).isoformat()
+        cohere(ev)
+
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+        services = Services()
+        store = Store()
+        hass = types.SimpleNamespace(data={}, services=services)
+        coord = mod.SituarenessCoordinator(hass, cfg, store, {})
+
+        # Scoped quarantine with valid feature_id does not trigger quarantine_ambiguous or notify.
+        scoped = collector.CollectedEvents(
+            [ev],
+            1,
+            [["https://api.weather.gov/alerts/bad-ref"]],
+            False,
+            source_count=2,
+            all_events=[ev],
+        )
+        with patch.object(mod, "fetch", return_value=scoped):
+            h1 = await coord._async_update_data()
+        self.assertTrue(h1["partial"])
+        self.assertFalse(h1["quarantine_ambiguous"])
+        self.assertEqual(len(services.calls), 1)
+        self.assertNotIn("situareness_degraded", notifications)
+
+        # Unextractable feature_id sets quarantine_ambiguous and raises situareness_degraded;
+        # next clean poll clears the notification.
+        ambig = collector.CollectedEvents(
+            [ev], 1, [], True, source_count=2, all_events=[ev]
+        )
+        with patch.object(mod, "fetch", return_value=ambig):
+            h2 = await coord._async_update_data()
+        self.assertTrue(h2["quarantine_ambiguous"])
+        self.assertIn("situareness_degraded", notifications)
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness alert scope ambiguous",
+        )
+        with patch.object(mod, "fetch", return_value=[ev]):
+            h3 = await coord._async_update_data()
+        self.assertFalse(h3["quarantine_ambiguous"])
+        self.assertNotIn("situareness_degraded", notifications)
+
+        # Degraded journal_lost poll carrying quarantined_cancel_lineages reports
+        # cancellation_uncertain=True and partial=True even when target is absent from records.
+        lost_entry = types.SimpleNamespace(
+            entry_id="lost-q", data={"journal_initialized": True}
+        )
+        lost_hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+            ),
+        )
+        lost_coord = mod.SituarenessCoordinator(
+            lost_hass, cfg, Store(), None, entry=lost_entry
+        )
+        q_cancel = collector.CollectedEvents(
+            [],
+            1,
+            [
+                [
+                    "https://api.weather.gov/alerts/c1",
+                    "https://api.weather.gov/alerts/t1",
+                ]
+            ],
+            False,
+            source_count=1,
+            all_events=[],
+            quarantined_cancel_lineages=[
+                [
+                    "https://api.weather.gov/alerts/c1",
+                    "https://api.weather.gov/alerts/t1",
+                ]
+            ],
+        )
+        with patch.object(mod, "fetch", return_value=q_cancel):
+            h_deg = await lost_coord._async_update_data()
+        self.assertTrue(h_deg["evidence_degraded"])
+        self.assertTrue(h_deg["cancellation_uncertain"])
+        self.assertTrue(h_deg["partial"])
+
+    async def test_partial_cancellation_continuing_segment_delivery(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime.now(timezone.utc)
+
+        def make_ev(name, offset_min, refs=(), message_type="Update"):
+            ev = d.normalize(feature())
+            ev["id"] = f"https://api.weather.gov/alerts/{name}"
+            ev["message_type"] = message_type
+            for key, sec in [
+                ("sent", offset_min * 60),
+                ("effective", offset_min * 60),
+                ("onset", 0),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                ev[key] = (now + timedelta(seconds=sec)).isoformat()
+            return cohere(ev, *refs)
+
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+        p = make_ev("part-p", -10, message_type="Alert")
+        cancel_c = make_ev("part-c", -5, [p], message_type="Cancel")
+        u_new = make_ev("part-u-new", -4, [p])
+        u_new["instruction"] = "Take shelter in a basement immediately."
+        u2 = make_ev("part-u2", -3, [p, u_new])
+        u2["instruction"] = u_new["instruction"]
+
+        services = Services()
+        store = Store()
+        coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services), cfg, store, {}
+        )
+        with patch.object(mod, "fetch", return_value=[p]):
+            await coord._async_update_data()
+        self.assertEqual(len(services.calls), 1)
+
+        with patch.object(mod, "fetch", return_value=[cancel_c, u_new]):
+            h2 = await coord._async_update_data()
+        self.assertEqual(h2["active_count"], 1)
+        self.assertEqual(len(services.calls), 2)
+        self.assertEqual(services.calls[1][2]["data"]["url"], u_new["id"])
+
+        # After Cancel leaves the feed, continuing update with same instruction stays active without duplicate output.
+        with patch.object(mod, "fetch", return_value=[u2]):
+            h3 = await coord._async_update_data()
+        self.assertEqual(h3["active_count"], 1)
+        self.assertEqual(len(services.calls), 2)

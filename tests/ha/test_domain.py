@@ -904,11 +904,99 @@ class Policy(unittest.TestCase):
         target = cap_event("n1-target", -5, message_type="Alert")
         other = cap_event("n1-other", -5, message_type="Alert")
         records, _ = d.reconcile({}, [target, other], config(), NOW)
-        # Future-dated invalid cancel fails cap_event_valid (so target is uncertain, not cancelled)
-        # and must not mark `other` as superseded even if referenced.
+        # Future-dated invalid cancel fails cap_event_valid(event, now), isolates uncertain_targets
+        # without merging target/other lineages, and stays non-cancelled even after clock catches up.
         bad_cancel = cap_event("n1-cancel", 10, [target, other], "Cancel")
         result, _ = d.reconcile(records, [bad_cancel], config(), NOW)
         self.assertNotEqual(result[other["id"]]["state"], "superseded")
+        self.assertEqual(result[bad_cancel["id"]]["lineage"], [bad_cancel["id"]])
+        self.assertEqual(
+            result[bad_cancel["id"]]["uncertain_targets"],
+            sorted([target["id"], other["id"]]),
+        )
+        self.assertEqual(result[target["id"]]["state"], "quarantined")
+        self.assertEqual(result[other["id"]]["state"], "quarantined")
+        groups, _ = d.lineage_index(result, [])
+        self.assertNotEqual(groups[target["id"]], groups[other["id"]])
+
+        result2, _ = d.reconcile(
+            result, [bad_cancel], config(), NOW + timedelta(minutes=15)
+        )
+        self.assertEqual(result2[target["id"]]["state"], "quarantined")
+        self.assertEqual(result2[other["id"]]["state"], "quarantined")
+
+    def test_partial_cancellation_allows_continuing_updates_while_withholding_pre_cancel_actions(
+        self,
+    ):
+        p = cap_event("can-p", -10, message_type="Alert")
+        records, plans = d.reconcile({}, [p], config(), NOW)
+        self.assertEqual([pl["id"] for pl in plans], [p["id"]])
+
+        # Unchanged continuing update after Cancel withholds repeated pre-cancel action.
+        cancel_c = cap_event("can-c", -5, [p], "Cancel")
+        u_same = cap_event("can-u-same", -4, [p])
+        u_same["instruction"] = p["instruction"]
+        res_same, plans_same = d.reconcile(records, [cancel_c, u_same], config(), NOW)
+        self.assertEqual(res_same[p["id"]]["state"], "cancelled")
+        self.assertEqual(res_same[p["id"]]["cancelled_at"], cancel_c["sent"])
+        self.assertEqual(res_same[u_same["id"]]["state"], "quarantined")
+        self.assertEqual(plans_same, [])
+        self.assertIn(
+            res_same[u_same["id"]]["fingerprint"], res_same[u_same["id"]]["actions"]
+        )
+        res_same_later, plans_same_later = d.reconcile(
+            res_same, [cancel_c, u_same], config(), NOW + timedelta(minutes=20)
+        )
+        self.assertEqual(res_same_later[u_same["id"]]["state"], "quarantined")
+        self.assertEqual(plans_same_later, [])
+
+        # Changed qualifying instruction on continuing update after Cancel qualifies and delivers,
+        # and subsequent updates stay active without quarantining superseded active updates.
+        u_new = cap_event("can-u-new", -4, [p])
+        u_new["instruction"] = "Take shelter in a basement immediately."
+        res_new, plans_new = d.reconcile(records, [cancel_c, u_new], config(), NOW)
+        self.assertEqual(res_new[p["id"]]["state"], "cancelled")
+        self.assertEqual(res_new[p["id"]]["cancelled_at"], cancel_c["sent"])
+        self.assertEqual(res_new[u_new["id"]]["state"], "active")
+        self.assertEqual([pl["id"] for pl in plans_new], [u_new["id"]])
+
+        # Poll 3a: While Cancel C remains in the feed, u2 supersedes u_new cleanly without duplicate plans.
+        u2 = cap_event("can-u2", -3, [p, u_new])
+        u2["instruction"] = u_new["instruction"]
+        res_u2, plans_u2 = d.reconcile(res_new, [cancel_c, u2], config(), NOW)
+        self.assertEqual(res_u2[u_new["id"]]["state"], "superseded")
+        self.assertEqual(res_u2[u2["id"]]["state"], "active")
+        self.assertEqual(plans_u2, [])
+
+        # Poll 3b: Cancel C leaves the feed while P remains cancelled; repeated action still deduplicates.
+        res_u2_absent, plans_u2_absent = d.reconcile(res_u2, [u2], config(), NOW)
+        self.assertEqual(res_u2_absent[u2["id"]]["state"], "active")
+        self.assertEqual(plans_u2_absent, [])
+
+        # Temporary geometry loss on continuing branch marks ineligible and preserves action history on restore.
+        u_geom_lost = cap_event("can-u-geom-lost", -2.5, [p, u2])
+        u_geom_lost["instruction"] = u_new["instruction"]
+        u_geom_lost["geometry"] = None
+        res_geom_lost, plans_geom_lost = d.reconcile(
+            res_u2_absent, [u_geom_lost], config(), NOW
+        )
+        self.assertEqual(res_geom_lost[u_geom_lost["id"]]["state"], "ineligible")
+        self.assertEqual(plans_geom_lost, [])
+
+        u_restored = cap_event("can-u-restored", -2.2, [p, u_geom_lost])
+        u_restored["instruction"] = u_new["instruction"]
+        res_restored, plans_restored = d.reconcile(
+            res_geom_lost, [u_restored], config(), NOW
+        )
+        self.assertEqual(res_restored[u_restored["id"]]["state"], "active")
+        self.assertEqual(plans_restored, [])
+
+        # Poll 4: New instruction on continuing branch plans once.
+        u3 = cap_event("can-u3", -2, [p, u_restored])
+        u3["instruction"] = "Take shelter in an interior room on the lowest floor."
+        res_u3, plans_u3 = d.reconcile(res_restored, [u3], config(), NOW)
+        self.assertEqual(res_u3[u3["id"]]["state"], "active")
+        self.assertEqual([pl["id"] for pl in plans_u3], [u3["id"]])
 
     def test_normalize_oversized_and_non_string_properties(self):
         oversized = feature()
@@ -1708,7 +1796,9 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         events = await collector.fetch(
             Session(Response(json.dumps(body).encode())), ["NY"]
         )
-        self.assertTrue(events.quarantine_ambiguous)
+        self.assertFalse(events.quarantine_ambiguous)
+        self.assertEqual(events.quarantined_lineages, [[bad["id"]]])
+        self.assertEqual(len(events), 1)
         bad["properties"]["references"] = [
             {"@id": f"https://api.weather.gov/alerts/{i}"} for i in range(5001)
         ]

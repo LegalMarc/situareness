@@ -437,7 +437,9 @@ async def test_real_ha_journal_lost_first_poll_failure_and_remove_dismisses_noti
     assert "situareness_degraded" in hass.data.get("persistent_notification", {})
     from homeassistant.helpers.storage import Store
 
-    saved = await Store(hass, 1, "situareness." + entry.entry_id).async_load()
+    saved = await Store(
+        hass, 1, "situareness." + entry.entry_id, private=True
+    ).async_load()
     assert saved is not None
     assert saved["degraded"] is True
     assert saved["degraded_reason"] == "journal_lost"

@@ -226,7 +226,7 @@ def matches(point, geometry):
         return False
 
 
-def cap_event_valid(event):
+def cap_event_valid(event, now=None):
     """Require internally consistent, chronologically directed CAP tuples."""
     identity = event.get("cap_identity")
     refs = event.get("reference_identities")
@@ -243,6 +243,10 @@ def cap_event_valid(event):
         or len(refs) != len(references)
     ):
         return False
+    if now is not None:
+        sent_ts = timestamp(identity[2])
+        if sent_ts is None or sent_ts > now + timedelta(minutes=5):
+            return False
     if event.get("message_type") in ("Update", "Cancel") and not refs:
         return False
     for ref, url in zip(refs, references):
@@ -462,14 +466,10 @@ def conflicting_prior_cancel(event, old):
     return event.get("status") == "Actual" and event.get("message_type") == "Cancel"
 
 
-def cancellation_evidence(
+def _cancellation_analysis(
     records, events, groups, now=None, quarantine_cancel_lineages=()
 ):
-    """Find explicit cancelled messages and directed, uncertain successors.
-
-    Persisted edges are only authoritative when recorded with complete CAP
-    tuples. Old journal lineage sets do not establish directed relationships.
-    """
+    """Analyze explicit cancellations, continuing post-cancel segments, and timestamps."""
 
     identity_cache = {}
 
@@ -557,7 +557,9 @@ def cancellation_evidence(
         identity = event.get("cap_identity")
         refs = event.get("reference_identities")
         valid = (
-            valid_identity(identity)
+            cap_event_valid(event, now)
+            and (not is_cancel or records.get(eid, {}).get("uncertain_targets") is None)
+            and valid_identity(identity)
             and eid == "https://api.weather.gov/alerts/" + identity[1]
             and timestamp(event.get("sent")) == timestamp(identity[2])
             and event.get("cap_references_valid")
@@ -616,6 +618,7 @@ def cancellation_evidence(
     }
     cancelled = set(seeded_cancelled_identities)
     cancelled_by_group = {}
+    cancelled_at_by_identity = {}
     for identity, grp in seeded_cancelled_identities.items():
         cancelled_by_group.setdefault(grp, set()).add(identity)
     children = {}
@@ -641,6 +644,12 @@ def cancellation_evidence(
             else:
                 cancelled.update(refs)
                 cancelled_by_group.setdefault(groups.get(eid), set()).update(refs)
+                cancel_ts = timestamp(identity[2])
+                if cancel_ts is not None:
+                    for ref in refs:
+                        prev_ts = cancelled_at_by_identity.get(ref)
+                        if prev_ts is None or cancel_ts > prev_ts:
+                            cancelled_at_by_identity[ref] = cancel_ts
             continue
         # An update that explicitly references a valid earlier Cancel is new
         # evidence. Other older references may supply history, not a path that
@@ -648,6 +657,18 @@ def cancellation_evidence(
         if not any(ref in valid_cancels for ref in refs):
             for ref in refs:
                 children.setdefault(ref, set()).add(identity)
+    for eid, record in records.items():
+        identity = record.get("cap_identity")
+        if (
+            record.get("state") == "cancelled"
+            and record.get("cancel_message") is not True
+            and valid_identity(identity)
+        ):
+            ident = tuple(identity)
+            if ident in cancelled and ident not in cancelled_at_by_identity:
+                ts = timestamp(record.get("cancelled_at"))
+                if ts is not None:
+                    cancelled_at_by_identity[ident] = ts
     # If a referenced predecessor is missing, it may conceal a path from a
     # cancelled message. A predecessor strictly older than every cancelled
     # identity cannot descend from one under CAP's directed time ordering.
@@ -661,6 +682,37 @@ def cancellation_evidence(
     for target_eid in seeded_uncertain_ids:
         if target_eid in nodes and not nodes[target_eid][2]:
             uncertain.add(nodes[target_eid][0])
+    hard_uncertain = set(uncertain)
+    for eid, (identity, _, is_cancel) in nodes.items():
+        if not is_cancel and (
+            groups.get(eid) in ambiguous_groups
+            or eid in seeded_uncertain_ids
+            or timestamp(identity[2]) is None
+        ):
+            hard_uncertain.add(identity)
+    tainted_from_hard = set(hard_uncertain)
+    hard_pending = list(hard_uncertain)
+    while hard_pending:
+        parent = hard_pending.pop()
+        for child in children.get(parent, ()):
+            if child not in tainted_from_hard:
+                tainted_from_hard.add(child)
+                hard_pending.append(child)
+    failed_cancel_timing = set()
+    for anc in cancelled:
+        anc_ts = cancelled_at_by_identity.get(anc)
+        anc_pending = [anc]
+        anc_visited = {anc}
+        while anc_pending:
+            parent = anc_pending.pop()
+            for child in children.get(parent, ()):
+                if child not in anc_visited:
+                    anc_visited.add(child)
+                    anc_pending.append(child)
+                    if child not in cancelled:
+                        child_ts = timestamp(child[2])
+                        if anc_ts is None or child_ts is None or child_ts < anc_ts:
+                            failed_cancel_timing.add(child)
     pending = list(cancelled | uncertain)
     visited = set(pending)
     while pending:
@@ -673,6 +725,18 @@ def cancellation_evidence(
     direct_ids = {
         eid for identity in cancelled for eid in identities.get(identity, ())
     } | seeded_cancelled_ids
+    continuing_uncertain_ids = {
+        eid
+        for identity in uncertain
+        if identity not in cancelled
+        and identity not in tainted_from_hard
+        and identity not in failed_cancel_timing
+        for eid in identities.get(identity, ())
+        if eid in nodes
+        and not nodes[eid][2]
+        and eid not in seeded_uncertain_ids
+        and groups.get(eid) not in ambiguous_groups
+    } - direct_ids
     uncertain_ids = (
         {eid for identity in uncertain for eid in identities.get(identity, ())}
         | seeded_uncertain_ids
@@ -692,10 +756,35 @@ def cancellation_evidence(
         if groups.get(event["id"]) in cancellation_groups and event["id"] not in nodes
     )
     uncertain_ids.update(eid for eid in groups if groups.get(eid) in ambiguous_groups)
+    continuing_uncertain_ids &= uncertain_ids
+    cancelled_at_by_eid = {
+        eid: ts
+        for ident, ts in cancelled_at_by_identity.items()
+        for eid in identities.get(ident, ())
+        if eid in direct_ids
+    }
+    return direct_ids, uncertain_ids, continuing_uncertain_ids, cancelled_at_by_eid
+
+
+def cancellation_evidence(
+    records, events, groups, now=None, quarantine_cancel_lineages=()
+):
+    """Find explicit cancelled messages and directed, uncertain successors.
+
+    Persisted edges are only authoritative when recorded with complete CAP
+    tuples. Old journal lineage sets do not establish directed relationships.
+    """
+    direct_ids, uncertain_ids, _, _ = _cancellation_analysis(
+        records,
+        events,
+        groups,
+        now=now,
+        quarantine_cancel_lineages=quarantine_cancel_lineages,
+    )
     return direct_ids, uncertain_ids
 
 
-def _invalid_graph_ids(prior, graph_events):
+def _invalid_graph_ids(prior, graph_events, now=None):
     known_identities = {
         eid: record.get("cap_identity")
         for eid, record in prior.items()
@@ -706,7 +795,10 @@ def _invalid_graph_ids(prior, graph_events):
         if conflicting_prior_cancel(source, prior.get(source["id"])):
             invalid_ids.add(source["id"])
             continue
-        if not cap_event_valid(source):
+        if prior.get(source["id"], {}).get("uncertain_targets") is not None:
+            invalid_ids.add(source["id"])
+            continue
+        if not cap_event_valid(source, now):
             invalid_ids.add(source["id"])
             continue
         known = known_identities.get(source["id"])
@@ -727,12 +819,12 @@ def _invalid_graph_ids(prior, graph_events):
     return invalid_ids
 
 
-def resolve_candidates(previous, events, graph_events=None):
+def resolve_candidates(previous, events, graph_events=None, now=None):
     """Restore predecessors hidden by a graph update rejected against prior state."""
     if graph_events is None:
         return list(events)
     graph_list = list(graph_events)
-    invalid_ids = _invalid_graph_ids(previous or {}, graph_list)
+    invalid_ids = _invalid_graph_ids(previous or {}, graph_list, now=now)
     by_graph_id = {e["id"]: e for e in graph_list}
     valid_superseded = set()
     for source in graph_list:
@@ -798,6 +890,8 @@ def _expire_cancellation_horizons(prior, records, members, active_feed_groups, n
                     records[eid]["state"] = "ended_or_absent"
                     records[eid]["inactive_since"] = since
                     records[eid]["updated"] = now.isoformat()
+                    prior[eid].pop("cancelled_at", None)
+                    records[eid].pop("cancelled_at", None)
 
 
 def _cancel_record_identity(
@@ -981,7 +1075,7 @@ def reconcile(
     """Reconcile bounded history; quarantined inputs cannot end unrelated records."""
     graph_events = list(events if graph_events is None else graph_events)
     prior = deepcopy(previous or {})
-    events = resolve_candidates(prior, events, graph_events)
+    events = resolve_candidates(prior, events, graph_events, now=now)
     # Cancels are source evidence even when a later message references them.
     present = {event["id"] for event in events}
     events = list(events) + [
@@ -993,7 +1087,7 @@ def reconcile(
     ]
     records = deepcopy(prior)
     plans = []
-    invalid_ids = _invalid_graph_ids(prior, graph_events)
+    invalid_ids = _invalid_graph_ids(prior, graph_events, now=now)
 
     def actual_cancel(source):
         return (
@@ -1025,7 +1119,12 @@ def reconcile(
         for source in graph_events
         if source["id"] not in invalid_ids or actual_cancel(source)
     ]
-    cancelled_ids, uncertain_ids = cancellation_evidence(
+    (
+        cancelled_ids,
+        uncertain_ids,
+        continuing_uncertain_ids,
+        cancelled_at_by_eid,
+    ) = _cancellation_analysis(
         prior,
         trusted_events,
         groups,
@@ -1037,7 +1136,7 @@ def reconcile(
         ref
         for e in events
         if e["id"] not in invalid_ids
-        and e["id"] not in uncertain_ids
+        and e["id"] not in (uncertain_ids - continuing_uncertain_ids)
         and e["id"] not in cancelled_ids
         for ref in e.get("references", [])
     }
@@ -1084,14 +1183,40 @@ def reconcile(
             "inactive": {},
             "active_identity": {},
             "inactive_identity": {},
+            "pre_cancel_actions": {},
             "inactive_since": None,
         }
         for record_id in ids:
             record = prior[record_id]
-            if record_id in cancelled_ids or record_id in uncertain_ids:
-                continue
             state = semantic_state(record)
-            if state in ("superseded", "cancelled"):
+            is_withheld_uncertain = record.get(
+                "state"
+            ) == "quarantined" and "cancellation scope uncertain" in record.get(
+                "reasons", []
+            )
+            if (
+                record_id in cancelled_ids
+                or state == "cancelled"
+                or (
+                    record_id in uncertain_ids
+                    and record_id not in continuing_uncertain_ids
+                )
+                or is_withheld_uncertain
+            ):
+                if (
+                    state in inactive_states
+                    and not is_withheld_uncertain
+                    and record_id not in uncertain_ids
+                ):
+                    since = timestamp(
+                        record.get("inactive_since") or record.get("updated")
+                    )
+                    if not since or since > now or now - since > timedelta(minutes=15):
+                        continue
+                if state != "superseded":
+                    merge_bounded(summary["pre_cancel_actions"], action_history(record))
+                continue
+            if state == "superseded":
                 continue
             bucket = "inactive" if state in inactive_states else "active"
             if bucket == "inactive":
@@ -1195,7 +1320,25 @@ def reconcile(
                 )
             seen.add(eid)
             continue
-        if eid in quarantined_event_ids or uncertain or identity_uncertain:
+        continuing_uncertain = (
+            uncertain
+            and eid in continuing_uncertain_ids
+            and eid not in quarantined_event_ids
+            and not identity_uncertain
+        )
+        continuing_withheld = (
+            continuing_uncertain
+            and fp in summary.get("pre_cancel_actions", {})
+            and fp not in summary.get("active", {})
+            and (group, fp) not in planned_in_poll
+            and not activate
+        )
+        if (
+            eid in quarantined_event_ids
+            or identity_uncertain
+            or (uncertain and not continuing_uncertain)
+            or continuing_withheld
+        ):
             reason = (
                 "invalid or incomplete CAP identity or references"
                 if identity_uncertain
@@ -1203,7 +1346,7 @@ def reconcile(
                 if uncertain
                 else "lineage quarantined"
             )
-            records[eid] = _quarantined_record(
+            quarantined_rec = _quarantined_record(
                 eid,
                 event,
                 records.get(eid, {}),
@@ -1216,6 +1359,12 @@ def reconcile(
                 keep_prior_timestamps=identity_uncertain,
                 invalid_cancel=invalid_cancel,
             )
+            if continuing_withheld and fp in summary.get("pre_cancel_actions", {}):
+                merged_actions = dict(quarantined_rec.get("actions", {}))
+                if len(merged_actions) < 100 and fp not in merged_actions:
+                    merged_actions[fp] = summary["pre_cancel_actions"][fp]
+                quarantined_rec["actions"] = merged_actions
+            records[eid] = quarantined_rec
             seen.add(eid)
             continue
         actions = {}
@@ -1313,26 +1462,60 @@ def reconcile(
         }
         if uncertain_targets is not None:
             record["uncertain_targets"] = uncertain_targets
+        if blocked and not cancelled:
+            cancel_ts = cancelled_at_by_eid.get(eid)
+            cancelled_at = (
+                cancel_ts.isoformat()
+                if cancel_ts is not None
+                else (old_prior.get("cancelled_at") if old_prior else None)
+            )
+            if cancelled_at is not None:
+                record["cancelled_at"] = cancelled_at
         records[eid] = record
         seen.add(eid)
         if not (cancelled or blocked):
             referenced.update(ref for ref in refs if ref != eid)
     for eid in cancelled_ids:
         if eid in records and not records[eid].get("cancel_message"):
-            records[eid] = {
+            cancel_ts = cancelled_at_by_eid.get(eid)
+            cancelled_at = (
+                cancel_ts.isoformat()
+                if cancel_ts is not None
+                else records[eid].get("cancelled_at")
+            )
+            updated_rec = {
                 **records[eid],
                 "state": "cancelled",
                 "actions": {},
                 "reasons": ["message explicitly referenced by cancellation"],
             }
+            if cancelled_at is not None:
+                updated_rec["cancelled_at"] = cancelled_at
+            records[eid] = updated_rec
     current_cancel_groups = {
         groups.get(source["id"]) for source in trusted_events if actual_cancel(source)
     } | {groups.get(cid) for ids in quarantine_cancel_lineages for cid in ids}
+    current_cancel_targets = {
+        ref
+        for source in trusted_events
+        if actual_cancel(source)
+        for ref in source.get("references", [])
+    } | {cid for ids in quarantine_cancel_lineages for cid in ids}
     uncertain_handled = set()
     for eid in uncertain_ids - cancelled_ids:
-        if eid in seen or eid not in records or records[eid].get("cancel_message"):
+        if (
+            eid in seen
+            or eid not in records
+            or records[eid].get("cancel_message")
+            or (
+                eid in continuing_uncertain_ids
+                and records[eid].get("state") != "quarantined"
+            )
+        ):
             continue
-        group_has_current_cancel = groups.get(eid) in current_cancel_groups
+        group_has_current_cancel = (
+            groups.get(eid) in current_cancel_groups or eid in current_cancel_targets
+        )
         record_unconfirmed = (
             quarantine_all
             or (partial and not quarantine_lineages and not quarantine_cancel_lineages)
