@@ -234,7 +234,9 @@ def _clear_corrupt_store_backups(storage_dir, prefix):
 
 
 class SituarenessCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass, config, store, persisted, entry=None):
+    def __init__(
+        self, hass, config, store, persisted, entry=None, has_corrupt_backup=False
+    ):
         super().__init__(
             hass, _LOGGER, name=DOMAIN, update_interval=timedelta(minutes=1)
         )
@@ -349,6 +351,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     self._entry,
                     data={**self._entry.data, "journal_initialized": True},
                 )
+        self._needs_corrupt_cleanup = bool(
+            has_corrupt_backup
+            or (self._entry is not None and "malformed_store_at" in self._entry.data)
+        )
         self._journal_lost_saved = not (
             self.degraded
             and self.degraded_reason == "journal_lost"
@@ -382,11 +388,6 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.degraded_reason = None
         self.degraded_at = None
         self.degraded_until = None
-        if self._entry is not None and "journal_lost_at" in self._entry.data:
-            new_data = {
-                k: v for k, v in self._entry.data.items() if k != "journal_lost_at"
-            }
-            self.hass.config_entries.async_update_entry(self._entry, data=new_data)
         return True
 
     async def _save(self, records, outbox, outcomes):
@@ -412,17 +413,19 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             True,
         )
         self.was_live = live(self.config)
-        if (
-            self._entry is not None
-            and hasattr(self.hass, "async_add_executor_job")
-            and hasattr(self.hass, "config")
-            and hasattr(self.hass.config, "path")
-        ):
-            await self.hass.async_add_executor_job(
-                _clear_corrupt_store_backups,
-                self.hass.config.path(".storage"),
-                f"{DOMAIN}.{self._entry.entry_id}",
-            )
+        if self._needs_corrupt_cleanup:
+            if (
+                self._entry is not None
+                and hasattr(self.hass, "async_add_executor_job")
+                and hasattr(self.hass, "config")
+                and hasattr(self.hass.config, "path")
+            ):
+                await self.hass.async_add_executor_job(
+                    _clear_corrupt_store_backups,
+                    self.hass.config.path(".storage"),
+                    f"{DOMAIN}.{self._entry.entry_id}",
+                )
+            self._needs_corrupt_cleanup = False
         if self._entry is not None and (
             self._entry.data.get("journal_initialized") is not True
             or "malformed_store_at" in self._entry.data
@@ -443,10 +446,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         ):
             return
         if self.degraded:
-            state = (self.degraded_reason, self.degraded_at, self.degraded_until)
+            state = self.degraded_reason
             if self._notified_degraded_state != state:
                 until_note = (
-                    f" Until: {self.degraded_until}."
+                    " Output remains withheld until the triggering condition clears and the seven-day horizon expires or is acknowledged."
                     if self.degraded_until
                     else " Manual store repair or replacement required."
                 )
@@ -991,10 +994,22 @@ async def async_setup_entry(hass, entry):
         raise ConfigEntryNotReady(f"Invalid situareness.json: {err}") from err
     prefix = f"{DOMAIN}.{entry.entry_id}"
     store = Store(hass, 1, prefix)
+    has_corrupt_backup = False
     try:
         persisted = await store.async_load()
-    except Exception:
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError):
         persisted = ["unreadable"]
+    except Exception as err:
+        cause = getattr(err, "__cause__", None)
+        if isinstance(err, OSError) or isinstance(cause, OSError):
+            raise ConfigEntryNotReady(f"Could not read persisted store: {err}") from err
+        if (
+            isinstance(cause, ValueError)
+            or type(err).__name__ == "UnsupportedStorageVersionError"
+        ):
+            persisted = ["unreadable"]
+        else:
+            raise ConfigEntryNotReady(f"Could not load persisted store: {err}") from err
     if (
         persisted is None
         and hasattr(hass, "config")
@@ -1003,8 +1018,16 @@ async def async_setup_entry(hass, entry):
             _has_corrupt_store_backup, hass.config.path(".storage"), prefix
         )
     ):
+        has_corrupt_backup = True
         persisted = ["corrupt_json"]
-    coordinator = SituarenessCoordinator(hass, config, store, persisted, entry=entry)
+    coordinator = SituarenessCoordinator(
+        hass,
+        config,
+        store,
+        persisted,
+        entry=entry,
+        has_corrupt_backup=has_corrupt_backup,
+    )
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

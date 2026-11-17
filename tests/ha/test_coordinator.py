@@ -2331,19 +2331,42 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         await reloaded.async_stop()
         self.assertNotIn("situareness_degraded", notifications)
 
-        # Valid acknowledgement on reload clears degraded state and journal_lost_at.
+        # Valid acknowledgement on reload clears degraded state, preserves journal_lost_at
+        # until a clean save succeeds, and clears journal_lost_at once saved.
         ack_cfg = config()
         ack_cfg["acknowledge_degraded_at"] = (
             datetime.now(timezone.utc) + timedelta(seconds=1)
         ).isoformat()
+        store_ack = Store()
         with patch.object(mod, "datetime") as mock_dt:
             mock_dt.now.return_value = datetime.now(timezone.utc) + timedelta(seconds=2)
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
             acked = mod.SituarenessCoordinator(
-                hass, ack_cfg, Store(), None, entry=entry
+                hass, ack_cfg, store_ack, None, entry=entry
             )
-        self.assertFalse(acked.degraded)
+            self.assertFalse(acked.degraded)
+            self.assertIn("journal_lost_at", entry.data)
+            self.assertNotIn("situareness_degraded", notifications)
+
+            # Failing first poll keeps journal_lost_at preserved for subsequent retries.
+            with patch.object(mod, "fetch", failing_fetch):
+                with self.assertRaises(UpdateFailed):
+                    await acked._async_update_data()
+            self.assertEqual(store_ack.saved, [])
+            self.assertIn("journal_lost_at", entry.data)
+
+            # Retry with persisted=None still acknowledges, and clean poll removes journal_lost_at.
+            acked_retry = mod.SituarenessCoordinator(
+                hass, ack_cfg, store_ack, None, entry=entry
+            )
+            self.assertFalse(acked_retry.degraded)
+            with patch.object(mod, "fetch", return_value=[]):
+                await acked_retry._async_update_data()
         self.assertNotIn("journal_lost_at", entry.data)
+        self.assertEqual(
+            store_ack.saved[-1]["acknowledged_degraded_at"],
+            ack_cfg["acknowledge_degraded_at"],
+        )
         self.assertNotIn("situareness_degraded", notifications)
 
     async def test_invalid_cap_cancel_replay_quarantines_targets_and_delivers_sibling(
@@ -2449,12 +2472,17 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             )[1],
         )
 
+        class UnsupportedStorageVersionError(Exception):
+            pass
+
+        load_error = ValueError("corrupt json")
+
         class RecordingStore(Store):
             def __init__(self, *args, **kwargs):
                 super().__init__()
 
             async def async_load(self):
-                raise RuntimeError("unreadable disk store")
+                raise load_error
 
             async def async_remove(self):
                 events.append("remove")
@@ -2501,15 +2529,17 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, ["dismiss", "remove"])
         self.assertNotIn("situareness_degraded", notifications)
 
-        # async_setup_entry treats store.async_load() exceptions as malformed_store.
+        # async_setup_entry treats decode/version errors as malformed_store and I/O errors
+        # as ConfigEntryNotReady without marking malformed_store_at or journal_initialized.
         with tempfile.TemporaryDirectory() as tmp:
+            import asyncio
+
             cfg_file = Path(tmp) / "situareness.json"
             cfg_file.write_text("{}", encoding="utf-8")
 
             async def run_exec(fn, *args):
                 return fn(*args)
 
-            setup_entry = types.SimpleNamespace(entry_id="bad-load", data={})
             setup_hass = types.SimpleNamespace(
                 data={},
                 services=Services(),
@@ -2524,19 +2554,31 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                     async_forward_entry_setups=lambda *a: asyncio.sleep(0),
                 ),
             )
-            setup_coord = None
 
             class CapturingCoordinator(mod.SituarenessCoordinator):
                 async def async_config_entry_first_refresh(self):
                     self.data = await self._update_once()
 
-            with patch.object(mod, "SituarenessCoordinator", CapturingCoordinator):
-                import asyncio
+            for err in (
+                ValueError("corrupt"),
+                UnsupportedStorageVersionError("future version"),
+            ):
+                load_error = err
+                err_entry = types.SimpleNamespace(entry_id="bad-load", data={})
+                with patch.object(mod, "SituarenessCoordinator", CapturingCoordinator):
+                    await mod.async_setup_entry(setup_hass, err_entry)
+                setup_coord = setup_hass.data[mod.DOMAIN][err_entry.entry_id]
+                self.assertEqual(setup_coord.degraded_reason, "malformed_store")
+                self.assertTrue(err_entry.data.get("journal_initialized"))
 
-                await mod.async_setup_entry(setup_hass, setup_entry)
-            setup_coord = setup_hass.data[mod.DOMAIN][setup_entry.entry_id]
-            self.assertEqual(setup_coord.degraded_reason, "malformed_store")
-            self.assertTrue(setup_entry.data.get("journal_initialized"))
+            perm_err = RuntimeError("storage error")
+            perm_err.__cause__ = PermissionError("denied")
+            for io_err in (OSError("read failure"), perm_err):
+                load_error = io_err
+                io_entry = types.SimpleNamespace(entry_id="io-load", data={})
+                with self.assertRaises(ConfigEntryNotReady):
+                    await mod.async_setup_entry(setup_hass, io_entry)
+                self.assertEqual(io_entry.data, {})
 
     async def test_outbox_overflow_latches_degraded_and_recovers_after_prune(self):
         from datetime import datetime, timedelta, timezone
@@ -2643,3 +2685,90 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(h2["evidence_degraded"])
         self.assertFalse(h2["output_blocked"])
         self.assertEqual(len(services.calls), 1)
+
+    async def test_degraded_notification_fires_once_and_clean_save_skips_corrupt_cleanup(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        create_calls = []
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                create_calls.append((notification_id, msg, title))
+            ),
+            async_dismiss=lambda hass, notification_id: None,
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        now = datetime.now(timezone.utc)
+        bad_cancel = d.normalize(feature())
+        bad_cancel["message_type"] = "Cancel"
+        bad_cancel["references"] = []
+        bad_cancel["reference_identities"] = []
+        bad_cancel["cap_references_valid"] = True
+        cohere(bad_cancel)
+
+        class Clock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        Clock.current = now
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exec_calls = []
+
+            async def track_exec(fn, *args):
+                exec_calls.append(getattr(fn, "__name__", str(fn)))
+                return fn(*args)
+
+            clean_entry = types.SimpleNamespace(entry_id="clean-entry", data={})
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                async_add_executor_job=track_exec,
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+                ),
+            )
+            coord = mod.SituarenessCoordinator(
+                hass, config(), Store(), {}, entry=clean_entry
+            )
+            with patch.object(mod, "datetime", Clock):
+                # Clean save must not schedule directory scans for corrupt backups.
+                with patch.object(mod, "fetch", return_value=[]):
+                    await coord._async_update_data()
+                self.assertEqual(exec_calls, [])
+
+                # Two consecutive degraded polls with advancing timestamps emit notification once.
+                with patch.object(mod, "fetch", return_value=[bad_cancel]):
+                    await coord._async_update_data()
+                    Clock.current = now + timedelta(minutes=2)
+                    await coord._async_update_data()
+            self.assertEqual(len(create_calls), 1)
+            self.assertEqual(create_calls[0][0], "situareness_degraded")
+            self.assertNotIn("Until:", create_calls[0][1])

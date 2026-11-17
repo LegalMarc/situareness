@@ -2,6 +2,21 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 eighth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `a146710` (`run_id`: `20261117T192723Z-402b20`, 307.7s standards and 340.1s specification) reported **0 Critical and 0 High findings** and zero browser/UI/packaging/catalog/CAP-core/gate defects, leaving 8 unique findings (1 Medium, 4 Low, 3 Nit).
+
+All 8 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor spec/reference/report updates:
+- **`HA-ACK-01`**: Retained `journal_lost_at` in `entry.data` inside `_try_acknowledge()` so it clears only when `_save()` persists a non-degraded state, preserving acknowledgement recovery across failed first-poll retries.
+- **`HA-STORE-01`**: Narrowed `store.async_load()` error handling in `async_setup_entry()` so JSON/value/type/key/unsupported-version errors latch `malformed_store` while transient `OSError` / permission errors raise `ConfigEntryNotReady` for retry.
+- **`SIT-R2` & `HA-NOTIF-01`**: Keyed `_sync_degraded_notification` on `degraded_reason` alone and removed advancing timestamps from notification text to eliminate per-minute notification churn.
+- **`SIT-R3` & `PERF-01`**: Added `has_corrupt_backup` and `_needs_corrupt_cleanup` so `_save()` clears `.corrupt.*` backups only once when needed.
+- **`SIT-R1`, `DOC-HA-01`, `DOC-HA-02`, & `SIT-R4`**: Corrected `docs/ha/README.md` ambiguous-quarantine scope (`all lineages (both current and absent)`), clarified per-poll refresh vs `outbox_overflow`, replaced ambiguous store-emptying guidance with deleting the store/backups or replacing its data with `{}` across all contract/guide docs, and cleaned the asyncio import ordering + dead variable in `tests/ha/test_coordinator.py`.
+
+The complete local gates passed: 43 Node, 82 stdlib HA (`-W error`), 7 source-skill, 21 Chromium browser, and 10 actual-HA tests (163 total), plus static checks, Ruff lint/format, and two identical deterministic ZIP builds (`823de6d0...` extension, `062fd336...` HA). Actual HA reports five known upstream deprecations without suppression. Live anonymous smoke (`node tools/live-browser-smoke.mjs`) passed at `2026-11-17T19:41:35.151Z` with HTTP 200 across NWS (0 alerts), USGS (6 items), BBC World (24 items), and BBC US & Canada (23 items).
+
+Next: run `audit_private.py`, commit and push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, run independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews, and once both pass, run a fresh independent Opus `adversarial` review on that immutable candidate. Household outputs remain disabled and no commissioning occurred. `main` remains at `847d0e5`; once all release gates pass, fast-forward `main` and advance roadmap **S0** and **S1**.
+
 ## Continuation update: November 17 seventh Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `f0e8a08` (`run_id`: `20261117T190130Z-35fadb`, 311.6s standards and 283.6s specification) reported **0 browser/UI/packaging/catalog findings**, and identified 9 unique findings in Home Assistant, docs, and tests (`SIT-H1` High, `SIT-HA-01` Medium, `SIT-HA-02`/`SIT-HA-03`/`SIT-L1` Low, `SIT-HA-04`/`SIT-HA-05`/`SIT-N1`/`SIT-DOC-01`/`SIT-TEST-01`/`SIT-N2` Nit).

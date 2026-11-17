@@ -26,8 +26,10 @@ The release gate is open until the current candidate has zero supported unresolv
 | `930803369829a761cfd4593d4db3f153b8c13d64` | Specification | Claude Opus 5.5, medium effort | Six findings (0 High, 1 Medium, 2 Low, 3 Nit; `run_id`: `20261117T180834Z-0e141a`, 394.4s); repaired in `120c3c4` |
 | `120c3c4362ff529a62f3e43e59ff10a8b3c02ec2` | Standards | Claude Opus 5.5, medium effort | Four actionable findings + one non-blocking nit (0 Critical, 0 High, 1 Medium, 2 Low, 1+1 Nit; `run_id`: `20261117T184436Z-6d91c1`, 260.7s; zero browser/packaging/catalog defects); repaired in `f0e8a08` |
 | `120c3c4362ff529a62f3e43e59ff10a8b3c02ec2` | Specification | Claude Opus 5.5, medium effort | Three findings (0 High, 0 Medium, 3 Low; `run_id`: `20261117T184436Z-6d91c1`, 244.0s; zero browser/packaging/catalog defects); repaired in `f0e8a08` |
-| `f0e8a08eb8f09585666b3ba5b2f966e57cc65a25` | Standards | Claude Opus 5.5, medium effort | Four findings (0 Critical, 1 High, 0 Medium, 1 Low, 2 Nit; `run_id`: `20261117T190130Z-35fadb`, 311.6s; zero browser/packaging/catalog defects); repaired in next candidate |
-| `f0e8a08eb8f09585666b3ba5b2f966e57cc65a25` | Specification | Claude Opus 5.5, medium effort | Seven findings (0 Critical, 0 High, 1 Medium, 2 Low, 4 Nit; `run_id`: `20261117T190130Z-35fadb`, 283.6s; zero browser/packaging/catalog defects); repaired in next candidate |
+| `f0e8a08eb8f09585666b3ba5b2f966e57cc65a25` | Standards | Claude Opus 5.5, medium effort | Four findings (0 Critical, 1 High, 0 Medium, 1 Low, 2 Nit; `run_id`: `20261117T190130Z-35fadb`, 311.6s; zero browser/packaging/catalog defects); repaired in `a146710` |
+| `f0e8a08eb8f09585666b3ba5b2f966e57cc65a25` | Specification | Claude Opus 5.5, medium effort | Seven findings (0 Critical, 0 High, 1 Medium, 2 Low, 4 Nit; `run_id`: `20261117T190130Z-35fadb`, 283.6s; zero browser/packaging/catalog defects); repaired in `a146710` |
+| `a1467104017f1efad31661370dbd19a4f37189ee` | Standards | Claude Opus 5.5, medium effort | Four findings (0 Critical, 0 High, 0 Medium, 2 Low, 2 Nit; `run_id`: `20261117T192723Z-402b20`, 307.7s; zero browser/packaging/catalog/CAP/gate defects); repaired in next candidate |
+| `a1467104017f1efad31661370dbd19a4f37189ee` | Specification | Claude Opus 5.5, medium effort | Six findings (0 Critical, 0 High, 1 Medium, 2 Low, 3 Nit; `run_id`: `20261117T192723Z-402b20`, 340.1s; zero browser/packaging/catalog/room defects); repaired in next candidate |
 
 The exact model reported by completed CLI result metadata was `claude-opus-5-5`. The second standards/specification passes took 204.4 and 205.3 seconds respectively. They independently read an immutable full-source snapshot, complete change diff from the public root, documented contract/standards, and raw local test evidence. They executed no code or physical output.
 
@@ -237,4 +239,21 @@ Candidate `f0e8a08eb8f09585666b3ba5b2f966e57cc65a25` passed 158 local tests, Ruf
 | Spec | SIT-DOC-01 | Nit | `collector.py` counts unique quarantined identifiers per lineage rather than per poll. | Tracked `seen_quarantine_ids` across the entire poll in `fetch()` against the 5,000-ID bound; re-review pending. |
 | Spec / Standards | SIT-TEST-01 / SIT-N2 | Nit | Tests contain a leftover drafting comment and inline external review IDs. | Removed the drafting comment and replaced all review-code tags in `tests/ha/**` with behavioral comments; re-review pending. |
 
-All findings from candidate `f0e8a08` are repaired on `wip/supervisor-handoff-20261117`. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.
+All findings from candidate `f0e8a08` were verified fixed at `a146710`.
+
+### Candidate a146710 Opus review findings
+
+Candidate `a1467104017f1efad31661370dbd19a4f37189ee` passed 162 local tests, Ruff, deterministic packaging, and live anonymous smoke, with **0 Critical, 0 High, and 0 browser/UI/packaging/catalog/CAP-core/gate findings**. Independent Claude Opus 5.5 medium-effort reviews (`run_id`: `20261117T192723Z-402b20`; 307.7s standards, 340.1s specification) reported 2 Low + 2 Nit standards findings and 1 Medium + 2 Low + 3 Nit specification findings (8 unique findings total):
+
+| Axis | Code | Severity | Finding | Current disposition |
+| --- | --- | --- | --- | --- |
+| Spec | HA-ACK-01 | Medium | `_try_acknowledge()` deletes `journal_lost_at` before `_save()` runs; if the first poll after reload fails, retries regenerate `degraded_at = now` and lose the acknowledgement. | Retained `journal_lost_at` in `entry.data` inside `_try_acknowledge()` so it clears only when `_save()` persists non-degraded state; re-review pending. |
+| Spec | HA-STORE-01 | Low | `except Exception:` around `store.async_load()` treats transient `OSError`/permission errors as `malformed_store`. | Caught only JSON/value/type/key/unsupported-version errors as `malformed_store` and raised `ConfigEntryNotReady` on `OSError`/unexpected load errors; re-review pending. |
+| Standards / Spec | SIT-R2 / HA-NOTIF-01 | Low | `_sync_degraded_notification` keys on `(reason, degraded_at, degraded_until)`, re-creating `situareness_degraded` every minute while triggers persist. | Keyed notification on `degraded_reason` alone with stable message text free of moving timestamps; re-review pending. |
+| Standards | SIT-R1 | Low | Docs state `outbox_overflow` refreshes `degraded_at`/`degraded_until` while outbox remains above capacity, whereas degraded polls cap outbox at 5,000 before re-evaluating. | Synchronized `docs/ha/README.md`, `home-assistant/README.md`, and `o3-mvp.md` with actual `outbox_overflow` behavior; re-review pending. |
+| Spec | DOC-HA-01 | Low | `docs/ha/README.md:29` states ambiguous quarantine suspends all *absent* lineages instead of *all* lineages (current and absent). | Corrected `docs/ha/README.md:29` to state `all lineages (both current and absent) are suspended for that poll`; re-review pending. |
+| Spec | DOC-HA-02 | Nit | Docs say "deleting/emptying" the store file transitions to `journal_lost`, whereas a 0-byte file triggers `.corrupt.*`/`malformed_store`. | Clarified docs to say deleting the store file and any `.corrupt.*` backups (or replacing its data with empty JSON `{}`); re-review pending. |
+| Standards / Spec | SIT-R3 / PERF-01 | Nit | `_save()` runs `.storage` `.corrupt.*` glob cleanup on every save, including delivery-loop saves. | Added `has_corrupt_backup` and `_needs_corrupt_cleanup` so cleanup runs once when needed; re-review pending. |
+| Standards | SIT-R4 | Nit | Test lambda at `tests/ha/test_coordinator.py` references `asyncio` before `import asyncio` and leaves unused `setup_coord = None`. | Moved `import asyncio` above the lambda and removed `setup_coord = None`; re-review pending. |
+
+All findings from candidate `a146710` are repaired on `wip/supervisor-handoff-20261117`. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.
