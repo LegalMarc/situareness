@@ -14,6 +14,7 @@ EXTENSION_FILES = (
     "defaults/config.json",
     "lib/collector.js",
     "lib/config.js",
+    "lib/freshness.js",
     "lib/normalize.js",
     "manifest.json",
     "offscreen.html",

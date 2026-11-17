@@ -476,6 +476,43 @@ test("clock rollback does not suppress recurring alarms", async () => {
   }
 });
 
+test("startup recollects when the last attempt is in the future after clock rollback", async () => {
+  const now = Date.now();
+  const originalNow = Date.now;
+  const requests = [];
+  Date.now = () => now;
+  globalThis.fetch = async (url) => {
+    requests.push(url);
+    return new Response(
+      url.includes("bbci.co.uk")
+        ? "<rss></rss>"
+        : JSON.stringify({ features: [] }),
+    );
+  };
+  persisted.situareness_state_v1 = {
+    config: structuredClone(defaults),
+    events: [],
+    sources: defaults.sources.map((source) => ({
+      ...source,
+      status: "ok",
+      last_attempt_at: new Date(now + 3600_000).toISOString(),
+      last_success_at: new Date(now + 3600_000).toISOString(),
+      last_alarm_tick: 10,
+    })),
+    collector: { alarm_tick: 10, last_alarm_clock_at: now + 3600_000 },
+  };
+  try {
+    await import("../../extension/background.js?rollback-startup");
+    listeners.startup();
+    const state = await send({ type: "GET_STATE" });
+    assert.equal(requests.length, defaults.sources.length);
+    assert.equal(state.state.collector.last_alarm_clock_at, now);
+  } finally {
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("worker identifies invalid bundled defaults explicitly", async () => {
   persisted.situareness_state_v1 = { config: { schema_version: 99 } };
   globalThis.fetch = async () =>

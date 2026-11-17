@@ -406,3 +406,14 @@ test("weather lifecycle tolerates absent source configuration", () => {
     "cached",
   );
 });
+
+test("a source timestamp in the future is not presented as fresh", () => {
+  const now = Date.now();
+  assert.equal(
+    sourceFreshness(
+      { status: "ok", interval_minutes: 1, last_success_at: new Date(now + 60_000).toISOString() },
+      now,
+    ),
+    "stale",
+  );
+});

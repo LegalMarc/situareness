@@ -29,8 +29,10 @@ Start with the [project context](CONTEXT.md) and [continuation guide](plans/RESU
 - `docs/plans/HANDOFF.md` — Supervisor continuation brief, interrupted WIP status, failing checks, source-semantics questions, and delegation/review workflow. anchors: first-instruction-for-the-new-supervisor, what-stopped-and-what-is-actually-known, immediate-work-before-more-features, critical-source-semantics-correction, parallel-work-and-supervision, independent-review-that-worked, local-environment-and-privacy-boundary, suggested-skills
 - `docs/plans/RESUME.md` — Current state, verification commands, privacy boundaries, and remaining work. anchors: current-state, read-first, verification, remaining-work
 - `docs/plans/primary-source-roadmap.md` — Prioritized primary-source roadmap with data contracts, location setup, adapter work packages, acceptance checks, and coding handoff. anchors: goal-and-priority, decisions-for-the-public-baseline, current-baseline-and-remaining-gaps, source-order-and-evidence, work-packages-in-order, coding-and-review-operating-plan
+- `docs/plans/supervision-20261117.md` — Bounded delegated repair plan, immutable review gates, checkpoint discipline, and continuation priorities. anchors: initial-repair-and-evidence-gate, completion-evidence
 
 ## docs/reference/
+- `docs/reference/cap-cancellation.md` — Primary CAP/NWS evidence, observed branch fixtures, conservative cancellation policy, and unresolved scope limits. anchors: evidence-and-its-limits, conservative-processing-policy
 - `docs/reference/primary-sources.md` — Verified official-channel references and access limitations for weather, earthquakes, NYC/DC, IPAWS, hurricanes, and space weather. anchors: weather-warnings-and-faster-transports, earthquakes, nyc-and-dc-local-authority-channels, national-all-hazards-coverage, preparation-and-national-impact-candidates, how-to-maintain-this-evidence
 
 ## docs/reports/

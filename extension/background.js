@@ -196,7 +196,7 @@ async function refresh(force, alarmClockAt = null, scheduledTime = null) {
         0,
         Math.round((nowMs - previous) / 60000),
       );
-    state.collector.last_alarm_clock_at = Math.max(nowMs, previous ?? nowMs);
+    state.collector.last_alarm_clock_at = nowMs;
   }
   const due = state.config.sources.filter((s) => {
     const previous = state.sources.find((p) => p.id === s.id);
@@ -206,6 +206,7 @@ async function refresh(force, alarmClockAt = null, scheduledTime = null) {
         previous?.last_alarm_tick == null ||
         (!Number.isFinite(alarmClockAt) &&
           (!Number.isFinite(Date.parse(previous?.last_attempt_at || "")) ||
+            nowMs < Date.parse(previous.last_attempt_at) ||
             nowMs - Date.parse(previous.last_attempt_at) >=
               s.interval_minutes * 60000)) ||
         (Number.isFinite(alarmClockAt) &&

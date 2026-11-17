@@ -1,6 +1,7 @@
 import { test, expect, chromium } from "@playwright/test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 const extension = path.resolve("extension");
 const profileRoot = path.resolve("work/browser-profiles");
@@ -37,13 +38,13 @@ const usgs = {
   ],
 };
 
-async function launch(profile) {
+async function launch(profile, extensionPath = extension) {
   return chromium.launchPersistentContext(profile, {
     channel: "chromium",
     headless: true,
     args: [
-      `--disable-extensions-except=${extension}`,
-      `--load-extension=${extension}`,
+      `--disable-extensions-except=${extensionPath}`,
+      `--load-extension=${extensionPath}`,
       "--no-proxy-server",
       "--host-resolver-rules=MAP api.weather.gov ~NOTFOUND, MAP earthquake.usgs.gov ~NOTFOUND, MAP feeds.bbci.co.uk ~NOTFOUND",
     ],
@@ -87,6 +88,53 @@ async function routeFixtures(context, control) {
 }
 const send = (page, message) =>
   page.evaluate((message) => chrome.runtime.sendMessage(message), message);
+
+test("packaged extension starts and collects from its extracted archive", async () => {
+  test.setTimeout(90_000);
+  await mkdir(profileRoot, { recursive: true });
+  const root = await mkdtemp(path.join(profileRoot, "package-"));
+  let context;
+  try {
+    const bundles = path.join(root, "bundles");
+    const extracted = path.join(root, "extracted");
+    execFileSync("python3", ["tools/package.py", "--output-dir", bundles]);
+    const manifest = JSON.parse(
+      await readFile(path.join(bundles, "manifest.json"), "utf8"),
+    );
+    const bundle = manifest.bundles.find((item) =>
+      item.name.startsWith("situareness-extension-"),
+    );
+    expect(bundle).toBeTruthy();
+    execFileSync("python3", [
+      "-m", "zipfile", "-e", path.join(bundles, bundle.name), extracted,
+    ]);
+    context = await launch(
+      path.join(root, "profile"),
+      path.join(extracted, "situareness-extension"),
+    );
+    const id = await extensionId(context);
+    const control = { fail: false, requests: [] };
+    await routeFixtures(context, control);
+    const page = await context.newPage();
+    await page.goto(`chrome-extension://${id}/room.html`);
+    await expect(
+      page.getByRole("heading", { name: "World & national events" }),
+    ).toBeVisible();
+    const initial = await send(page, { type: "GET_STATE" });
+    expect(initial.ok).toBe(true);
+    const result = await send(page, { type: "REFRESH" });
+    expect(result.ok).toBe(true);
+    expect(result.state.sources.map((source) => source.status)).toEqual([
+      "ok", "ok", "ok", "ok",
+    ]);
+    await expect(
+      page.getByRole("heading", { name: "Fixture weather" }),
+    ).toBeVisible();
+  } finally {
+    if (context) await context.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("extension collection, messaging, room reuse and persisted restart", async () => {
   test.setTimeout(90_000);

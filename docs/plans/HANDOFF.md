@@ -2,6 +2,12 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: browser repair slice
+
+The current supervisor preserved `67d829e` and delegated disjoint streams to `gpt-6.1-terra`, high effort. The browser/package stream reports 40 Node and 15 Chromium tests passing, including startup and fixture collection from the extracted installation ZIP. The freshness module is now included and archive imports have a completeness regression. Startup clock rollback and future freshness timestamps have additional coverage. HA lifecycle repairs report 38 standard-library and five actual-HA tests passing; the substantive directed-cancellation rewrite is still in progress, so those are focused repair results, not integrated candidate approval.
+
+The user approved suspending uncertain successor output with partial health while retaining independent sibling eligibility. Primary evidence and projected observed records are in [CAP cancellation](../reference/cap-cancellation.md); the [supervision plan](supervision-20261117.md) records ownership and gates. No new independent review has yet completed. Continue from the live branch, preserve unfinished HA changes, and revalidate everything before release. The initial all-ref history scan checked 137 unique reachable blobs with zero matches against private local criteria; every later checkpoint still needs its own staged/history/archive inspection.
+
 ## First instruction for the new supervisor
 
 Continue this project as supervisor: make the plan and important design decisions, dispatch bounded implementation work to capable faster/economical coding agents, integrate their changes, and require independent deep review before calling the result ready. The user explicitly requested this delegation. Preserve existing work and all private-data exclusions. Do not enable household output while developing.

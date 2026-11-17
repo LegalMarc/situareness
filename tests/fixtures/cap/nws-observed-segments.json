@@ -1,0 +1,127 @@
+{
+  "provenance": {
+    "kind": "observed public NWS API projection",
+    "retrieved": "2026-11-16T21:47:00Z (approximate)",
+    "queries": [
+      "https://api.weather.gov/alerts?status=actual&message_type=cancel&limit=100",
+      "https://api.weather.gov/alerts?status=actual&message_type=update&limit=100"
+    ],
+    "transform": "Selected four complete message identities and retained only lifecycle, area description, VTEC, geometry, expiry and reference fields. Original geometries were null. Descriptions, instructions and unrelated attributes omitted. Predecessors are not included. No synthetic cancellation/update relationship is implied between the two pairs."
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "id": "urn:oid:2.49.0.1.840.0.1d700199d87ee8470b3a702ec1b93b6ebb4290ae.001.1",
+        "sender": "w-nws.webmaster@noaa.gov",
+        "sent": "2026-11-15T10:04:00-06:00",
+        "status": "Actual",
+        "messageType": "Cancel",
+        "references": [
+          {
+            "@id": "https://api.weather.gov/alerts/urn:oid:2.49.0.1.840.0.7383a7f707cd58463daa6126e40fb9053ad06527.001.1",
+            "identifier": "urn:oid:2.49.0.1.840.0.7383a7f707cd58463daa6126e40fb9053ad06527.001.1",
+            "sender": "w-nws.webmaster@noaa.gov",
+            "sent": "2026-11-15T03:28:00-06:00"
+          },
+          {
+            "@id": "https://api.weather.gov/alerts/urn:oid:2.49.0.1.840.0.542e08e885f708984600c0f069fd8e0914ed1866.002.1",
+            "identifier": "urn:oid:2.49.0.1.840.0.542e08e885f708984600c0f069fd8e0914ed1866.002.1",
+            "sender": "w-nws.webmaster@noaa.gov",
+            "sent": "2026-11-15T08:42:00-06:00"
+          }
+        ],
+        "areaDesc": "Dawson; Borden; Scurry",
+        "event": "Dense Fog Advisory",
+        "expires": "2026-11-15T10:19:28-06:00",
+        "parameters": {
+          "VTEC": [
+            "/O.CAN.KMAF.FG.Y.0005.000000T0000Z-261115T1700Z/"
+          ]
+        }
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "id": "urn:oid:2.49.0.1.840.0.542e08e885f708984600c0f069fd8e0914ed1866.001.1",
+        "sender": "w-nws.webmaster@noaa.gov",
+        "sent": "2026-11-15T08:42:00-06:00",
+        "status": "Actual",
+        "messageType": "Cancel",
+        "references": [
+          {
+            "@id": "https://api.weather.gov/alerts/urn:oid:2.49.0.1.840.0.7383a7f707cd58463daa6126e40fb9053ad06527.001.1",
+            "identifier": "urn:oid:2.49.0.1.840.0.7383a7f707cd58463daa6126e40fb9053ad06527.001.1",
+            "sender": "w-nws.webmaster@noaa.gov",
+            "sent": "2026-11-15T03:28:00-06:00"
+          }
+        ],
+        "areaDesc": "Gaines; Andrews; Martin; Howard; Mitchell",
+        "event": "Dense Fog Advisory",
+        "expires": "2026-11-15T08:57:35-06:00",
+        "parameters": {
+          "VTEC": [
+            "/O.CAN.KMAF.FG.Y.0005.000000T0000Z-261115T1700Z/"
+          ]
+        }
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "id": "urn:oid:2.49.0.1.840.0.b1c6614d0462190c8c2d0aef0efe5f12b0293dd7.002.2",
+        "sender": "w-nws.webmaster@noaa.gov",
+        "sent": "2026-11-16T13:40:00-08:00",
+        "status": "Actual",
+        "messageType": "Update",
+        "references": [
+          {
+            "@id": "https://api.weather.gov/alerts/urn:oid:2.49.0.1.840.0.a673a6c404e5c93fcf6b770d5d2ad5bc7f77dd40.001.1",
+            "identifier": "urn:oid:2.49.0.1.840.0.a673a6c404e5c93fcf6b770d5d2ad5bc7f77dd40.001.1",
+            "sender": "w-nws.webmaster@noaa.gov",
+            "sent": "2026-11-16T11:43:00-08:00"
+          }
+        ],
+        "areaDesc": "East Bay Interior Valleys",
+        "event": "Cold Weather Advisory",
+        "expires": "2026-11-17T08:00:00-08:00",
+        "parameters": {
+          "VTEC": [
+            "/O.CON.KMTR.CW.Y.0009.261117T0600Z-261117T1600Z/"
+          ]
+        }
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {
+        "id": "urn:oid:2.49.0.1.840.0.b1c6614d0462190c8c2d0aef0efe5f12b0293dd7.004.1",
+        "sender": "w-nws.webmaster@noaa.gov",
+        "sent": "2026-11-16T13:40:00-08:00",
+        "status": "Actual",
+        "messageType": "Update",
+        "references": [
+          {
+            "@id": "https://api.weather.gov/alerts/urn:oid:2.49.0.1.840.0.a673a6c404e5c93fcf6b770d5d2ad5bc7f77dd40.001.1",
+            "identifier": "urn:oid:2.49.0.1.840.0.a673a6c404e5c93fcf6b770d5d2ad5bc7f77dd40.001.1",
+            "sender": "w-nws.webmaster@noaa.gov",
+            "sent": "2026-11-16T11:43:00-08:00"
+          }
+        ],
+        "areaDesc": "North Bay Interior Valleys; Southern Salinas Valley/Arroyo Seco and Lake San Antonio",
+        "event": "Cold Weather Advisory",
+        "expires": "2026-11-17T08:00:00-08:00",
+        "parameters": {
+          "VTEC": [
+            "/O.CON.KMTR.CW.Y.0009.261117T0600Z-261117T1600Z/"
+          ]
+        }
+      }
+    }
+  ]
+}

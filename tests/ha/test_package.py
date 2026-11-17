@@ -1,7 +1,9 @@
 """Exercise release packaging in isolated directories, never the real dist directory."""
 
 import json
+import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +60,34 @@ class PackageTest(unittest.TestCase):
                         names = archive.namelist()
                         self.assertIn("README.md", names)
                         self.assertNotIn("home-assistant/situareness.json", names)
+                        if "extension" in one.name:
+                            prefix = "situareness-extension/"
+                            packaged = {
+                                name.removeprefix(prefix)
+                                for name in names
+                                if name.startswith(prefix)
+                            }
+                            # Check imports against the archive, not the source tree.
+                            # This catches an omitted transitive module even when the
+                            # package script successfully creates a valid ZIP.
+                            for name in sorted(packaged):
+                                if not name.endswith((".js", ".mjs")):
+                                    continue
+                                text = archive.read(prefix + name).decode()
+                                imports = re.findall(
+                                    r"""(?:\bfrom\s*|\bimport\s*)["'](\.[^"']+)["']""",
+                                    text,
+                                )
+                                for specifier in imports:
+                                    dependency = (
+                                        Path(name).parent / specifier
+                                    ).as_posix()
+                                    dependency = Path(
+                                        os.path.normpath(dependency)
+                                    ).as_posix()
+                                    self.assertIn(
+                                        dependency, packaged, f"{name}: {specifier}"
+                                    )
                         if "home-assistant" in one.name:
                             self.assertIn(
                                 "home-assistant/situareness.example.json", names

@@ -7,5 +7,5 @@ export function sourceFreshness(source, now = Date.now()) {
   const staleAfterMinutes =
     Number.isFinite(interval) && interval > 0 ? Math.max(2, interval * 2) : 30;
   const staleAfter = staleAfterMinutes * 60_000;
-  return now - stamp > staleAfter ? "stale" : "ok";
+  return stamp > now || now - stamp > staleAfter ? "stale" : "ok";
 }
