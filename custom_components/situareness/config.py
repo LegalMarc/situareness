@@ -10,7 +10,7 @@ SERVICE = re.compile(r"^mobile_app_[a-z0-9_]+$")
 ENTITY = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
 
 
-def validate(raw, now=None):
+def validate(raw):
     if not isinstance(raw, dict):
         raise ValueError("configuration must be an object")
     states = raw.get("states", sorted(STATES))
@@ -106,12 +106,12 @@ def validate(raw, now=None):
         if (
             not isinstance(ack, str)
             or not ack.strip()
-            or len(ack) > 100
             or any(ord(ch) < 32 for ch in ack)
         ):
             raise ValueError("acknowledge_degraded_at must be a string")
-        ack_ts = timestamp(ack)
-        ack = ack_ts.isoformat() if ack_ts is not None else ack.strip()
+        ack_stripped = ack.strip()
+        ack_ts = timestamp(ack_stripped) if len(ack_stripped) <= 100 else None
+        ack = ack_ts.isoformat() if ack_ts is not None else ack_stripped[:101]
     return {
         "states": list(dict.fromkeys(states)),
         "locations": locations,

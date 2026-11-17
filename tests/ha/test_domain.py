@@ -779,17 +779,20 @@ class Policy(unittest.TestCase):
         self.assertFalse(defaults["live_enabled"])
         self.assertFalse(defaults["commissioning_passed"])
         self.assertIsNone(defaults["acknowledge_degraded_at"])
-        validated = c.validate(
-            {"acknowledge_degraded_at": "2026-11-17T10:00:00-05:00"},
-            now=datetime(2026, 11, 17, 16, 0, tzinfo=timezone.utc),
-        )
+        validated = c.validate({"acknowledge_degraded_at": "2026-11-17T10:00:00-05:00"})
         self.assertEqual(
             validated["acknowledge_degraded_at"], "2026-11-17T15:00:00+00:00"
         )
         future_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
-        for passthrough in ("2026-11-17T10:00:00", "not-a-timestamp", future_iso):
+        over_len = "2026-11-17T10:00:00Z-" + "x" * 100
+        for passthrough, expected in (
+            ("2026-11-17T10:00:00", "2026-11-17T10:00:00"),
+            ("not-a-timestamp", "not-a-timestamp"),
+            (future_iso, future_iso),
+            (over_len, over_len[:101]),
+        ):
             parsed = c.validate({"acknowledge_degraded_at": passthrough})
-            self.assertEqual(parsed["acknowledge_degraded_at"], passthrough)
+            self.assertEqual(parsed["acknowledge_degraded_at"], expected)
         for raw in (
             {"phones": ["notify.bad"]},
             {"live_enabled": "true"},
@@ -1943,6 +1946,109 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaises(ValueError):
             await collector.fetch(Session(Response(json.dumps(data).encode())), ["NY"])
+
+    def test_out_of_range_timestamps_and_horizon_overflow_resilience(self):
+        self.assertIsNone(d.timestamp("9999-12-31T23:59:59Z"))
+        self.assertIsNone(d.timestamp("0001-01-01T00:00:00Z"))
+        self.assertIsNotNone(d.timestamp("9998-12-31T23:59:59Z"))
+        self.assertIsNotNone(d.timestamp("0002-01-01T00:00:00Z"))
+
+        valid = d.normalize(feature())
+        valid["id"] = "https://api.weather.gov/alerts/valid-range"
+        cohere(valid)
+
+        # Far-future expires/ends/sent and year-9999 Cancel alerts fail closed per feature/lineage
+        # without OverflowError or storing year-9999 cap_identity/cap_references tuples.
+        bad_exp = d.normalize(feature())
+        bad_exp["id"] = "https://api.weather.gov/alerts/year9999-exp"
+        cohere(bad_exp)
+        bad_exp["expires"] = "9999-12-31T23:59:59Z"
+
+        raw_sent = feature()
+        raw_sent["id"] = "https://api.weather.gov/alerts/year9999-sent"
+        raw_sent["properties"]["id"] = "year9999-sent"
+        raw_sent["properties"]["sent"] = "9999-12-31T23:59:59Z"
+        bad_sent = d.normalize(raw_sent)
+        self.assertIsNone(bad_sent["cap_identity"])
+
+        target_9999 = d.normalize(feature())
+        target_9999["id"] = "https://api.weather.gov/alerts/target-9999"
+        cohere(target_9999)
+
+        raw_cancel = feature()
+        raw_cancel["id"] = "https://api.weather.gov/alerts/year9999-cancel"
+        raw_cancel["properties"]["id"] = "year9999-cancel"
+        raw_cancel["properties"]["messageType"] = "Cancel"
+        raw_cancel["properties"]["sent"] = "9999-12-31T23:59:59Z"
+        raw_cancel["properties"]["references"] = [
+            {
+                "@id": target_9999["id"],
+                "identifier": "target-9999",
+                "sender": "test@weather.gov",
+                "sent": "9999-12-31T23:59:59Z",
+            }
+        ]
+        bad_cancel = d.normalize(raw_cancel)
+        self.assertIsNone(bad_cancel["cap_identity"])
+        self.assertFalse(bad_cancel["cap_references_valid"])
+
+        records, plans = d.reconcile(
+            {}, [valid, target_9999, bad_exp, bad_sent, bad_cancel], config(), NOW
+        )
+        self.assertEqual([p["id"] for p in plans], [valid["id"]])
+        self.assertEqual(records[valid["id"]]["state"], "active")
+        self.assertEqual(records[bad_exp["id"]]["state"], "ineligible")
+        self.assertEqual(records[bad_sent["id"]]["state"], "quarantined")
+        self.assertIsNone(records[bad_sent["id"]].get("cap_identity"))
+        self.assertEqual(records[target_9999["id"]]["state"], "quarantined")
+        self.assertEqual(records[bad_cancel["id"]]["state"], "cancelled")
+        self.assertIsNone(records[bad_cancel["id"]].get("cap_identity"))
+        self.assertIsNone(records[bad_cancel["id"]].get("cap_references"))
+
+        # Near-datetime.max cancellation_horizon / _bound_records clamp cleanly instead of overflowing.
+        near_max = {
+            "https://api.weather.gov/alerts/near-max": {
+                "state": "cancelled",
+                "expires": "9999-12-30T00:00:00+00:00",
+                "updated": NOW.isoformat(),
+            }
+        }
+        with patch.object(
+            d,
+            "timestamp",
+            side_effect=lambda v: (
+                datetime.fromisoformat(v) if isinstance(v, str) else None
+            ),
+        ):
+            horizon = d.cancellation_horizon(
+                ["https://api.weather.gov/alerts/near-max"], near_max
+            )
+        self.assertEqual(horizon, datetime.max.replace(tzinfo=timezone.utc))
+
+        overflow_records = {
+            f"https://api.weather.gov/alerts/ov-max-{i}": {
+                "state": "cancelled",
+                "cancel_message": True,
+                "lineage": [f"https://api.weather.gov/alerts/ov-max-{i}"],
+                "sent": NOW.isoformat(),
+                "expires": NOW.isoformat(),
+                "updated": NOW.isoformat(),
+            }
+            for i in range(1002)
+        }
+        with self.assertRaises(d.CancellationEvidenceOverflow) as ctx:
+            d._bound_records(
+                overflow_records,
+                (),
+                {eid: eid for eid in overflow_records},
+                set(),
+                set(),
+                datetime(9999, 12, 30, tzinfo=timezone.utc),
+                [],
+            )
+        self.assertEqual(
+            ctx.exception.dropped_horizon, datetime.max.replace(tzinfo=timezone.utc)
+        )
 
 
 if __name__ == "__main__":

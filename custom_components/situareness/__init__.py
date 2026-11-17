@@ -433,7 +433,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         if ack is None:
             self.acknowledge_rejected = False
             return False
-        ack_ts = timestamp(ack)
+        ack_ts = timestamp(ack) if isinstance(ack, str) and len(ack) <= 100 else None
         if ack_ts is None:
             self.acknowledge_rejected = bool(self.degraded)
             return False

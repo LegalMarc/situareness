@@ -15,7 +15,10 @@ MAX_ACCEPTANCE_AGE = timedelta(days=7)
 def timestamp(value):
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+        if not parsed.tzinfo:
+            return None
+        utc = parsed.astimezone(timezone.utc)
+        return utc if 2 <= utc.year <= 9998 else None
     except (AttributeError, TypeError, ValueError, OverflowError):
         return None
 
@@ -427,7 +430,12 @@ def cancellation_horizon(group_ids, records):
             if parsed is not None:
                 record_timestamps.append(parsed)
         timestamps.extend(record_timestamps)
-    return max(timestamps) + MAX_ACCEPTANCE_AGE if timestamps else None
+    if not timestamps:
+        return None
+    try:
+        return max(timestamps) + MAX_ACCEPTANCE_AGE
+    except OverflowError:
+        return datetime.max.replace(tzinfo=timezone.utc)
 
 
 def conflicting_prior_cancel(event, old):
@@ -1048,7 +1056,11 @@ def _bound_records(
             if (h := cancellation_horizon(all_members_by_group.get(g, []), records))
             is not None
         ]
-        dropped_horizon = max([now + MAX_ACCEPTANCE_AGE, *dropped_component_horizons])
+        try:
+            default_horizon = now + MAX_ACCEPTANCE_AGE
+        except OverflowError:
+            default_horizon = datetime.max.replace(tzinfo=timezone.utc)
+        dropped_horizon = max([default_horizon, *dropped_component_horizons])
         for eid, rec in bounded.items():
             if rec.get("updated") == now.isoformat():
                 rec_actions = rec.get("actions")

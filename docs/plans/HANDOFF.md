@@ -2,6 +2,17 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 fifteenth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `1078764` (`run_id`: `20261117T230054Z-57bc4c`, 286.1s standards and 394.5s specification) reported **0 Critical, 0 High, 0 Medium specification findings, and zero browser/packaging/catalog/gate/routing/overflow/store/lifecycle defects**, leaving only 4 small HA/documentation findings (`HA-01` Medium, `HA-02` Low, `SPEC-01`/`HA-04` Low/Nit, `HA-03`/`NIT-01` Nit).
+
+All 4 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor contract/README/report updates:
+- **`HA-01`**: Bounded `domain.timestamp()` to UTC years `2–9998` and added `OverflowError` clamping in `cancellation_horizon()` and `_bound_records()` so far-future year-`9999` or year-`0001` timestamps fail closed or quarantine per-feature/per-lineage without wedging `reconcile`/`UpdateFailed` once the component leaves the feed, with domain and coordinator regression tests.
+- **`HA-02`**: Updated `docs/spec/o3-mvp.md`, `docs/ha/README.md`, and `home-assistant/README.md` to match `_deliver_outbox_batch()` (`persisting once before a 10-target group when expired items are pruned and once after each completed 10-target group`).
+- **`SPEC-01` / `HA-04` & `HA-03` / `NIT-01`**: Removed unused `now=None` from `config.validate(raw)`, removed the `len(ack) > 100` setup rejection from `config.validate(raw)` so over-length `acknowledge_degraded_at` strings pass setup and trigger runtime `acknowledge_rejected: true` in `_try_acknowledge()` while keeping monitoring online, and updated `docs/spec/o3-mvp.md`, READMEs, and tests.
+
+Next: run complete local gates (`43` Node, `90` stdlib HA, `7` skill, `21` Chromium, `11` actual HA = `172` total), deterministic packaging (`823de6d0...` extension, `0b2f7ec3...` HA), live anonymous smoke (`2026-11-17T23:16:55.849Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, and run Opus `axes` + fresh `adversarial` reviews. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 17 fourteenth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `c81fb7f` (`run_id`: `20261117T224454Z-a299b9`, 217.6s standards and 373.9s specification) reported **0 Critical, 0 High, and zero room/catalog/quarantine/overflow/lifecycle defects**, leaving only 3 unique HA/documentation findings (`HA-ACK-01`/`SPEC-HA-01`/`DOC-HA-02` Medium/Low, `HA-DOC-02` Low, `SPEC-HA-03` Low).

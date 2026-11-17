@@ -2983,8 +2983,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 "commissioning_passed": True,
                 "phones": ["mobile_app_ok"],
                 "tts_entity": None,
-            },
-            now=later,
+            }
         )
         ev_later = d.normalize(feature())
         ev_later["id"] += "-after-overflow"
@@ -3713,3 +3712,86 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(fut_reload.degraded)
             self.assertTrue(fut_reload.acknowledge_rejected)
+
+            # Over-length acknowledge_degraded_at passes c.validate(), rejects cleanly at runtime,
+            # keeps monitoring online, and persists valid store state.
+            over_len_ack = "2026-11-17T10:00:00Z-" + "x" * 100
+            over_len_cfg = c.validate({**cfg, "acknowledge_degraded_at": over_len_ack})
+            self.assertEqual(
+                over_len_cfg["acknowledge_degraded_at"], over_len_ack[:101]
+            )
+            over_entry = types.SimpleNamespace(entry_id="ack-overlen", data={})
+            over_hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+                ),
+            )
+            over_store = Store()
+            over_coord = mod.SituarenessCoordinator(
+                over_hass, over_len_cfg, over_store, persisted_deg, entry=over_entry
+            )
+            self.assertTrue(over_coord.degraded)
+            self.assertTrue(over_coord.acknowledge_rejected)
+            self.assertNotIn("acknowledged_degraded_at", over_entry.data)
+            self.assertEqual(
+                over_coord.acknowledged_degraded_at,
+                persisted_deg["acknowledged_degraded_at"],
+            )
+            over_msg = notifications["situareness_degraded"]["message"]
+            self.assertIn("did not clear", over_msg)
+            with patch.object(mod, "fetch", return_value=[]):
+                h_over = await over_coord._async_update_data()
+            self.assertTrue(h_over["acknowledge_rejected"])
+            self.assertTrue(mod._valid_persisted_store(over_store.saved[-1]))
+
+        # Far-future year-9999 timestamps in expires/ends/sent/Cancel leave the feed without
+        # OverflowError or UpdateFailed while valid alerts stay active and deliver cleanly.
+        now_live = datetime.now(timezone.utc)
+        valid_ev = d.normalize(feature())
+        valid_ev["id"] = "https://api.weather.gov/alerts/coord-valid-9999"
+        for key, sec in [
+            ("sent", -60),
+            ("effective", -60),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            valid_ev[key] = (now_live + timedelta(seconds=sec)).isoformat()
+        cohere(valid_ev)
+
+        y9999_exp = d.normalize(feature())
+        y9999_exp["id"] = "https://api.weather.gov/alerts/coord-9999-exp"
+        cohere(y9999_exp)
+        y9999_exp["expires"] = "9999-12-31T23:59:59Z"
+        y9999_exp["ends"] = "9999-12-31T23:59:59Z"
+
+        y9999_cancel = d.normalize(feature())
+        y9999_cancel["id"] = "https://api.weather.gov/alerts/coord-9999-cancel"
+        y9999_cancel["message_type"] = "Cancel"
+        y9999_cancel["sent"] = "9999-12-31T23:59:59Z"
+        y9999_cancel["references"] = [
+            "https://api.weather.gov/alerts/coord-9999-target"
+        ]
+
+        live_services = Services()
+        live_store = Store()
+        live_coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=live_services), cfg, live_store, {}
+        )
+        with patch.object(
+            mod, "fetch", return_value=[valid_ev, y9999_exp, y9999_cancel]
+        ):
+            h_y1 = await live_coord._async_update_data()
+        self.assertFalse(h_y1["evidence_degraded"])
+        self.assertEqual(h_y1["active_count"], 1)
+        self.assertEqual(len(live_services.calls), 1)
+        self.assertEqual(live_services.calls[0][2]["data"]["url"], valid_ev["id"])
+
+        # After year-9999 features leave the feed, subsequent polls remain clean without UpdateFailed.
+        with patch.object(mod, "fetch", return_value=[valid_ev]):
+            h_y2 = await live_coord._async_update_data()
+        self.assertFalse(h_y2["evidence_degraded"])
+        self.assertEqual(h_y2["active_count"], 1)
+        self.assertEqual(len(live_services.calls), 1)
