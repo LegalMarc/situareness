@@ -38,6 +38,7 @@ Start with the [project context](CONTEXT.md) and [continuation guide](plans/RESU
 ## docs/reports/
 - `docs/reports/REVIEW.md` — Immutable review candidates, reviewer metadata, separate findings by axis, and resolution status. anchors: candidates-and-reviewers, standards-findings-at-2c0f1e1, specification-findings-at-2c0f1e1, third-candidate-findings, standards, specification, evidence-limits
 - `docs/reports/VALIDATION.md` — Public-candidate validation status, test evidence, review gates, and physical commissioning limits. anchors: current-status, automated-evidence, required-release-checks, limits
+- `docs/reports/browser-focused-63da80f.md` — Fresh OpenAI review of the immutable browser/package slice and the cached-freshness finding.
 
 ## docs/spec/
 - `docs/spec/o3-mvp.md` — Browser and Home Assistant implementation contract. anchors: architecture-and-privacy, room, home-assistant, research-and-verification

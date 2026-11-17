@@ -541,7 +541,14 @@ test("refreshes an already open room from collector state without a page reload"
 });
 
 test("marks the collector disconnected, preserves cached events and disables stale controls", async () => {
+  const weather = page.locator(".event-card").filter({
+    has: page.getByRole("heading", { name: "Wind advisory for New York City" }),
+  });
+  await expect(weather.getByText("In latest results")).toBeVisible();
+  await expect(weather.getByText("Collected Just now")).toBeVisible();
   await page.evaluate(() => {
+    const initialTime = Date.now();
+    Date.now = () => initialTime + 5 * 60_000;
     Object.defineProperty(chrome.runtime, "sendMessage", {
       configurable: true,
       value: async () => {
@@ -562,6 +569,35 @@ test("marks the collector disconnected, preserves cached events and disables sta
   await expect(
     page.getByRole("heading", { name: "Wind advisory for New York City" }),
   ).toBeVisible();
+  await expect(weather.getByText("Cached · source unavailable")).toBeVisible();
+  await expect(weather.getByText("Collected 5m ago")).toBeVisible();
+  await expect(page.locator("#freshness-note")).toContainText("overdue");
+  await page.getByRole("button", { name: "All places" }).click();
+  await expect(page.getByText("Collector disconnected")).toBeVisible();
+  await expect(page.getByText(/Local collector unavailable/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Refresh" })).toBeDisabled();
+});
+
+test("a failed manual refresh ages cached data and disables controls", async () => {
+  const weather = page.locator(".event-card").filter({
+    has: page.getByRole("heading", { name: "Wind advisory for New York City" }),
+  });
+  await page.evaluate(() => {
+    const initialTime = Date.now();
+    Date.now = () => initialTime + 5 * 60_000;
+    Object.defineProperty(chrome.runtime, "sendMessage", {
+      configurable: true,
+      value: async () => {
+        throw new Error("Simulated local collector outage.");
+      },
+    });
+  });
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await expect(page.getByText("Collector disconnected")).toBeVisible();
+  await expect(weather.getByText("Cached · source unavailable")).toBeVisible();
+  await expect(weather.getByText("Collected 5m ago")).toBeVisible();
+  await expect(page.locator("#freshness-note")).toContainText("overdue");
+  await expect(page.getByRole("button", { name: "Refresh" })).toBeDisabled();
 });
 
 test("omitted providers use bundled defaults when restored through settings and import", async () => {

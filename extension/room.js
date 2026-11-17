@@ -503,14 +503,41 @@ function renderFeed(state) {
 
 function render(state) {
   currentState = state && typeof state === "object" ? state : null;
-  connectionError = null;
-  clearNotice();
   updateControls();
   if (!currentState) return;
   renderStatus(currentState);
   renderPlaces(currentState);
   renderSources(currentState);
   renderFeed(currentState);
+  if (connectionError) {
+    els.collectorDot.className = "status-dot error";
+    els.collectorLabel.textContent = "Collector disconnected";
+  }
+}
+
+function renderConnected(state) {
+  connectionError = null;
+  clearNotice();
+  render(state);
+}
+
+function showDisconnected(error) {
+  connectionError = error.message;
+  if (currentState) render(currentState);
+  else {
+    els.state.hidden = false;
+    els.state.replaceChildren(
+      element("strong", "", "Unable to connect"),
+      element("span", "", error.message),
+    );
+  }
+  els.collectorDot.className = "status-dot error";
+  els.collectorLabel.textContent = "Collector disconnected";
+  announce(
+    `Local collector unavailable. Showing cached data; timestamps are unchanged. ${error.message}`,
+    "error",
+  );
+  updateControls();
 }
 
 async function refreshState() {
@@ -518,22 +545,9 @@ async function refreshState() {
   busy = true;
   updateControls();
   try {
-    render(await send({ type: "GET_STATE" }));
+    renderConnected(await send({ type: "GET_STATE" }));
   } catch (error) {
-    connectionError = error.message;
-    els.collectorDot.className = "status-dot error";
-    els.collectorLabel.textContent = "Collector disconnected";
-    if (!currentState) {
-      els.state.hidden = false;
-      els.state.replaceChildren(
-        element("strong", "", "Unable to connect"),
-        element("span", "", error.message),
-      );
-    }
-    announce(
-      `Local collector unavailable. Showing cached data; timestamps are unchanged. ${error.message}`,
-      "error",
-    );
+    showDisconnected(error);
   } finally {
     busy = false;
     updateControls();
@@ -546,7 +560,7 @@ async function runAction(message, success) {
   updateControls();
   clearNotice();
   try {
-    render(await send(message));
+    renderConnected(await send(message));
     if (success) announce(success);
   } catch (error) {
     if (
@@ -554,12 +568,8 @@ async function runAction(message, success) {
         error.message,
       )
     ) {
-      connectionError = error.message;
-      els.collectorDot.className = "status-dot error";
-      els.collectorLabel.textContent = "Collector disconnected";
-      updateControls();
-    }
-    announce(error.message, "error");
+      showDisconnected(error);
+    } else announce(error.message, "error");
   } finally {
     busy = false;
     updateControls();
@@ -838,7 +848,7 @@ els.saveSettings.addEventListener("click", async () => {
   try {
     const config = getEditedConfig();
     const state = await send({ type: "UPDATE_CONFIG", config });
-    render(state);
+    renderConnected(state);
     els.dialog.close();
     announce("Settings saved.");
   } catch (error) {

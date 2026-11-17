@@ -54,11 +54,25 @@ try {
       const id = new URL(worker.url()).host;
       const page = await context.newPage();
       await page.goto(`chrome-extension://${id}/room.html`);
-      const response = await page.evaluate(() =>
-        chrome.runtime.sendMessage({ type: "REFRESH" }),
-      );
-      if (!response?.ok) throw new Error("Extension refresh failed.");
-      const state = response.state;
+      // A fresh profile runs the extension's installation collection. Observe
+      // that single collection rather than immediately forcing another poll.
+      let state;
+      while (true) {
+        const response = await page.evaluate(() =>
+          chrome.runtime.sendMessage({ type: "GET_STATE" }),
+        );
+        if (!response?.ok)
+          throw new Error(response?.error || "Extension state unavailable.");
+        state = response.state;
+        const enabled = state.sources.filter((source) => source.enabled);
+        if (
+          enabled.length > 0 &&
+          !state.collector.running &&
+          enabled.every((source) => source.last_attempt_at)
+        )
+          break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
       report.sources = state.sources.map((s) => ({
         id: s.id,
         status: s.status,
