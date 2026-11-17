@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
   eventTimestamp,
+  isEventSourceUnavailable,
   matchesEvent,
   nwsAwarenessLifecycle,
   parsePublicConfig,
@@ -484,4 +485,80 @@ test("USGS and BBC items are marked cached when their source is unavailable or o
     }
     assert.equal(nwsAwarenessLifecycle(event, now, sources, []), "cached");
   }
+});
+
+test("non-expired NWS items with missing/unknown lifecycle become cached when unavailable, while not_in_latest_fetch and expired preserve lifecycle", () => {
+  const now = Date.now();
+  const sources = [{ id: "nws", kind: "nws", interval_minutes: 1 }];
+  const failedState = [
+    {
+      id: "nws",
+      enabled: true,
+      status: "error",
+      last_success_at: new Date(now).toISOString(),
+    },
+  ];
+  const freshState = [
+    {
+      id: "nws",
+      enabled: true,
+      status: "ok",
+      last_success_at: new Date(now).toISOString(),
+    },
+  ];
+  const notLatest = {
+    source_id: "nws",
+    category: "weather",
+    official: true,
+    awareness_lifecycle: "not_in_latest_fetch",
+    expires_at: new Date(now + 60 * 60_000).toISOString(),
+  };
+  const missingLifecycle = {
+    source_id: "nws",
+    category: "weather",
+    official: true,
+    expires_at: new Date(now + 60 * 60_000).toISOString(),
+  };
+  const unknownLifecycle = {
+    ...missingLifecycle,
+    awareness_lifecycle: "unrecognized",
+  };
+  const expired = {
+    source_id: "nws",
+    category: "weather",
+    official: true,
+    awareness_lifecycle: "current",
+    expires_at: new Date(now - 60_000).toISOString(),
+  };
+
+  assert.equal(isEventSourceUnavailable(notLatest, now, sources), false);
+  assert.equal(
+    isEventSourceUnavailable(notLatest, now, sources, freshState),
+    false,
+  );
+  assert.equal(
+    isEventSourceUnavailable(notLatest, now, sources, failedState),
+    true,
+  );
+
+  assert.equal(
+    nwsAwarenessLifecycle(notLatest, now, sources, failedState),
+    "not_in_latest_fetch",
+  );
+  assert.equal(
+    nwsAwarenessLifecycle(missingLifecycle, now, sources, failedState),
+    "cached",
+  );
+  assert.equal(
+    nwsAwarenessLifecycle(unknownLifecycle, now, sources, failedState),
+    "cached",
+  );
+  assert.equal(
+    nwsAwarenessLifecycle(missingLifecycle, now, sources, freshState),
+    "unknown",
+  );
+  assert.equal(
+    nwsAwarenessLifecycle(expired, now, sources, failedState),
+    "expired",
+  );
 });

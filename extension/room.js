@@ -1,5 +1,6 @@
 import {
   eventTimestamp,
+  isEventSourceUnavailable,
   matchesEvent,
   nwsAwarenessLifecycle,
   parsePublicConfig,
@@ -346,9 +347,10 @@ function renderEvent(event, locations) {
     top.append(element("span", "severity-pill", event.severity));
   if (event.status && event.status !== "actual")
     top.append(element("span", "status-pill", event.status));
+  const now = Date.now();
   const lifecycle = nwsAwarenessLifecycle(
     event,
-    Date.now(),
+    now,
     currentState?.config?.sources,
     currentState?.sources,
   );
@@ -375,11 +377,24 @@ function renderEvent(event, locations) {
         "Current presence in the latest processed weather alert results is unknown.",
       ],
     };
-    const [label, description] = labels[lifecycle];
-    const badge = element("span", `presence-pill ${lifecycle}`, label);
-    badge.title = description;
-    badge.setAttribute("aria-label", `${label}. ${description}`);
-    top.append(badge);
+    const badges = [lifecycle];
+    if (
+      lifecycle === "not_in_latest_fetch" &&
+      isEventSourceUnavailable(
+        event,
+        now,
+        currentState?.config?.sources,
+        currentState?.sources,
+      )
+    )
+      badges.push("cached");
+    for (const pill of badges) {
+      const [label, description] = labels[pill];
+      const badge = element("span", `presence-pill ${pill}`, label);
+      badge.title = description;
+      badge.setAttribute("aria-label", `${label}. ${description}`);
+      top.append(badge);
+    }
   }
   top.append(
     element(

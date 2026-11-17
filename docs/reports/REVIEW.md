@@ -18,8 +18,10 @@ The release gate is open until the current candidate has zero supported unresolv
 | `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Specification | Claude Opus 5.5, medium effort | Twelve findings (`run_id`: `20261117T164428Z-8b628a`, 225.2s); repaired in `e38a7fd` |
 | `e38a7fdd88ff4877bf2969bad2658c5025ed583d` | Standards | Claude Opus 5.5, medium effort | Ten findings (`run_id`: `20261117T171412Z-dfb683`, 214.2s; zero browser/packaging defects); repaired in `83f328c` |
 | `e38a7fdd88ff4877bf2969bad2658c5025ed583d` | Specification | Claude Opus 5.5, medium effort | Eight findings (`run_id`: `20261117T171412Z-dfb683`, 204.1s; zero browser/packaging defects); repaired in `83f328c` |
-| `83f328c518f4f9c5b87903b5ef56317127a94ae8` | Standards | Claude Opus 5.5, medium effort | Six findings (`run_id`: `20261117T173308Z-a2a286`, 260.9s; zero browser/packaging defects); repaired for next candidate |
-| `83f328c518f4f9c5b87903b5ef56317127a94ae8` | Specification | Claude Opus 5.5, medium effort | Five findings (`run_id`: `20261117T173308Z-a2a286`, 267.0s; zero browser/packaging defects); repaired for next candidate |
+| `83f328c518f4f9c5b87903b5ef56317127a94ae8` | Standards | Claude Opus 5.5, medium effort | Six findings (`run_id`: `20261117T173308Z-a2a286`, 260.9s; zero browser/packaging defects); repaired in `64b6fa0` |
+| `83f328c518f4f9c5b87903b5ef56317127a94ae8` | Specification | Claude Opus 5.5, medium effort | Five findings (`run_id`: `20261117T173308Z-a2a286`, 267.0s; zero browser/packaging defects); repaired in `64b6fa0` |
+| `64b6fa03ae148cd5964e23e7c1d1420c020175b2` | Standards | Claude Opus 5.5, medium effort | Three findings (0 High, 1 Medium, 2 Low; `run_id`: `20261117T174809Z-251d8a`, 384.8s; zero browser/packaging/catalog defects); repaired in next candidate |
+| `64b6fa03ae148cd5964e23e7c1d1420c020175b2` | Specification | Claude Opus 5.5, medium effort | Four findings (0 High, 1 Medium, 3 Low; `run_id`: `20261117T174809Z-251d8a`, 308.0s; zero HA-01/packaging defects); repaired in next candidate |
 
 The exact model reported by completed CLI result metadata was `claude-opus-5-5`. The second standards/specification passes took 204.4 and 205.3 seconds respectively. They independently read an immutable full-source snapshot, complete change diff from the public root, documented contract/standards, and raw local test evidence. They executed no code or physical output.
 
@@ -161,4 +163,19 @@ Candidate `83f328c518f4f9c5b87903b5ef56317127a94ae8` passed 143 local tests and 
 | Standards / Spec | SIT-L2 / SR-L1 | Low | Deep store validation misses unhashable `prior_state`/`action_identity`/`fingerprint`/`action_fingerprint`/`action_affected` and outbox payload fields. | Completed `_valid_persisted_store` validation across all record and outbox fields; re-review pending. |
 | Spec | SR-L2 | Low | `malformed_store` reports `degraded_at: null` and `degraded_until: null`. | Populated `degraded_at` and `degraded_until` from detection time while keeping `malformed_store` latched until store repair/replacement; re-review pending. |
 
-All findings from `fcc9072`, `e38a7fd`, and `83f328c` are repaired and pass 146 local automated tests, Ruff, deterministic packaging, and live anonymous smoke. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.
+All findings from `fcc9072`, `e38a7fd`, and `83f328c` were repaired in `64b6fa0`.
+
+### Candidate 64b6fa0 Opus review findings
+
+Candidate `64b6fa03ae148cd5964e23e7c1d1420c020175b2` passed 146 local tests, Ruff, deterministic packaging, and live anonymous smoke, with **0 High findings** and zero packaging or catalog defects. Independent Claude Opus 5.5 medium-effort reviews (`run_id`: `20261117T174809Z-251d8a`; 384.8s standards, 308.0s specification) reported 1 Medium + 2 Low standards findings and 1 Medium + 3 Low specification findings (6 unique findings total):
+
+| Axis | Code | Severity | Finding | Current disposition |
+| --- | --- | --- | --- | --- |
+| Spec | SPEC-01 | Medium | Missing/empty persisted store on an already-initialized config entry silently resets history without latching `journal_lost`. | Added `entry.data["journal_initialized"]` detection latching `journal_lost` with output withheld and read-only collection preserved; re-review pending. |
+| Standards | SIT-REV-M1 | Medium | Overflow drops `state == "cancelled"` records before non-cancel protected items and computes `degraded_until` without dropped-component horizons. | Seeded `state == "cancelled"` protection and expiry in `domain.py`, prioritized `Cancel`/`cancelled` records under overflow, and propagated `dropped_horizon` into `degraded_until` without shrinking earlier horizons; re-review pending. |
+| Spec / Standards | SPEC-02 / SIT-REV-L1 | Low | Poll-time `_try_acknowledge(now)` lets future-dated `acknowledge_degraded_at` auto-clear on later polls without reload. | Evaluated `_try_acknowledge` solely at coordinator construction against load time; re-review pending. |
+| Spec | SPEC-03 | Low | `_try_acknowledge()` clears `last_degraded_poll`, losing retry-budget credit for the final interval before recovery poll. | Preserved `last_degraded_poll` until after `_migrate_and_prune_outbox()` runs on recovery; re-review pending. |
+| Spec | SPEC-04 | Low | `"Cached · source unavailable"` badge suppressed on cached `not_in_latest_fetch` (and missing-lifecycle) NWS items when source is unavailable. | Appended `"cached"` pill alongside `"not_in_latest_fetch"` when `isEventSourceUnavailable(...)` is true and defaulted missing/unknown NWS lifecycle on unavailable sources to `"cached"` (keeping `"expired"` exclusive); re-review pending. |
+| Standards | SIT-REV-L2 | Low | Operational history-loss/re-alert caveats for missing stores, store replacement, and early overflow acknowledgement missing from docs alongside `journal_lost`. | Documented `journal_lost`, load-time-only acknowledgement, overflow `dropped_horizon`, and tombstone-loss re-alert risks across `o3-mvp.md`, `cap-cancellation.md`, `docs/ha/README.md`, and `home-assistant/README.md`; re-review pending. |
+
+All findings from `fcc9072`, `e38a7fd`, `83f328c`, and `64b6fa0` are now repaired on `wip/supervisor-handoff-20261117`. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.

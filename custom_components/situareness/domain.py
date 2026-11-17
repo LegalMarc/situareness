@@ -39,9 +39,10 @@ def safe_url(value):
 class CancellationEvidenceOverflow(ValueError):
     """Cancellation evidence cannot fit safely in the durable journal."""
 
-    def __init__(self, message, records=None):
+    def __init__(self, message, records=None, dropped_horizon=None):
         super().__init__(message)
         self.records = records
+        self.dropped_horizon = dropped_horizon
 
 
 class OversizedFeature(ValueError):
@@ -473,11 +474,14 @@ def cancellation_evidence(records, events, groups, now=None):
 
     nodes = {}
     cancellations = []
+    seeded_cancelled_identities = {}
+    seeded_cancelled_ids = set()
     ambiguous_groups = set()
     for eid, record in records.items():
         identity = record.get("cap_identity")
         refs = record.get("cap_references")
         is_cancel = record.get("cancel_message") is True
+        is_cancelled_record = record.get("state") == "cancelled" and not is_cancel
         if (
             valid_identity(identity)
             and eid == "https://api.weather.gov/alerts/" + identity[1]
@@ -487,8 +491,14 @@ def cancellation_evidence(records, events, groups, now=None):
             nodes[eid] = (tuple(identity), [tuple(r) for r in refs], is_cancel)
             if is_cancel:
                 cancellations.append(eid)
+            elif is_cancelled_record:
+                seeded_cancelled_identities[tuple(identity)] = groups.get(eid)
+                cancellations.append(eid)
         elif is_cancel:
             ambiguous_groups.add(groups.get(eid))
+        elif is_cancelled_record:
+            seeded_cancelled_ids.add(eid)
+            cancellations.append(eid)
     for event in events:
         eid = event["id"]
         is_cancel = (
@@ -541,8 +551,10 @@ def cancellation_evidence(records, events, groups, now=None):
         and groups.get(eid) not in ambiguous_groups
         and (now is None or timestamp(identity[2]) <= now + timedelta(minutes=5))
     }
-    cancelled = set()
+    cancelled = set(seeded_cancelled_identities)
     cancelled_by_group = {}
+    for identity, grp in seeded_cancelled_identities.items():
+        cancelled_by_group.setdefault(grp, set()).add(identity)
     children = {}
     for eid, (identity, refs, is_cancel) in nodes.items():
         if is_cancel:
@@ -585,7 +597,9 @@ def cancellation_evidence(records, events, groups, now=None):
                 visited.add(child)
                 uncertain.add(child)
                 pending.append(child)
-    direct_ids = {eid for identity in cancelled for eid in identities.get(identity, ())}
+    direct_ids = {
+        eid for identity in cancelled for eid in identities.get(identity, ())
+    } | seeded_cancelled_ids
     uncertain_ids = {
         eid for identity in uncertain for eid in identities.get(identity, ())
     } - direct_ids
@@ -731,7 +745,14 @@ def reconcile(
     for group, ids in members.items():
         if group in active_feed_groups:
             continue
-        if not any(prior[eid].get("cancel_message") for eid in ids):
+        if not any(
+            prior[eid].get("cancel_message")
+            or (
+                prior[eid].get("state") == "cancelled"
+                and not prior[eid].get("cancellation_expired")
+            )
+            for eid in ids
+        ):
             continue
         horizon = cancellation_horizon(ids, prior)
         if horizon is None or now > horizon:
@@ -740,6 +761,12 @@ def reconcile(
                     prior[eid]["cancel_message"] = False
                     records[eid]["cancel_message"] = False
                     records[eid]["cancellation_expired"] = True
+                if prior[eid].get("state") == "cancelled":
+                    since = records[eid].get("inactive_since") or now.isoformat()
+                    prior[eid]["state"] = "ended_or_absent"
+                    records[eid]["state"] = "ended_or_absent"
+                    records[eid]["inactive_since"] = since
+                    records[eid]["updated"] = now.isoformat()
     trusted_events = [
         source
         for source in graph_events
@@ -1111,7 +1138,7 @@ def reconcile(
     cancellation_groups = {
         groups.get(eid)
         for eid, record in records.items()
-        if record.get("cancel_message")
+        if record.get("cancel_message") or record.get("state") == "cancelled"
     }
     current_graph_ids = {event["id"] for event in graph_events}
     protected = (
@@ -1119,19 +1146,32 @@ def reconcile(
         | current_graph_ids
         | {eid for eid in records if groups.get(eid) in cancellation_groups}
     )
-    if len(protected) > 1000:
-        bounded = dict(
-            sorted(
-                records.items(),
-                key=lambda item: (
-                    item[0] in seen,
-                    item[0] in current_graph_ids,
-                    item[0] in protected,
-                    item[1].get("updated", ""),
-                ),
-                reverse=True,
-            )[:1000]
+
+    def sort_key(item):
+        return (
+            item[0] in seen,
+            item[0] in current_graph_ids,
+            bool(item[1].get("cancel_message")),
+            item[1].get("state") == "cancelled",
+            item[0] in protected,
+            item[1].get("updated", ""),
         )
+
+    if len(protected) > 1000:
+        sorted_items = sorted(records.items(), key=sort_key, reverse=True)
+        bounded = dict(sorted_items[:1000])
+        dropped_items = sorted_items[1000:]
+        all_members_by_group = {}
+        for eid in records:
+            all_members_by_group.setdefault(groups.get(eid), []).append(eid)
+        dropped_groups = {groups.get(eid) for eid, _ in dropped_items}
+        dropped_component_horizons = [
+            h
+            for g in dropped_groups
+            if (h := cancellation_horizon(all_members_by_group.get(g, []), records))
+            is not None
+        ]
+        dropped_horizon = max([now + MAX_ACCEPTANCE_AGE, *dropped_component_horizons])
         for eid, rec in bounded.items():
             if rec.get("updated") == now.isoformat():
                 rec_actions = rec.get("actions")
@@ -1142,12 +1182,7 @@ def reconcile(
         raise CancellationEvidenceOverflow(
             "current messages and cancellation evidence exceed journal limit",
             records=bounded,
+            dropped_horizon=dropped_horizon,
         )
-    records = dict(
-        sorted(
-            records.items(),
-            key=lambda item: (item[0] in protected, item[1].get("updated", "")),
-            reverse=True,
-        )[:1000]
-    )
+    records = dict(sorted(records.items(), key=sort_key, reverse=True)[:1000])
     return records, plans

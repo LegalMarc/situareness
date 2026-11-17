@@ -1443,6 +1443,64 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["id"] for e in events_cancel], [valid["id"]])
         self.assertTrue(events_cancel.conflicting_cancellation)
 
+    def test_cancelled_record_without_cancel_retains_protection_and_overflow_horizon(
+        self,
+    ):
+        # A persisted state=="cancelled" record (whose Cancel was evicted) still blocks
+        # replay within 7 days and transitions to ended_or_absent once past horizon.
+        target = cap_event("m1-target", -5, message_type="Alert")
+        prior = {
+            target["id"]: {
+                "state": "cancelled",
+                "cancel_message": False,
+                "lineage": [target["id"]],
+                "cap_identity": target["cap_identity"],
+                "cap_references": target["reference_identities"],
+                "sent": target["sent"],
+                "expires": target["expires"],
+                "ends": target["ends"],
+                "updated": NOW.isoformat(),
+            }
+        }
+        replayed, plans = d.reconcile(
+            prior, [target], config(), NOW + timedelta(days=2)
+        )
+        self.assertFalse(plans)
+        self.assertEqual(replayed[target["id"]]["state"], "cancelled")
+
+        expired, _ = d.reconcile(prior, [], config(), NOW + timedelta(days=8))
+        self.assertEqual(expired[target["id"]]["state"], "ended_or_absent")
+
+        # Overflow prioritizes Cancel / state=="cancelled" over non-cancel protected records
+        # and propagates dropped_horizon across evicted components.
+        long_expiry = (NOW + timedelta(days=3)).isoformat()
+        overflow_prior = {}
+        for i in range(1002):
+            eid = f"https://api.weather.gov/alerts/ov-{i}"
+            overflow_prior[eid] = {
+                "state": "cancelled" if i < 600 else "active",
+                "cancel_message": i < 100,
+                "lineage": [eid],
+                "sent": NOW.isoformat(),
+                "expires": long_expiry if i == 1001 else NOW.isoformat(),
+                "updated": NOW.isoformat(),
+            }
+        # Put all records in protected via a shared cancel component or 1002 active/cancelled records:
+        # 100 Cancel + 500 cancelled + 402 current graph events -> 1002 protected.
+        extra_events = [
+            cap_event(f"ov-ev-{i}", -1, message_type="Alert") for i in range(402)
+        ]
+        with self.assertRaises(d.CancellationEvidenceOverflow) as ctx:
+            d.reconcile(overflow_prior, extra_events, config(), NOW)
+        retained = ctx.exception.records
+        self.assertEqual(len(retained), 1000)
+        self.assertTrue(
+            all(
+                f"https://api.weather.gov/alerts/ov-{i}" in retained for i in range(100)
+            )
+        )
+        self.assertEqual(ctx.exception.dropped_horizon, NOW + timedelta(days=10))
+
     async def test_malformed_actual_cancel_is_not_lost_as_a_simple_poll_error(self):
         bad = feature()
         bad["id"] = "not-a-valid-nws-id"

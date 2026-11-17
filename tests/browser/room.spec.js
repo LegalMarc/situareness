@@ -456,15 +456,25 @@ test("shows cached data after source failure and surfaces stale/truncated source
   await expect(
     page.getByRole("heading", { name: "Wind advisory for New York City" }),
   ).toBeVisible();
-  await expect(page.getByText("Not in latest results")).toBeVisible();
+  const notLatestCard = page
+    .locator(".event-card")
+    .filter({ has: page.getByRole("heading", { name: "Not latest fixture" }) });
+  await expect(notLatestCard.getByText("Not in latest results")).toBeVisible();
+  await expect(
+    notLatestCard.getByText("Cached · source unavailable"),
+  ).toBeVisible();
   await expect(page.getByText("Source expiry passed")).toBeVisible();
   const expiredCard = page
     .locator(".event-card")
     .filter({ has: page.getByRole("heading", { name: "Expired fixture" }) });
+  await expect(expiredCard.locator(".presence-pill")).toHaveCount(1);
   await expect(expiredCard.locator(".presence-pill")).toHaveAttribute(
     "title",
     /does not establish that the hazard ended/,
   );
+  await expect(
+    expiredCard.getByText("Cached · source unavailable"),
+  ).toHaveCount(0);
 });
 
 test("rejects invalid configuration imports and keeps the room usable at a phone viewport", async () => {
@@ -838,4 +848,120 @@ test("cached USGS and BBC items display cached unavailable badge when their sour
   await page.reload();
   await expect(usgsCard.getByText("Cached · source unavailable")).toBeVisible();
   await expect(bbcCard.getByText("Cached · source unavailable")).toBeVisible();
+});
+
+test("unavailable NWS items with not_in_latest_fetch or missing lifecycle render cached badge while expired items do not", async () => {
+  const initialState = (await send({ type: "GET_STATE" })).state;
+  const baseState = structuredClone(initialState);
+  const now = Date.now();
+  const addedAt = new Date(now - 5 * 60_000).toISOString();
+  const nwsSource = baseState.sources.find((source) => source.id === "nws");
+  nwsSource.status = "error";
+  nwsSource.last_error = "Simulated NWS outage";
+  baseState.events = [
+    {
+      id: "nws:not-latest",
+      source_id: "nws",
+      source_name: "National Weather Service alerts",
+      title: "NWS missing from latest poll",
+      summary: null,
+      url: null,
+      published_at: addedAt,
+      updated_at: null,
+      collected_at: addedAt,
+      expires_at: new Date(now + 60 * 60_000).toISOString(),
+      status: "actual",
+      category: "weather",
+      severity: null,
+      urgency: null,
+      certainty: null,
+      location_ids: [],
+      geometry: null,
+      instructions: null,
+      official: true,
+      awareness_lifecycle: "not_in_latest_fetch",
+    },
+    {
+      id: "nws:missing-lifecycle",
+      source_id: "nws",
+      source_name: "National Weather Service alerts",
+      title: "NWS missing lifecycle field",
+      summary: null,
+      url: null,
+      published_at: addedAt,
+      updated_at: null,
+      collected_at: addedAt,
+      expires_at: new Date(now + 60 * 60_000).toISOString(),
+      status: "actual",
+      category: "weather",
+      severity: null,
+      urgency: null,
+      certainty: null,
+      location_ids: [],
+      geometry: null,
+      instructions: null,
+      official: true,
+    },
+    {
+      id: "nws:expired",
+      source_id: "nws",
+      source_name: "National Weather Service alerts",
+      title: "NWS expired alert",
+      summary: null,
+      url: null,
+      published_at: addedAt,
+      updated_at: null,
+      collected_at: addedAt,
+      expires_at: new Date(now - 60_000).toISOString(),
+      status: "actual",
+      category: "weather",
+      severity: null,
+      urgency: null,
+      certainty: null,
+      location_ids: [],
+      geometry: null,
+      instructions: null,
+      official: true,
+      awareness_lifecycle: "current",
+    },
+  ];
+  await page.addInitScript((mockedState) => {
+    const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+    Object.defineProperty(chrome.runtime, "sendMessage", {
+      configurable: true,
+      value: async (message) => {
+        if (message?.type === "GET_STATE") {
+          return { ok: true, state: mockedState };
+        }
+        return original(message);
+      },
+    });
+  }, baseState);
+  await page.reload();
+
+  const notLatestCard = page.locator(".event-card").filter({
+    has: page.getByRole("heading", { name: "NWS missing from latest poll" }),
+  });
+  await expect(notLatestCard.getByText("Not in latest results")).toBeVisible();
+  await expect(
+    notLatestCard.getByText("Cached · source unavailable"),
+  ).toBeVisible();
+  await expect(notLatestCard.locator(".presence-pill")).toHaveCount(2);
+
+  const missingCard = page.locator(".event-card").filter({
+    has: page.getByRole("heading", { name: "NWS missing lifecycle field" }),
+  });
+  await expect(
+    missingCard.getByText("Cached · source unavailable"),
+  ).toBeVisible();
+  await expect(missingCard.locator(".presence-pill")).toHaveCount(1);
+
+  const expiredCard = page.locator(".event-card").filter({
+    has: page.getByRole("heading", { name: "NWS expired alert" }),
+  });
+  await expect(expiredCard.getByText("Source expiry passed")).toBeVisible();
+  await expect(
+    expiredCard.getByText("Cached · source unavailable"),
+  ).toHaveCount(0);
+  await expect(expiredCard.locator(".presence-pill")).toHaveCount(1);
 });

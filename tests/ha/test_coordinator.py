@@ -1127,7 +1127,16 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(store3.saved[-1]["degraded_at"])
         self.assertIsNotNone(store3.saved[-1]["degraded_until"])
 
-        # Future-dated acknowledge_degraded_at is rejected until clock reaches it.
+        # Future-dated acknowledge_degraded_at is rejected at load and does NOT
+        # auto-clear on subsequent polls even after clock advances past it.
+        class AckClock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        AckClock.current = now
         future_ack_cfg = {
             **cfg,
             "acknowledge_degraded_at": (now + timedelta(hours=1)).isoformat(),
@@ -1139,6 +1148,14 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             persisted,
         )
         self.assertTrue(c_future.degraded)
+        AckClock.current = now + timedelta(hours=2)
+        with (
+            patch.object(mod, "datetime", AckClock),
+            patch.object(mod, "fetch", fetch_alert),
+        ):
+            still_deg = await c_future._async_update_data()
+        self.assertTrue(still_deg["evidence_degraded"])
+        self.assertTrue(still_deg["output_blocked"])
 
         # One-shot acknowledgment: once consumed, the same timestamp cannot clear a new degradation.
         ack_once = (now - timedelta(minutes=30)).isoformat()
@@ -1596,6 +1613,147 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         ):
             h_dup = await c_dup_cancel._async_update_data()
         self.assertEqual(h_dup["degraded_reason"], "conflicting_cancellation")
+
+        # SPEC-01 / SIT-REV-L2: Missing persisted store after journal_initialized=True
+        # latches journal_lost, withholds output while collecting, and preserves state.
+        class FakeConfigEntries:
+            def __init__(self, entry):
+                self.entry = entry
+
+            def async_update_entry(self, entry, *, data):
+                entry.data = data
+
+        entry = types.SimpleNamespace(data={})
+        hass_entry = types.SimpleNamespace(
+            services=Services(), config_entries=FakeConfigEntries(entry)
+        )
+        store_jl = Store()
+        c_init = mod.SituarenessCoordinator(
+            hass_entry, cfg, store_jl, None, entry=entry
+        )
+        with patch.object(mod, "fetch", return_value=[]):
+            await c_init._async_update_data()
+        self.assertTrue(entry.data.get("journal_initialized"))
+
+        # Restart with lost store (None or {}) latches journal_lost and blocks output.
+        for lost_payload in (None, {}):
+            with self.subTest(lost_payload=lost_payload):
+                srv_jl = Services()
+                store_lost = Store()
+                hass_lost = types.SimpleNamespace(
+                    services=srv_jl, config_entries=FakeConfigEntries(entry)
+                )
+                c_lost = mod.SituarenessCoordinator(
+                    hass_lost, cfg, store_lost, lost_payload, entry=entry
+                )
+                self.assertTrue(c_lost.degraded)
+                self.assertEqual(c_lost.degraded_reason, "journal_lost")
+                alert_jl = make_alert("spec01-alert")
+                with patch.object(mod, "fetch", return_value=[alert_jl]):
+                    h_jl = await c_lost._async_update_data()
+                self.assertTrue(h_jl["evidence_degraded"])
+                self.assertTrue(h_jl["output_blocked"])
+                self.assertEqual(h_jl["degraded_reason"], "journal_lost")
+                self.assertEqual(srv_jl.calls, [])
+                self.assertEqual(
+                    store_lost.saved[-1]["degraded_reason"], "journal_lost"
+                )
+
+        # SIT-REV-M1: Overflow propagates dropped_horizon to degraded_until and a
+        # subsequent shorter trigger never shrinks an earlier longer degraded_until.
+        long_exp = (now + timedelta(days=4)).isoformat()
+        ov_long_records = {
+            f"ov-long-{i}": {
+                "state": "cancelled",
+                "cancel_message": True,
+                "lineage": [f"ov-long-{i}"],
+                "expires": long_exp if i == 0 else now.isoformat(),
+                "updated": (now - timedelta(minutes=1)).isoformat()
+                if i == 0
+                else now.isoformat(),
+            }
+            for i in range(1001)
+        }
+        store_horizon = Store()
+        c_horizon = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=Services()),
+            cfg,
+            store_horizon,
+            {
+                "initialized": True,
+                "was_live": True,
+                "records": ov_long_records,
+                "outbox": [],
+            },
+        )
+        with patch.object(mod, "fetch", return_value=[make_alert("ov-h-ev")]):
+            h_ov_long = await c_horizon._async_update_data()
+        expected_long_until = d.timestamp(long_exp) + d.MAX_ACCEPTANCE_AGE
+        self.assertGreaterEqual(
+            d.timestamp(h_ov_long["degraded_until"]), expected_long_until
+        )
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents(
+                [make_alert("ov-h-ev2")], 0, [], False, uncertain_cancellation=True
+            ),
+        ):
+            h_ov_next = await c_horizon._async_update_data()
+        self.assertEqual(h_ov_next["degraded_until"], h_ov_long["degraded_until"])
+
+        # SPEC-03: Reloading with acknowledge_degraded_at after >15m degraded preserves
+        # last_degraded_poll until post-ack outbox migration credits the final interval.
+        class AckOutboxClock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        AckOutboxClock.current = now
+        srv_s3 = PartialFailServices()
+        srv_s3.fail_two = True
+        store_s3 = Store()
+        s3_alert = make_alert("spec03-alert")
+        c_s3 = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=srv_s3), cfg_two, store_s3, {}
+        )
+        with patch.object(mod, "datetime", AckOutboxClock):
+            with patch.object(mod, "fetch", return_value=[s3_alert]):
+                await c_s3._async_update_data()
+            AckOutboxClock.current = now + timedelta(minutes=1)
+            with patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents(
+                    [s3_alert], 0, [], False, uncertain_cancellation=True
+                ),
+            ):
+                await c_s3._async_update_data()
+        # Reload at T + 20m with ack at T + 2m (evaluated at load time -> acknowledged),
+        # then poll at T + 20m: last_degraded_poll (T + 1m) credits 19m and delivers phone_2.
+        AckOutboxClock.current = now + timedelta(minutes=20)
+        srv_s3.fail_two = False
+        store_s3_rec = Store()
+        with patch.object(mod, "datetime", AckOutboxClock):
+            c_s3_rec = mod.SituarenessCoordinator(
+                types.SimpleNamespace(services=srv_s3),
+                {
+                    **cfg_two,
+                    "acknowledge_degraded_at": (now + timedelta(minutes=2)).isoformat(),
+                },
+                store_s3_rec,
+                store_s3.saved[-1],
+            )
+            self.assertFalse(c_s3_rec.degraded)
+            self.assertIsNotNone(c_s3_rec.last_degraded_poll)
+            with patch.object(mod, "fetch", return_value=[s3_alert]):
+                h_s3 = await c_s3_rec._async_update_data()
+        self.assertFalse(h_s3["evidence_degraded"])
+        self.assertIsNone(store_s3_rec.saved[-1]["last_degraded_poll"])
+        self.assertEqual(len(srv_s3.calls), 3)
+        self.assertEqual(srv_s3.calls[-1][1], "mobile_app_two")
 
     async def test_invalid_cap_cancel_quarantines_locally_and_independent_sibling_retries(
         self,

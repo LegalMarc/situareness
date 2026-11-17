@@ -208,27 +208,35 @@ export function eventTimestamp(event) {
     : { timestamp: 0, value: null, label: "Time unknown" };
 }
 
+/** Return true when source state is available for inspection and the event's source is disabled, failed, overdue, or missing. */
+export function isEventSourceUnavailable(
+  event,
+  now = Date.now(),
+  sources = [],
+  sourceStates = null,
+) {
+  if (!sourceStates) return false;
+  const state = (Array.isArray(sourceStates) ? sourceStates : []).find(
+    (source) => source?.id === event?.source_id,
+  );
+  const config = Array.isArray(sources)
+    ? sources.find((source) => source?.id === event?.source_id)
+    : undefined;
+  return (
+    !state ||
+    sourceFreshness(
+      { ...state, interval_minutes: config?.interval_minutes },
+      now,
+    ) !== "ok"
+  );
+}
+
 export function nwsAwarenessLifecycle(
   event,
   now = Date.now(),
   sources = [],
   sourceStates = null,
 ) {
-  const isSourceUnavailable = () => {
-    const state = (Array.isArray(sourceStates) ? sourceStates : []).find(
-      (source) => source?.id === event?.source_id,
-    );
-    const config = Array.isArray(sources)
-      ? sources.find((source) => source?.id === event?.source_id)
-      : undefined;
-    return (
-      !state ||
-      sourceFreshness(
-        { ...state, interval_minutes: config?.interval_minutes },
-        now,
-      ) !== "ok"
-    );
-  };
   const sourceIsWeather =
     Array.isArray(sources) &&
     sources.some(
@@ -241,17 +249,22 @@ export function nwsAwarenessLifecycle(
     event?.category === "weather" &&
     event?.official === true;
   if (!sourceIsWeather && !carriesWeatherLifecycle)
-    return sourceStates && isSourceUnavailable() ? "cached" : null;
+    return isEventSourceUnavailable(event, now, sources, sourceStates)
+      ? "cached"
+      : null;
   const expiry = Date.parse(event?.expires_at || "");
   if (Number.isFinite(expiry) && expiry <= now) return "expired";
   if (event.awareness_lifecycle === "expired") return "expired";
   if (event.awareness_lifecycle === "not_in_latest_fetch")
     return "not_in_latest_fetch";
   if (event.awareness_lifecycle === "current") {
-    if (sourceStates && isSourceUnavailable()) return "cached";
+    if (isEventSourceUnavailable(event, now, sources, sourceStates))
+      return "cached";
     return "current";
   }
-  return "unknown";
+  return isEventSourceUnavailable(event, now, sources, sourceStates)
+    ? "cached"
+    : "unknown";
 }
 
 export function matchesEvent(

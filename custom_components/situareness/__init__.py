@@ -197,12 +197,13 @@ def _outbox_signature(groups, item, records=None):
 
 
 class SituarenessCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass, config, store, persisted):
+    def __init__(self, hass, config, store, persisted, entry=None):
         super().__init__(
             hass, _LOGGER, name=DOMAIN, update_interval=timedelta(minutes=1)
         )
         self.config = config
         self.store = store
+        self._entry = entry
         if not _valid_persisted_store(persisted):
             detect_now = datetime.now(timezone.utc)
             self.records = {}
@@ -216,6 +217,23 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.degraded_until = (detect_now + MAX_ACCEPTANCE_AGE).isoformat()
             self.acknowledged_degraded_at = None
             self.last_degraded_poll = None
+        elif (
+            self._entry is not None
+            and self._entry.data.get("journal_initialized") is True
+            and (persisted is None or persisted == {})
+        ):
+            detect_now = datetime.now(timezone.utc)
+            self.records = {}
+            self.outbox = []
+            self.outcomes = []
+            self.initialized = True
+            self.was_live = live(self.config)
+            self.degraded = True
+            self.degraded_reason = "journal_lost"
+            self.degraded_at = detect_now.isoformat()
+            self.degraded_until = (detect_now + MAX_ACCEPTANCE_AGE).isoformat()
+            self.acknowledged_degraded_at = None
+            self.last_degraded_poll = detect_now.isoformat()
         else:
             persisted = persisted if isinstance(persisted, dict) else {}
             self.records = persisted.get("records", {})
@@ -240,7 +258,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             )
             self.acknowledged_degraded_at = persisted.get("acknowledged_degraded_at")
             self.last_degraded_poll = (
-                persisted.get("last_degraded_poll") if self.degraded else None
+                (persisted.get("last_degraded_poll") or self.degraded_at)
+                if self.degraded
+                else None
             )
         self._try_acknowledge(datetime.now(timezone.utc))
         self.session = async_get_clientsession(hass)
@@ -266,7 +286,6 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.degraded_reason = None
         self.degraded_at = None
         self.degraded_until = None
-        self.last_degraded_poll = None
         return True
 
     async def _save(self, records, outbox, outcomes):
@@ -292,6 +311,13 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             True,
         )
         self.was_live = live(self.config)
+        if (
+            self._entry is not None
+            and self._entry.data.get("journal_initialized") is not True
+        ):
+            self.hass.config_entries.async_update_entry(
+                self._entry, data={**self._entry.data, "journal_initialized": True}
+            )
 
     async def async_stop(self):
         self._stopping = True
@@ -484,6 +510,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 else None
             )
             plans = []
+            overflow_horizon = None
             try:
                 records, plans = reconcile(
                     self.records,
@@ -500,11 +527,23 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             except CancellationEvidenceOverflow as err:
                 records = err.records if err.records is not None else self.records
                 degraded_trigger = "cancellation_evidence_overflow"
+                overflow_horizon = (
+                    timestamp(err.dropped_horizon)
+                    if isinstance(err.dropped_horizon, str)
+                    else err.dropped_horizon
+                )
             if degraded_trigger is not None:
+                existing_until = timestamp(self.degraded_until)
+                candidate_until = overflow_horizon or (now + MAX_ACCEPTANCE_AGE)
+                new_until = (
+                    max(existing_until, candidate_until)
+                    if existing_until is not None
+                    else candidate_until
+                )
                 self.degraded = True
                 self.degraded_reason = degraded_trigger
                 self.degraded_at = now.isoformat()
-                self.degraded_until = (now + MAX_ACCEPTANCE_AGE).isoformat()
+                self.degraded_until = new_until.isoformat()
             elif self.degraded:
                 if self.degraded_at is None:
                     self.degraded_at = now.isoformat()
@@ -513,13 +552,12 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     self.degraded_until = (
                         (timestamp(self.degraded_at) or now) + MAX_ACCEPTANCE_AGE
                     ).isoformat()
-                if not self._try_acknowledge(now):
-                    until = timestamp(self.degraded_until)
-                    if until is not None and now > until:
-                        self.degraded = False
-                        self.degraded_reason = None
-                        self.degraded_at = None
-                        self.degraded_until = None
+                until = timestamp(self.degraded_until)
+                if until is not None and now > until:
+                    self.degraded = False
+                    self.degraded_reason = None
+                    self.degraded_at = None
+                    self.degraded_until = None
             degraded_delta = (
                 now - last_ts
                 if (
@@ -706,7 +744,7 @@ async def async_setup_entry(hass, entry):
         raise ConfigEntryNotReady(f"Invalid situareness.json: {err}") from err
     store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}")
     persisted = await store.async_load()
-    coordinator = SituarenessCoordinator(hass, config, store, persisted)
+    coordinator = SituarenessCoordinator(hass, config, store, persisted, entry=entry)
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

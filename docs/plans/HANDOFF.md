@@ -2,6 +2,22 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 fourth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `64b6fa0` (`run_id`: `20261117T174809Z-251d8a`, 384.8s standards and 308.0s specification) reported zero High findings and zero packaging/catalog defects, leaving one Medium and three Low `spec` findings (`SPEC-01`–`SPEC-04`) plus one Medium and two Low `standards` findings (`SIT-REV-M1`, `SIT-REV-L1` [same as `SPEC-02`], `SIT-REV-L2` — 6 unique findings total).
+
+All 6 remaining findings were repaired via disjoint workers (`ha-repair` `775aa2e8` and `browser-repair` `50a99905`) plus supervisor specification/report updates:
+- **`SPEC-01` & `SIT-REV-L2`**: Tracked `"journal_initialized": True` on the config entry after saving a journal so a missing or empty persisted store on an already-initialized entry latches `degraded_reason="journal_lost"` (withholding output while continuing read-only collection until `degraded_until` or load-time acknowledgement) instead of resetting cleanly.
+- **`SIT-REV-M1`**: Retained `state == "cancelled"` protection and seven-day expiry in `domain.py` even after a `Cancel` record ages out, prioritized active/current/`Cancel`/`cancelled` records under overflow, and propagated `dropped_horizon` across evicted components into `degraded_until` without shrinking earlier longer horizons.
+- **`SPEC-02` & `SIT-REV-L1`**: Evaluated `acknowledge_degraded_at` solely at coordinator construction against load time (`degraded_at <= acknowledge_degraded_at <= load_now`), preventing future-dated timestamps from auto-clearing on later polls without reload.
+- **`SPEC-03`**: Preserved `last_degraded_poll` across load-time acknowledgement until `_migrate_and_prune_outbox()` credits the final degraded interval on the recovery poll.
+- **`SPEC-04`**: Exported `isEventSourceUnavailable(...)` in `extension/ui/helpers.mjs`, rendered `"Cached · source unavailable"` alongside `"Not in latest results"` when an NWS source is unavailable, and defaulted missing/unknown non-expired NWS lifecycle metadata to `"cached"` while unavailable (`"expired"` stays exclusive).
+- **`SIT-REV-L2`**: Added explicit history-loss/re-alert disclosures for resetting/replacing `malformed_store`/`journal_lost` stores and early `cancellation_evidence_overflow` acknowledgement across `o3-mvp.md`, `cap-cancellation.md`, `docs/ha/README.md`, and `home-assistant/README.md`.
+
+The complete local gates passed: 42 Node, 73 stdlib HA (`-W error`), 7 source-skill, 20 Chromium browser, and 8 actual-HA tests (150 total), plus static checks, Ruff lint/format, and two identical deterministic ZIP builds (`60910aad...` extension, `fb0b4645...` HA). Actual HA reports five known upstream deprecations without suppression. Live anonymous smoke (`node tools/live-browser-smoke.mjs`) passed at `2026-11-17T18:06:18.354Z` with HTTP 200 across NWS (1 alert), USGS (7 items), BBC World (24 items), and BBC US & Canada (23 items).
+
+Next: run `audit_private.py`, commit and push to `wip/supervisor-handoff-20261117`, refresh verification logs on the clean `HEAD`, run independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews, and once both pass, run a fresh independent Opus `adversarial` review on that immutable candidate. Household outputs remain disabled and no commissioning occurred. `main` remains at `847d0e5`; once all release gates pass, fast-forward `main` and advance roadmap **S0** (public CI privacy/build gate) and **S1**.
+
 ## Continuation update: November 17 third Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `83f328c` (`run_id`: `20261117T173308Z-a2a286`, 260.9s standards and 267.0s specification) confirmed zero supported defects in the browser room, UI, packaging, and catalog validator, while reporting six standards (`SIT-H1`, `SIT-H2`, `SIT-M1`, `SIT-M2`, `SIT-L1`, `SIT-L2`) and five specification (`SR-H1`, `SR-M1`, `SR-M2`, `SR-L1`, `SR-L2`) findings in Home Assistant and HA documentation.
