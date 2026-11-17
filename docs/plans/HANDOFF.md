@@ -2,6 +2,19 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 sixteenth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `3b35e7c` (`run_id`: `20261117T232125Z-6894d0`, 359.6s standards and 349.8s specification) reported **0 Critical, 0 High, 0 Medium specification findings, and zero live-gate/routing/privacy/shadow/room/packaging defects**, leaving 7 findings (`SIT-R01` Medium, `SPEC-HA-01` / `SIT-R02` / `SIT-R03` / `SPEC-HA-02` Low, and `SIT-R04` / `SPEC-HA-03` Nit).
+
+All 7 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor contract/README/index/report updates:
+- **`SIT-R01` & `SPEC-HA-01`**: Defined `MAX_TIMESTAMP` (`9998-12-31T23:59:59+00:00`), bounded each record's retention timestamps in `cancellation_horizon()` at `min(ts, updated + 5m)` so future-dated invalid Cancels expire cleanly after 7 days (`NOW + 5m + MAX_ACCEPTANCE_AGE`), and clamped `cancellation_horizon()`, `_bound_records()`, and `_latch_degraded()` horizons at `MAX_TIMESTAMP` so reload validation never enters `malformed_store` on late-`9998` inputs.
+- **`SIT-R02`**: Offloaded `reconcile` and `_valid_persisted_store` via `hass.async_add_executor_job`, scoped `_deliverable_count` and batched `_deliver_outbox_batch` `qualify()` calls to queued active IDs, and tightened the 1,000-record `reconcile` benchmark to `< 0.5s`.
+- **`SIT-R03`**: Sorted deliverable outbox batches with never-attempted (`attempts == 0`) targets ahead of retries while preserving FIFO order within each tier.
+- **`SPEC-HA-02` & `SPEC-HA-03`**: Surfaced `acknowledge_rejected: true` and `situareness_degraded` on invalid/naive/over-length/future `acknowledge_degraded_at` values even while healthy (`_healthy_snapshot` / `_stopped_health`), consumed valid future ISO timestamps without failing setup, and removed the inaccurate 15-minute expiry clause from `outbox_overflow` notifications.
+- **`SIT-R04`**: Synchronized `docs/INDEX.md` anchors with all current headings in `docs/spec/o3-mvp.md` and `home-assistant/README.md`.
+
+Next: run complete local gates (`43` Node, `91` stdlib HA, `7` skill, `21` Chromium, `11` actual HA = `173` total), deterministic packaging (`823de6d0...` extension, `bca74a2b...` HA), live anonymous smoke (`2026-11-17T23:41:13.215Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, and run Opus `axes` + fresh `adversarial` reviews. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 17 fifteenth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `1078764` (`run_id`: `20261117T230054Z-57bc4c`, 286.1s standards and 394.5s specification) reported **0 Critical, 0 High, 0 Medium specification findings, and zero browser/packaging/catalog/gate/routing/overflow/store/lifecycle defects**, leaving only 4 small HA/documentation findings (`HA-01` Medium, `HA-02` Low, `SPEC-01`/`HA-04` Low/Nit, `HA-03`/`NIT-01` Nit).

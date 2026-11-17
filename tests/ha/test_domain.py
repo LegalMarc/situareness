@@ -1067,7 +1067,7 @@ class Policy(unittest.TestCase):
             elapsed = time.perf_counter() - start
         mock_deepcopy.assert_called_once()
         self.assertLessEqual(len(records), 1000)
-        self.assertLess(elapsed, 5.0)
+        self.assertLess(elapsed, 0.5)
 
     def test_normalize_oversized_and_non_string_properties(self):
         oversized = feature()
@@ -1840,7 +1840,10 @@ class Collector(unittest.IsolatedAsyncioTestCase):
                 f"https://api.weather.gov/alerts/ov-{i}" in retained for i in range(100)
             )
         )
-        self.assertEqual(ctx.exception.dropped_horizon, NOW + timedelta(days=10))
+        self.assertEqual(
+            ctx.exception.dropped_horizon,
+            (NOW - timedelta(seconds=1)) + timedelta(minutes=5) + d.MAX_ACCEPTANCE_AGE,
+        )
 
     async def test_malformed_actual_cancel_is_not_lost_as_a_simple_poll_error(self):
         bad = feature()
@@ -2005,25 +2008,68 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(records[bad_cancel["id"]].get("cap_identity"))
         self.assertIsNone(records[bad_cancel["id"]].get("cap_references"))
 
-        # Near-datetime.max cancellation_horizon / _bound_records clamp cleanly instead of overflowing.
+        # Invalid far-future Cancel (sent/expires +365d, updated=NOW) clamps cancellation_horizon
+        # to observed + 5m + MAX_ACCEPTANCE_AGE and ages out cleanly after 8 days.
+        fut_target = d.normalize(feature())
+        fut_target["id"] = "https://api.weather.gov/alerts/fut-target"
+        cohere(fut_target)
+        fut_cancel = d.normalize(feature())
+        fut_cancel["id"] = "https://api.weather.gov/alerts/fut-cancel"
+        fut_cancel["message_type"] = "Cancel"
+        fut_cancel["sent"] = (NOW + timedelta(days=365)).isoformat()
+        fut_cancel["expires"] = (NOW + timedelta(days=365)).isoformat()
+        cohere(fut_cancel, fut_target)
+        fut_records, _ = d.reconcile({}, [fut_target, fut_cancel], config(), NOW)
+        fut_horizon = d.cancellation_horizon(
+            [fut_target["id"], fut_cancel["id"]], fut_records
+        )
+        self.assertEqual(fut_horizon, NOW + timedelta(minutes=5) + d.MAX_ACCEPTANCE_AGE)
+        valid_day8 = d.normalize(feature())
+        valid_day8["id"] = "https://api.weather.gov/alerts/valid-day8"
+        for key, delta in [
+            ("sent", -60),
+            ("effective", -60),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            valid_day8[key] = (NOW + timedelta(days=8, seconds=delta)).isoformat()
+        cohere(valid_day8)
+        day8_records, day8_plans = d.reconcile(
+            fut_records,
+            [valid_day8],
+            config(),
+            NOW + timedelta(days=8),
+        )
+        self.assertEqual([p["id"] for p in day8_plans], [valid_day8["id"]])
+        self.assertEqual(day8_records[fut_target["id"]]["state"], "ended_or_absent")
+        self.assertEqual(day8_records[fut_cancel["id"]]["state"], "ended_or_absent")
+        self.assertTrue(day8_records[fut_cancel["id"]]["cancellation_expired"])
+
+        # Near-MAX_TIMESTAMP cancellation_horizon / _bound_records clamp cleanly to MAX_TIMESTAMP.
         near_max = {
             "https://api.weather.gov/alerts/near-max": {
                 "state": "cancelled",
-                "expires": "9999-12-30T00:00:00+00:00",
+                "expires": "9998-12-30T00:00:00+00:00",
                 "updated": NOW.isoformat(),
-            }
+            },
+            "https://api.weather.gov/alerts/near-max-unbounded": {
+                "state": "cancelled",
+                "expires": "9998-12-30T00:00:00+00:00",
+            },
         }
-        with patch.object(
-            d,
-            "timestamp",
-            side_effect=lambda v: (
-                datetime.fromisoformat(v) if isinstance(v, str) else None
+        self.assertEqual(
+            d.cancellation_horizon(
+                ["https://api.weather.gov/alerts/near-max-unbounded"], near_max
             ),
-        ):
-            horizon = d.cancellation_horizon(
+            d.MAX_TIMESTAMP,
+        )
+        self.assertEqual(
+            d.cancellation_horizon(
                 ["https://api.weather.gov/alerts/near-max"], near_max
-            )
-        self.assertEqual(horizon, datetime.max.replace(tzinfo=timezone.utc))
+            ),
+            NOW + timedelta(minutes=5) + d.MAX_ACCEPTANCE_AGE,
+        )
 
         overflow_records = {
             f"https://api.weather.gov/alerts/ov-max-{i}": {
@@ -2043,12 +2089,10 @@ class Collector(unittest.IsolatedAsyncioTestCase):
                 {eid: eid for eid in overflow_records},
                 set(),
                 set(),
-                datetime(9999, 12, 30, tzinfo=timezone.utc),
+                datetime(9998, 12, 30, tzinfo=timezone.utc),
                 [],
             )
-        self.assertEqual(
-            ctx.exception.dropped_horizon, datetime.max.replace(tzinfo=timezone.utc)
-        )
+        self.assertEqual(ctx.exception.dropped_horizon, d.MAX_TIMESTAMP)
 
 
 if __name__ == "__main__":

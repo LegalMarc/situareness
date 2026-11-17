@@ -20,6 +20,12 @@ class BaseCoordinator:
     def __init__(self, hass, *args, **kwargs):
         self.hass = hass
         self.config_entry = kwargs.get("config_entry")
+        if hass is not None and not hasattr(hass, "async_add_executor_job"):
+
+            async def _exec(fn, *args):
+                return fn(*args)
+
+            hass.async_add_executor_job = _exec
 
 
 class UpdateFailed(Exception):
@@ -1843,10 +1849,10 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(mod, "fetch", return_value=[make_alert("ov-h-ev")]):
             h_ov_long = await c_horizon._async_update_data()
-        expected_long_until = d.timestamp(long_exp) + d.MAX_ACCEPTANCE_AGE
-        self.assertGreaterEqual(
-            d.timestamp(h_ov_long["degraded_until"]), expected_long_until
+        expected_long_until = (
+            (now - timedelta(minutes=1)) + timedelta(minutes=5) + d.MAX_ACCEPTANCE_AGE
         )
+        self.assertEqual(d.timestamp(h_ov_long["degraded_until"]), expected_long_until)
         with patch.object(
             mod,
             "fetch",
@@ -2632,6 +2638,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             pass
 
         load_error = ValueError("corrupt json")
+        load_result = None
 
         seen_private = []
 
@@ -2641,7 +2648,9 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 seen_private.append(kwargs.get("private"))
 
             async def async_load(self):
-                raise load_error
+                if load_error is not None:
+                    raise load_error
+                return load_result
 
             async def async_remove(self):
                 events.append("remove")
@@ -2779,6 +2788,25 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                     await mod.async_setup_entry(setup_hass, io_entry)
                 self.assertEqual(io_entry.data, {})
 
+            # Non-empty invalid-schema persisted dict validates once off-loop and keeps degraded_at.
+            load_error = None
+            load_result = {
+                "records": "corrupt",
+                "degraded_at": "2026-11-17T01:02:03+00:00",
+            }
+            schema_entry = types.SimpleNamespace(entry_id="bad-schema", data={})
+            with (
+                patch.object(mod, "SituarenessCoordinator", CapturingCoordinator),
+                patch.object(
+                    mod, "_valid_persisted_store", wraps=mod._valid_persisted_store
+                ) as mock_valid,
+            ):
+                await mod.async_setup_entry(setup_hass, schema_entry)
+            mock_valid.assert_called_once_with(load_result)
+            schema_coord = setup_hass.data[mod.DOMAIN][schema_entry.entry_id]
+            self.assertEqual(schema_coord.degraded_reason, "malformed_store")
+            self.assertEqual(schema_coord.degraded_at, "2026-11-17T01:02:03+00:00")
+
     async def test_outbox_overflow_latches_degraded_and_recovers_after_prune(self):
         from datetime import datetime, timedelta, timezone
         from test_domain import c
@@ -2872,6 +2900,14 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn(
             "live output blocked", notifications["situareness_degraded"].lower()
+        )
+        self.assertNotIn(
+            "15-minute degraded_until horizon expires",
+            notifications["situareness_degraded"].lower(),
+        )
+        self.assertIn(
+            "fit within the 5,000-target limit",
+            notifications["situareness_degraded"].lower(),
         )
         degraded_at = datetime.fromisoformat(store.saved[-1]["degraded_at"])
         degraded_until = datetime.fromisoformat(store.saved[-1]["degraded_until"])
@@ -3075,7 +3111,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             exec_calls = []
 
             async def track_exec(fn, *args):
-                exec_calls.append(getattr(fn, "__name__", str(fn)))
+                exec_calls.append(getattr(getattr(fn, "func", fn), "__name__", str(fn)))
                 return fn(*args)
 
             clean_entry = types.SimpleNamespace(entry_id="clean-entry", data={})
@@ -3097,7 +3133,8 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 # Clean save must not schedule directory scans for corrupt backups.
                 with patch.object(mod, "fetch", return_value=[]):
                     await coord._async_update_data()
-                self.assertEqual(exec_calls, [])
+                self.assertNotIn("_clear_corrupt_store_backups", exec_calls)
+                self.assertIn("reconcile", exec_calls)
 
                 # Two consecutive degraded polls with advancing timestamps emit notification once.
                 with patch.object(mod, "fetch", return_value=[bad_cancel]):
@@ -3795,3 +3832,285 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(h_y2["evidence_degraded"])
         self.assertEqual(h_y2["active_count"], 1)
         self.assertEqual(len(live_services.calls), 1)
+
+    async def test_max_timestamp_overflow_retry_priority_and_healthy_ack_rejection(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+        from test_domain import c
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+            ),
+        )
+
+        # Near-MAX_TIMESTAMP CancellationEvidenceOverflow stores MAX_TIMESTAMP.isoformat(),
+        # passes _valid_persisted_store(), and reloads into cancellation_evidence_overflow.
+        class MaxClock:
+            current = datetime(9998, 12, 30, 0, 0, tzinfo=timezone.utc)
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        max_now = MaxClock.current
+        ov_records = {
+            f"https://api.weather.gov/alerts/max-ov-{i}": {
+                "state": "cancelled",
+                "cancel_message": True,
+                "lineage": [f"https://api.weather.gov/alerts/max-ov-{i}"],
+                "sent": max_now.isoformat(),
+                "expires": max_now.isoformat(),
+                "updated": max_now.isoformat(),
+            }
+            for i in range(1001)
+        }
+        ov_store = Store()
+        with patch.object(mod, "datetime", MaxClock):
+            ov_coord = mod.SituarenessCoordinator(
+                hass,
+                cfg,
+                ov_store,
+                {
+                    "records": ov_records,
+                    "outbox": [],
+                    "initialized": True,
+                    "was_live": True,
+                },
+            )
+            with patch.object(mod, "fetch", return_value=[]):
+                h_max = await ov_coord._async_update_data()
+        expected_max_iso = d.MAX_TIMESTAMP.isoformat()
+        self.assertEqual(expected_max_iso, "9998-12-31T23:59:59+00:00")
+        self.assertEqual(h_max["degraded_reason"], "cancellation_evidence_overflow")
+        self.assertEqual(h_max["degraded_until"], expected_max_iso)
+        self.assertTrue(mod._valid_persisted_store(ov_store.saved[-1]))
+        reloaded_max = mod.SituarenessCoordinator(
+            hass, cfg, Store(), ov_store.saved[-1]
+        )
+        self.assertEqual(reloaded_max.degraded_reason, "cancellation_evidence_overflow")
+        self.assertEqual(reloaded_max.degraded_until, expected_max_iso)
+
+        # Outbox delivery prioritizes first-attempt items (attempts == 0) before retries (attempts > 0)
+        # while maintaining FIFO within each tier and caching qualify() per incident per 10-target group.
+        now = datetime.now(timezone.utc)
+
+        def make_live_event(suffix, offset_sec=-60):
+            ev = d.normalize(feature())
+            ev["id"] = f"https://api.weather.gov/alerts/prio-{suffix}"
+            for key, delta in [
+                ("sent", offset_sec),
+                ("effective", offset_sec),
+                ("onset", 0),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                ev[key] = (now + timedelta(seconds=delta)).isoformat()
+            return cohere(ev)
+
+        retry_ev = make_live_event("retry", -120)
+        fresh_ev = make_live_event("fresh", -30)
+        batch_cfg = {**cfg, "phones": [f"mobile_app_{i}" for i in range(10)]}
+        retry_outbox = [
+            {
+                "key": f"retry-{i}",
+                "incident_id": retry_ev["id"],
+                "fingerprint": "fp-retry",
+                "kind": "phone",
+                "target": f"mobile_app_{i % 10}",
+                "location": "new_york_ny",
+                "affected_names": ["New York"],
+                "event": "Tornado Warning",
+                "instruction": "Take shelter immediately.",
+                "source_url": retry_ev["id"],
+                "attempts": 1,
+                "created": now.isoformat(),
+            }
+            for i in range(100)
+        ]
+        fresh_item = {
+            "key": "fresh-0",
+            "incident_id": fresh_ev["id"],
+            "fingerprint": "fp-fresh",
+            "kind": "phone",
+            "target": "mobile_app_0",
+            "location": "new_york_ny",
+            "affected_names": ["New York"],
+            "event": "Tornado Warning",
+            "instruction": "Take shelter immediately.",
+            "source_url": fresh_ev["id"],
+            "attempts": 0,
+            "created": now.isoformat(),
+        }
+        prio_services = Services()
+        prio_hass = types.SimpleNamespace(data={}, services=prio_services)
+        prio_records = {
+            retry_ev["id"]: {
+                "state": "active",
+                "fingerprint": "fp-retry",
+                "lineage": [retry_ev["id"]],
+                "actions": {"fp-retry": ["new_york_ny"]},
+                "updated": now.isoformat(),
+            },
+            fresh_ev["id"]: {
+                "state": "active",
+                "fingerprint": "fp-fresh",
+                "lineage": [fresh_ev["id"]],
+                "actions": {"fp-fresh": ["new_york_ny"]},
+                "updated": now.isoformat(),
+            },
+        }
+        prio_coord = mod.SituarenessCoordinator(
+            prio_hass,
+            batch_cfg,
+            Store(),
+            {
+                "records": prio_records,
+                "outbox": [*retry_outbox, fresh_item],
+                "initialized": True,
+                "was_live": True,
+            },
+        )
+        with patch.object(mod, "qualify", wraps=d.qualify) as mock_qualify:
+            attempts, failures = await prio_coord._deliver_outbox_batch(
+                [retry_ev, fresh_ev], now
+            )
+        self.assertEqual(attempts, 100)
+        self.assertEqual(failures, 0)
+        self.assertEqual(prio_services.calls[0][2]["data"]["url"], fresh_ev["id"])
+        # Remaining 99 slots go to FIFO retries; 1 retry remains queued.
+        self.assertEqual(len(prio_coord.outbox), 1)
+        self.assertEqual(prio_coord.outbox[0]["key"], "retry-99")
+        # Group 0 had fresh_ev + 9 retry_ev items => at most 2 qualify() calls for Group 0
+        # plus 1 per subsequent 10-target group (9 remaining groups) = 11 instead of 100.
+        self.assertLessEqual(mock_qualify.call_count, 11)
+
+        # Loading naive, over-length, or future acknowledge_degraded_at while healthy sets
+        # acknowledge_rejected=True on coordinator + snapshot and raises situareness_degraded;
+        # valid consumed future ISO still cannot clear a later degradation.
+        healthy_store = {
+            "records": {},
+            "outbox": [],
+            "initialized": True,
+            "was_live": True,
+        }
+        for bad_ack in (
+            "2026-11-17T10:00:00",
+            "2026-11-17T10:00:00Z-" + "x" * 100,
+        ):
+            notifications.clear()
+            bad_cfg = c.validate({**cfg, "acknowledge_degraded_at": bad_ack})
+            hc = mod.SituarenessCoordinator(hass, bad_cfg, Store(), healthy_store)
+            self.assertFalse(hc.degraded)
+            self.assertTrue(hc.acknowledge_rejected)
+            self.assertIn("situareness_degraded", notifications)
+            self.assertEqual(
+                notifications["situareness_degraded"]["title"],
+                "Situareness acknowledgement rejected",
+            )
+            with patch.object(mod, "fetch", return_value=[]):
+                hh = await hc._async_update_data()
+            self.assertTrue(hh["acknowledge_rejected"])
+            self.assertFalse(hh["evidence_degraded"])
+
+        notifications.clear()
+        fut_healthy_ack = (now + timedelta(hours=1)).isoformat()
+        fut_healthy_entry = types.SimpleNamespace(entry_id="healthy-fut", data={})
+        fut_hc = mod.SituarenessCoordinator(
+            hass,
+            c.validate({**cfg, "acknowledge_degraded_at": fut_healthy_ack}),
+            Store(),
+            healthy_store,
+            entry=fut_healthy_entry,
+        )
+        self.assertFalse(fut_hc.degraded)
+        self.assertTrue(fut_hc.acknowledge_rejected)
+        self.assertEqual(
+            fut_healthy_entry.data.get("acknowledged_degraded_at"), fut_healthy_ack
+        )
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness acknowledgement rejected",
+        )
+        with patch.object(mod, "fetch", return_value=[]):
+            hh_fut = await fut_hc._async_update_data()
+        self.assertTrue(hh_fut["acknowledge_rejected"])
+
+        # Subsequent degradation after clock passes fut_healthy_ack still cannot be cleared by it.
+        later_deg = {
+            "records": {},
+            "outbox": [],
+            "initialized": True,
+            "was_live": True,
+            "degraded": True,
+            "degraded_reason": "journal_lost",
+            "degraded_at": (now + timedelta(minutes=10)).isoformat(),
+            "degraded_until": (now + timedelta(days=8)).isoformat(),
+            "acknowledged_degraded_at": fut_healthy_ack,
+        }
+
+        class FutureAckClock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        FutureAckClock.current = now + timedelta(hours=2)
+
+        with patch.object(mod, "datetime", FutureAckClock):
+            deg_after = mod.SituarenessCoordinator(
+                hass,
+                c.validate({**cfg, "acknowledge_degraded_at": fut_healthy_ack}),
+                Store(),
+                later_deg,
+                entry=fut_healthy_entry,
+            )
+        self.assertTrue(deg_after.degraded)
+        self.assertTrue(deg_after.acknowledge_rejected)
+
+        # Removing acknowledge_degraded_at clears acknowledgement rejection notification.
+        clean_hc = mod.SituarenessCoordinator(hass, cfg, Store(), healthy_store)
+        self.assertFalse(clean_hc.acknowledge_rejected)
+        self.assertNotIn("situareness_degraded", notifications)

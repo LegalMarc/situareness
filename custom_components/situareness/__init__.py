@@ -3,7 +3,7 @@
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from itertools import islice
+from functools import partial
 import json
 import logging
 from pathlib import Path
@@ -21,6 +21,7 @@ from .delivery import MAX_AGE, deliver_one, live, pending_valid, targets
 from .domain import (
     CancellationEvidenceOverflow,
     MAX_ACCEPTANCE_AGE,
+    MAX_TIMESTAMP,
     action_history,
     conflicting_prior_cancel,
     lineage_index,
@@ -251,7 +252,14 @@ def _clear_corrupt_store_backups(storage_dir, prefix):
 
 class SituarenessCoordinator(DataUpdateCoordinator):
     def __init__(
-        self, hass, config, store, persisted, entry=None, has_corrupt_backup=False
+        self,
+        hass,
+        config,
+        store,
+        persisted,
+        entry=None,
+        has_corrupt_backup=False,
+        persisted_valid=None,
     ):
         super().__init__(
             hass,
@@ -263,7 +271,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.config = config
         self.store = store
         self._entry = entry
-        if not _valid_persisted_store(persisted):
+        if persisted_valid is None:
+            persisted_valid = _valid_persisted_store(persisted)
+        if not persisted_valid:
             detect_now = datetime.now(timezone.utc)
             persisted_deg_at = (
                 persisted.get("degraded_at") if isinstance(persisted, dict) else None
@@ -435,11 +445,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             return False
         ack_ts = timestamp(ack) if isinstance(ack, str) and len(ack) <= 100 else None
         if ack_ts is None:
-            self.acknowledge_rejected = bool(self.degraded)
+            self.acknowledge_rejected = True
             return False
         if not self.degraded:
             self._record_consumed_ack(ack)
-            self.acknowledge_rejected = False
+            self.acknowledge_rejected = ack_ts > current_now
             return False
         if self.degraded_reason == "malformed_store" or ack in (
             self.acknowledged_degraded_at,
@@ -537,7 +547,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                             "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld "
                             "while already-queued targets continue bounded delivery. "
                             + rej_note
-                            + "This clears automatically once outbox space frees up or the 15-minute degraded_until horizon expires; "
+                            + "This clears automatically on any poll where current plans fit within the 5,000-target limit; "
                             "one-shot acknowledge_degraded_at in situareness.json "
                             "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
                             "only once outbox overflow has cleared (otherwise the next poll re-latches with a new degraded_at). "
@@ -548,7 +558,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                             "Situareness monitoring is degraded in shadow mode (live output disabled): "
                             "the outbox reached the 5,000-target limit and overflowing alert plans are withheld. "
                             + rej_note
-                            + "This clears automatically once outbox space frees up or the 15-minute degraded_until horizon expires; "
+                            + "This clears automatically on any poll where current plans fit within the 5,000-target limit; "
                             "one-shot acknowledge_degraded_at in situareness.json "
                             "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
                             "only once outbox overflow has cleared (otherwise the next poll re-latches with a new degraded_at). "
@@ -609,6 +619,19 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
                 self._notified_degraded_state = state
                 self._checked_notification_clear = False
+        elif self.acknowledge_rejected:
+            state = ("acknowledge_rejected", live(self.config))
+            if self._notified_degraded_state != state:
+                persistent_notification.async_create(
+                    self.hass,
+                    "Configured acknowledge_degraded_at in situareness.json was invalid, "
+                    "missing a timezone offset, over-length, or in the future, so it was rejected "
+                    "(and consumed if valid ISO-8601). Situareness monitoring remains online.",
+                    title="Situareness acknowledgement rejected",
+                    notification_id="situareness_degraded",
+                )
+                self._notified_degraded_state = state
+                self._checked_notification_clear = False
         elif (
             self._notified_degraded_state is not None
             or not self._checked_notification_clear
@@ -633,11 +656,19 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             return await self._update_once()
 
     def _deliverable_count(self, records, candidate_events, health_now):
-        by_id = {event["id"]: event for event in candidate_events}
+        if not self.outbox:
+            return 0
+        active_outbox_ids = {
+            item["incident_id"]
+            for item in self.outbox
+            if records.get(item["incident_id"], {}).get("state") == "active"
+        }
+        if not active_outbox_ids:
+            return 0
         current_eligible = {
-            eid
-            for eid, event in by_id.items()
-            if records.get(eid, {}).get("state") == "active"
+            event["id"]
+            for event in candidate_events
+            if event["id"] in active_outbox_ids
             and qualify(event, self.config, health_now)["qualifies"]
         }
         return sum(
@@ -774,7 +805,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "degraded_reason": None,
             "degraded_at": None,
             "degraded_until": None,
-            "acknowledge_rejected": False,
+            "acknowledge_rejected": self.acknowledge_rejected,
             "shadow": not live(self.config),
             "events": [],
             "planned_count": 0,
@@ -860,16 +891,23 @@ class SituarenessCoordinator(DataUpdateCoordinator):
 
     def _latch_degraded(self, reason, now, until=None):
         default_window = MAX_AGE if reason == "outbox_overflow" else MAX_ACCEPTANCE_AGE
-        candidate_until = until or (now + default_window)
+        try:
+            fallback_until = min(now + default_window, MAX_TIMESTAMP)
+        except OverflowError:
+            fallback_until = MAX_TIMESTAMP
+        candidate_until = (
+            min(until, MAX_TIMESTAMP) if until is not None else fallback_until
+        )
         same_reason = self.degraded and self.degraded_reason == reason
         if self.degraded and (same_reason or reason != "outbox_overflow"):
             existing_until = timestamp(self.degraded_until)
         else:
             existing_until = None
-        new_until = (
+        new_until = min(
             max(existing_until, candidate_until)
             if existing_until is not None
-            else candidate_until
+            else candidate_until,
+            MAX_TIMESTAMP,
         )
         if not (same_reason and timestamp(self.degraded_at) is not None):
             self.degraded_at = now.isoformat()
@@ -997,16 +1035,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         """Deliver one bounded poll batch (max 100 targets, 30s deadline)."""
         attempts = failures = 0
         # Expired items and each completed 10-target delivery group are persisted; a crash between service call and save may duplicate that group.
-        batch = list(
-            islice(
-                (
-                    x
-                    for x in self.outbox
-                    if pending_valid(x, self.records, self.config, now)
-                ),
-                100,
-            )
-        )
+        deliverable_items = [
+            x for x in self.outbox if pending_valid(x, self.records, self.config, now)
+        ]
+        deliverable_items.sort(key=lambda x: x.get("attempts", 0) > 0)
+        batch = deliverable_items[:100]
         by_id = {event["id"]: event for event in candidate_events}
         deadline = now + timedelta(seconds=30)
         for offset in range(0, len(batch), 10):
@@ -1017,14 +1050,19 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 break
             group = []
             expired_keys = set()
+            qualified_by_id = {}
             for item in batch[offset : offset + 10]:
-                event = by_id.get(item["incident_id"])
-                if (
-                    event is not None
-                    and pending_valid(item, self.records, self.config, current)
-                    and qualify(event, self.config, current)["qualifies"]
+                incident_id = item["incident_id"]
+                event = by_id.get(incident_id)
+                if event is not None and pending_valid(
+                    item, self.records, self.config, current
                 ):
-                    group.append(item)
+                    is_qualified = qualified_by_id.get(incident_id)
+                    if is_qualified is None:
+                        is_qualified = qualify(event, self.config, current)["qualifies"]
+                        qualified_by_id[incident_id] = is_qualified
+                    if is_qualified:
+                        group.append(item)
                 elif not pending_valid(
                     item, self.records, self.config, current, allow_suspended=True
                 ):
@@ -1113,7 +1151,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
             "degraded_until": self.degraded_until,
-            "acknowledge_rejected": False,
+            "acknowledge_rejected": self.acknowledge_rejected,
             "quarantined_count": quarantine_count,
             "quarantine_ambiguous": quarantine_ambiguous,
             "shadow": not live(self.config),
@@ -1221,20 +1259,23 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             plans = []
             overflow_horizon = None
             try:
-                records, plans = reconcile(
-                    self.records,
-                    candidate_events,
-                    self.config,
-                    now,
-                    baseline=baseline,
-                    activate=live(self.config) and not self.was_live,
-                    partial=bool(getattr(events, "quarantined", 0)),
-                    quarantine_lineages=getattr(events, "quarantined_lineages", ()),
-                    quarantine_all=getattr(events, "quarantine_ambiguous", False),
-                    graph_events=source_events,
-                    quarantine_cancel_lineages=getattr(
-                        events, "quarantined_cancel_lineages", ()
-                    ),
+                records, plans = await self.hass.async_add_executor_job(
+                    partial(
+                        reconcile,
+                        self.records,
+                        candidate_events,
+                        self.config,
+                        now,
+                        baseline=baseline,
+                        activate=live(self.config) and not self.was_live,
+                        partial=bool(getattr(events, "quarantined", 0)),
+                        quarantine_lineages=getattr(events, "quarantined_lineages", ()),
+                        quarantine_all=getattr(events, "quarantine_ambiguous", False),
+                        graph_events=source_events,
+                        quarantine_cancel_lineages=getattr(
+                            events, "quarantined_cancel_lineages", ()
+                        ),
+                    )
                 )
             except CancellationEvidenceOverflow as err:
                 records = err.records if err.records is not None else self.records
@@ -1255,11 +1296,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
                 if self.degraded_at is None:
                     self.degraded_at = now.isoformat()
-                    self.degraded_until = (now + horizon).isoformat()
+                    try:
+                        computed_until = min(now + horizon, MAX_TIMESTAMP)
+                    except OverflowError:
+                        computed_until = MAX_TIMESTAMP
+                    self.degraded_until = computed_until.isoformat()
                 elif self.degraded_until is None:
-                    self.degraded_until = (
-                        (timestamp(self.degraded_at) or now) + horizon
-                    ).isoformat()
+                    base_at = timestamp(self.degraded_at) or now
+                    try:
+                        computed_until = min(base_at + horizon, MAX_TIMESTAMP)
+                    except OverflowError:
+                        computed_until = MAX_TIMESTAMP
+                    self.degraded_until = computed_until.isoformat()
                 until = timestamp(self.degraded_until)
                 if until is not None and now > until:
                     self.degraded = False
@@ -1387,11 +1435,16 @@ async def async_setup_entry(hass, entry):
             persisted = ["unreadable"]
         else:
             raise ConfigEntryNotReady(f"Could not load persisted store: {err}") from err
+    persisted_valid = None
     if persisted is None and await hass.async_add_executor_job(
         _has_corrupt_store_backup, hass.config.path(".storage"), prefix
     ):
         has_corrupt_backup = True
         persisted = ["corrupt_json"]
+    elif isinstance(persisted, dict) and persisted:
+        persisted_valid = await hass.async_add_executor_job(
+            _valid_persisted_store, persisted
+        )
     coordinator = SituarenessCoordinator(
         hass,
         config,
@@ -1399,6 +1452,7 @@ async def async_setup_entry(hass, entry):
         persisted,
         entry=entry,
         has_corrupt_backup=has_corrupt_backup,
+        persisted_valid=persisted_valid,
     )
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator

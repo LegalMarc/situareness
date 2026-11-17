@@ -41,10 +41,10 @@ Start with the [project context](CONTEXT.md) and [continuation guide](plans/RESU
 - `docs/reports/browser-focused-63da80f.md` — Fresh OpenAI review of the immutable browser/package slice and the cached-freshness finding.
 
 ## docs/spec/
-- `docs/spec/o3-mvp.md` — Browser and Home Assistant implementation contract. anchors: architecture-and-privacy, room, home-assistant, research-and-verification
+- `docs/spec/o3-mvp.md` — Browser and Home Assistant implementation contract. anchors: architecture-and-privacy, room, home-assistant, qualification-and-per-feature-quarantine, cap-cancellation-and-continuing-segments, bounded-storage-and-headroom, degraded-states-and-outbox_overflow, recovery-notifications-and-lifecycle, research-and-verification
 
 ## home-assistant/
-- `home-assistant/README.md` — Standalone Home Assistant bundle and commissioning instructions.
+- `home-assistant/README.md` — Standalone Home Assistant bundle and commissioning instructions. anchors: health-storage-and-degraded-recovery
 
 ## skills/situareness-sources/
 - `skills/situareness-sources/SKILL.md` — Official-source research and supported configuration workflow. covers: skills/situareness-sources/scripts/**, tests/skill/**

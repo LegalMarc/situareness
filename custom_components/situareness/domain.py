@@ -10,6 +10,7 @@ import math
 from urllib.parse import urlparse
 
 MAX_ACCEPTANCE_AGE = timedelta(days=7)
+MAX_TIMESTAMP = datetime(9998, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
 
 
 def timestamp(value):
@@ -413,29 +414,35 @@ def cancellation_horizon(group_ids, records):
         record = records.get(eid)
         if not isinstance(record, dict):
             continue
+        obs = timestamp(record.get("updated"))
+        if obs is not None:
+            try:
+                upper = min(obs + timedelta(minutes=5), MAX_TIMESTAMP)
+            except OverflowError:
+                upper = MAX_TIMESTAMP
+        else:
+            upper = MAX_TIMESTAMP
         record_timestamps = []
         for key in ("ends", "expires", "sent"):
             parsed = timestamp(record.get(key))
             if parsed is not None:
-                record_timestamps.append(parsed)
+                record_timestamps.append(min(parsed, upper))
         refs = record.get("cap_references")
         if isinstance(refs, list):
             for ref in refs:
                 if isinstance(ref, list) and len(ref) == 3:
                     parsed = timestamp(ref[2])
                     if parsed is not None:
-                        record_timestamps.append(parsed)
-        if not record_timestamps:
-            parsed = timestamp(record.get("updated"))
-            if parsed is not None:
-                record_timestamps.append(parsed)
+                        record_timestamps.append(min(parsed, upper))
+        if not record_timestamps and obs is not None:
+            record_timestamps.append(min(obs, MAX_TIMESTAMP))
         timestamps.extend(record_timestamps)
     if not timestamps:
         return None
     try:
-        return max(timestamps) + MAX_ACCEPTANCE_AGE
+        return min(max(timestamps) + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP)
     except OverflowError:
-        return datetime.max.replace(tzinfo=timezone.utc)
+        return MAX_TIMESTAMP
 
 
 def conflicting_prior_cancel(event, old):
@@ -1057,10 +1064,12 @@ def _bound_records(
             is not None
         ]
         try:
-            default_horizon = now + MAX_ACCEPTANCE_AGE
+            default_horizon = min(now + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP)
         except OverflowError:
-            default_horizon = datetime.max.replace(tzinfo=timezone.utc)
-        dropped_horizon = max([default_horizon, *dropped_component_horizons])
+            default_horizon = MAX_TIMESTAMP
+        dropped_horizon = min(
+            max([default_horizon, *dropped_component_horizons]), MAX_TIMESTAMP
+        )
         for eid, rec in bounded.items():
             if rec.get("updated") == now.isoformat():
                 rec_actions = rec.get("actions")
