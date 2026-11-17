@@ -777,14 +777,147 @@ class Policy(unittest.TestCase):
         self.assertEqual(defaults["phones"], [])
         self.assertFalse(defaults["live_enabled"])
         self.assertFalse(defaults["commissioning_passed"])
+        self.assertIsNone(defaults["acknowledge_degraded_at"])
+        validated = c.validate({"acknowledge_degraded_at": "2026-11-17T10:00:00-05:00"})
+        self.assertEqual(
+            validated["acknowledge_degraded_at"], "2026-11-17T15:00:00+00:00"
+        )
         for raw in (
             {"phones": ["notify.bad"]},
             {"live_enabled": "true"},
             {"locations": {"x": {"point": [999, 0]}}},
             {"states": ["NY&bad=1"]},
+            {"acknowledge_degraded_at": "2026-11-17T10:00:00"},
+            {"acknowledge_degraded_at": 123},
         ):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 c.validate(raw)
+
+    def test_max_acceptance_age_persisted_times_and_cancellation_horizon(self):
+        self.assertEqual(d.MAX_ACCEPTANCE_AGE, timedelta(days=7))
+        at_limit = d.normalize(feature())
+        at_limit["sent"] = (NOW - timedelta(days=7)).isoformat()
+        cohere(at_limit)
+        self.assertTrue(d.qualify(at_limit, config(), NOW)["qualifies"])
+        too_old = d.normalize(feature())
+        too_old["sent"] = (NOW - timedelta(days=7, seconds=1)).isoformat()
+        cohere(too_old)
+        self.assertFalse(d.qualify(too_old, config(), NOW)["qualifies"])
+
+        records, _ = d.reconcile({}, [at_limit], config(), NOW)
+        rec = records[at_limit["id"]]
+        self.assertEqual(rec["sent"], at_limit["sent"])
+        self.assertEqual(rec["expires"], at_limit["expires"])
+        self.assertEqual(rec["ends"], at_limit["ends"])
+        suspended, _ = d.reconcile(
+            records, [], config(), NOW + timedelta(minutes=1), partial=True
+        )
+        self.assertEqual(suspended[at_limit["id"]]["sent"], at_limit["sent"])
+        self.assertEqual(suspended[at_limit["id"]]["expires"], at_limit["expires"])
+        self.assertEqual(suspended[at_limit["id"]]["ends"], at_limit["ends"])
+
+        self.assertIsNone(d.cancellation_horizon(["missing"], {}))
+        horizon = d.cancellation_horizon(
+            ["a", "b"],
+            {
+                "a": {
+                    "sent": NOW.isoformat(),
+                    "updated": (NOW + timedelta(days=5)).isoformat(),
+                },
+                "b": {
+                    "cap_references": [
+                        ["nws", "id", (NOW + timedelta(hours=3)).isoformat()]
+                    ]
+                },
+            },
+        )
+        self.assertEqual(horizon, NOW + timedelta(hours=3) + d.MAX_ACCEPTANCE_AGE)
+        # Only fall back to `updated` when a record has no source/reference timestamps.
+        self.assertEqual(
+            d.cancellation_horizon(["u"], {"u": {"updated": NOW.isoformat()}}),
+            NOW + d.MAX_ACCEPTANCE_AGE,
+        )
+
+    def test_expired_cancellation_component_ages_out_after_horizon(self):
+        old_time = NOW - timedelta(days=8)
+        prior = {}
+        for i in range(1001):
+            eid = f"https://api.weather.gov/alerts/old-cancel-{i}"
+            prior[eid] = {
+                "state": "cancelled",
+                "cancel_message": True,
+                "lineage": [eid],
+                "sent": old_time.isoformat(),
+                "expires": old_time.isoformat(),
+                "ends": old_time.isoformat(),
+                "updated": old_time.isoformat(),
+                "cap_identity": [
+                    "nws@example.test",
+                    f"old-cancel-{i}",
+                    old_time.isoformat(),
+                ],
+                "cap_references": [
+                    [
+                        "nws@example.test",
+                        f"old-target-{i}",
+                        (old_time - timedelta(minutes=1)).isoformat(),
+                    ]
+                ],
+            }
+        fresh = cap_event("fresh-alert", -1, message_type="Alert")
+        records, plans = d.reconcile(prior, [fresh], config(), NOW)
+        self.assertEqual(len(records), 1000)
+        self.assertEqual(records[fresh["id"]]["state"], "active")
+        self.assertEqual(len(plans), 1)
+        self.assertFalse(any(rec.get("cancel_message") for rec in records.values()))
+
+    def test_historic_uncertainty_and_per_event_quarantine_are_scoped(self):
+        root = cap_event("scoped-root", -10, message_type="Alert")
+        child = cap_event("scoped-child", -9, [root])
+        unrelated = cap_event("scoped-unrelated", -8, message_type="Alert")
+        bad_id = cap_event("scoped-bad-id", -7, message_type="Alert")
+        bad_id["cap_identity"][1] = "forged"
+        cancel = cap_event("scoped-cancel", -6, [root], "Cancel")
+
+        records, _ = d.reconcile({}, [root, unrelated], config(), NOW)
+        records, _ = d.reconcile(records, [child, unrelated], config(), NOW)
+        # Per-event identity_uncertain does NOT make unrelated absent active alerts unconfirmed.
+        records, _ = d.reconcile(records, [bad_id], config(), NOW)
+        self.assertEqual(records[bad_id["id"]]["state"], "quarantined")
+        self.assertEqual(records[unrelated["id"]]["state"], "ended_or_absent")
+        self.assertEqual(records[child["id"]]["state"], "ended_or_absent")
+
+        # Historic cancellation uncertainty quarantines child while cancel is current,
+        # then resolves child to ended_or_absent once both leave the feed.
+        records2, _ = d.reconcile({}, [root, unrelated], config(), NOW)
+        records2, _ = d.reconcile(records2, [child, unrelated], config(), NOW)
+        records2, _ = d.reconcile(records2, [cancel, unrelated], config(), NOW)
+        self.assertEqual(records2[child["id"]]["state"], "quarantined")
+        self.assertEqual(records2[unrelated["id"]]["state"], "active")
+        resolved, _ = d.reconcile(
+            records2, [unrelated], config(), NOW + timedelta(minutes=1)
+        )
+        self.assertEqual(resolved[child["id"]]["state"], "ended_or_absent")
+        self.assertEqual(resolved[unrelated["id"]]["state"], "active")
+
+    def test_cancel_and_blocked_messages_do_not_supersede_references(self):
+        target = cap_event("n1-target", -5, message_type="Alert")
+        other = cap_event("n1-other", -5, message_type="Alert")
+        records, _ = d.reconcile({}, [target, other], config(), NOW)
+        # Future-dated invalid cancel fails cap_event_valid (so target is uncertain, not cancelled)
+        # and must not mark `other` as superseded even if referenced.
+        bad_cancel = cap_event("n1-cancel", 10, [target, other], "Cancel")
+        result, _ = d.reconcile(records, [bad_cancel], config(), NOW)
+        self.assertNotEqual(result[other["id"]]["state"], "superseded")
+
+    def test_normalize_oversized_and_non_string_properties(self):
+        oversized = feature()
+        oversized["properties"]["instruction"] = "x" * 10001
+        with self.assertRaises(d.OversizedFeature):
+            d.normalize(oversized)
+        bad_type = feature()
+        bad_type["properties"]["headline"] = 123
+        self.assertIsNone(d.normalize(bad_type))
 
 
 class Services:
@@ -1088,7 +1221,9 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result.uncertain_cancellation)
 
-    async def test_failed_pagination_after_cancel_reports_lost_evidence(self):
+    async def test_failed_pagination_and_cancelled_error_after_cancel_propagate(self):
+        import asyncio
+
         cancel = feature()
         cancel["properties"]["messageType"] = "Cancel"
         body = {
@@ -1098,8 +1233,73 @@ class Collector(unittest.IsolatedAsyncioTestCase):
                 "next": "https://api.weather.gov/alerts/active?cursor=repeat"
             },
         }
-        with self.assertRaises(collector.CancellationEvidenceLost):
+        with self.assertRaises(ValueError):
             await collector.fetch(Session(Response(json.dumps(body).encode())), ["NY"])
+
+        class CancelSession:
+            def get(self, url, **kwargs):
+                raise asyncio.CancelledError()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await collector.fetch(CancelSession(), ["NY"])
+
+    async def test_malformed_single_feature_is_quarantined_without_failing_collection(
+        self,
+    ):
+        bad_prop = feature()
+        bad_prop["id"] += "-bad-prop"
+        bad_prop["properties"]["headline"] = 123
+        bad_prop["properties"]["references"] = [{"@id": feature()["id"]}]
+
+        oversized_prop = feature()
+        oversized_prop["id"] += "-oversize-prop"
+        oversized_prop["properties"]["instruction"] = "x" * 10001
+        oversized_prop["properties"]["references"] = [{"@id": feature()["id"]}]
+
+        bad_id = feature()
+        bad_id["id"] = "https://evil.test/alerts/123"
+
+        body = {
+            "type": "FeatureCollection",
+            "features": [bad_prop, oversized_prop, feature()],
+        }
+        events = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertEqual((len(events), events.quarantined), (1, 2))
+        self.assertFalse(events.quarantine_ambiguous)
+        self.assertEqual(len(events.quarantined_lineages), 2)
+
+        body_ambiguous = {"type": "FeatureCollection", "features": [bad_id, feature()]}
+        events_ambiguous = await collector.fetch(
+            Session(Response(json.dumps(body_ambiguous).encode())), ["NY"]
+        )
+        self.assertEqual((len(events_ambiguous), events_ambiguous.quarantined), (1, 1))
+        self.assertTrue(events_ambiguous.quarantine_ambiguous)
+
+        oversized_cancel = feature()
+        oversized_cancel["id"] += "-oversize-cancel"
+        oversized_cancel["properties"].update(
+            messageType="Cancel",
+            instruction="x" * 10001,
+            references=[{"@id": feature()["id"]}],
+        )
+        events_cancel = await collector.fetch(
+            Session(
+                Response(
+                    json.dumps(
+                        {
+                            "type": "FeatureCollection",
+                            "features": [oversized_cancel, feature()],
+                        }
+                    ).encode()
+                )
+            ),
+            ["NY"],
+        )
+        self.assertTrue(events_cancel.uncertain_cancellation)
+        self.assertFalse(events_cancel.quarantine_ambiguous)
+        self.assertEqual((len(events_cancel), events_cancel.quarantined), (1, 1))
 
     async def test_malformed_actual_cancel_is_not_lost_as_a_simple_poll_error(self):
         bad = feature()

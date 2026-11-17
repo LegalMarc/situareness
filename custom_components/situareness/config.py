@@ -1,7 +1,8 @@
 """Validate private administrator-owned configuration."""
 
-import re
 import math
+import re
+from .domain import timestamp
 
 STATES = {"NY", "DC"}
 IDENT = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -100,6 +101,13 @@ def validate(raw):
     for key in ("live_enabled", "commissioning_passed"):
         if key in raw and not isinstance(raw[key], bool):
             raise ValueError("live gates must be boolean")
+    ack = raw.get("acknowledge_degraded_at")
+    if ack is not None:
+        if not isinstance(ack, str) or timestamp(ack) is None:
+            raise ValueError(
+                "acknowledge_degraded_at must be a timezone-aware ISO-8601 timestamp"
+            )
+        ack = timestamp(ack).isoformat()
     return {
         "states": list(dict.fromkeys(states)),
         "locations": locations,
@@ -108,4 +116,5 @@ def validate(raw):
         "tts_entity": tts,
         "live_enabled": raw.get("live_enabled", False),
         "commissioning_passed": raw.get("commissioning_passed", False),
+        "acknowledge_degraded_at": ack,
     }

@@ -20,8 +20,17 @@ try {
   if (!response.ok)
     throw new Error("Bundled source defaults could not be loaded.");
   const bundledConfig = await response.json();
-  if (!Array.isArray(bundledConfig.sources))
+  if (
+    !bundledConfig ||
+    typeof bundledConfig !== "object" ||
+    !Array.isArray(bundledConfig.sources)
+  )
     throw new Error("Bundled source defaults are invalid.");
+  try {
+    parsePublicConfig(JSON.stringify(bundledConfig));
+  } catch {
+    throw new Error("Bundled source defaults are invalid.");
+  }
   sourceDefaults = Object.fromEntries(
     bundledConfig.sources.map((source) => [source.id, source]),
   );
@@ -351,7 +360,7 @@ function renderEvent(event, locations) {
       ],
       cached: [
         "Cached · source unavailable",
-        "Previously present in weather results; the source is disabled, failed, or overdue.",
+        "Previously collected from this source; the source is disabled, failed, or overdue.",
       ],
       expired: [
         "Source expiry passed",
@@ -501,6 +510,12 @@ function renderFeed(state) {
     : "Waiting for first collection";
 }
 
+function isBundledConfigError(error) {
+  return /^Bundled (?:configuration|source defaults)/.test(
+    error?.message || "",
+  );
+}
+
 function render(state) {
   currentState = state && typeof state === "object" ? state : null;
   updateControls();
@@ -511,7 +526,11 @@ function render(state) {
   renderFeed(currentState);
   if (connectionError) {
     els.collectorDot.className = "status-dot error";
-    els.collectorLabel.textContent = "Collector disconnected";
+    els.collectorLabel.textContent = isBundledConfigError({
+      message: connectionError,
+    })
+      ? "Room could not start"
+      : "Collector disconnected";
   }
 }
 
@@ -523,6 +542,20 @@ function renderConnected(state) {
 
 function showDisconnected(error) {
   connectionError = error.message;
+  if (isBundledConfigError(error)) {
+    els.collectorDot.className = "status-dot error";
+    els.collectorLabel.textContent = "Room could not start";
+    if (!currentState) {
+      els.state.hidden = false;
+      els.state.replaceChildren(
+        element("strong", "", "Unable to start room"),
+        element("span", "", error.message),
+      );
+    }
+    announce(error.message, "error");
+    updateControls();
+    return;
+  }
   if (currentState) render(currentState);
   else {
     els.state.hidden = false;
@@ -564,7 +597,7 @@ async function runAction(message, success) {
     if (success) announce(success);
   } catch (error) {
     if (
-      !/^(Configuration|Invalid|Private|Source URL|Paused|Unknown request)/.test(
+      !/^(Configuration|Invalid|Private|Source URL|Paused|Unknown request|Bundled configuration)/.test(
         error.message,
       )
     ) {

@@ -11,17 +11,18 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from .collector import CancellationEvidenceLost, fetch
+from .collector import fetch
 from .config import validate
 from .const import DOMAIN
 from .delivery import deliver_one, live, pending_valid, targets
 from .domain import (
     CancellationEvidenceOverflow,
-    cap_event_valid,
+    MAX_ACCEPTANCE_AGE,
     action_history,
     lineage_index,
     qualify,
     reconcile,
+    timestamp,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +37,116 @@ def _read_config(path):
         return validate({})
 
 
+def _valid_persisted_store(persisted):
+    if persisted is None:
+        return True
+    if not isinstance(persisted, dict):
+        return False
+    if "degraded" in persisted and not isinstance(persisted["degraded"], bool):
+        return False
+    for key in ("degraded_at", "degraded_until"):
+        val = persisted.get(key)
+        if val is not None and (not isinstance(val, str) or timestamp(val) is None):
+            return False
+    reason = persisted.get("degraded_reason")
+    if reason is not None and not isinstance(reason, str):
+        return False
+    if persisted.get("initialized") is True and "records" not in persisted:
+        return False
+    if "records" in persisted:
+        records = persisted["records"]
+        if not isinstance(records, dict):
+            return False
+        for eid, record in records.items():
+            if not isinstance(eid, str) or not isinstance(record, dict):
+                return False
+            if "state" in record and not isinstance(record["state"], str):
+                return False
+            for list_key in ("lineage", "reasons", "affected"):
+                if list_key in record and (
+                    not isinstance(record[list_key], list)
+                    or not all(isinstance(v, str) for v in record[list_key])
+                ):
+                    return False
+            if "actions" in record:
+                actions = record["actions"]
+                if not isinstance(actions, dict) or not all(
+                    isinstance(k, str)
+                    and isinstance(v, list)
+                    and all(isinstance(x, str) for x in v)
+                    for k, v in actions.items()
+                ):
+                    return False
+            if "cap_identity" in record and record["cap_identity"] is not None:
+                ident = record["cap_identity"]
+                if (
+                    not isinstance(ident, list)
+                    or len(ident) != 3
+                    or not all(isinstance(x, str) for x in ident)
+                ):
+                    return False
+            if "cap_references" in record and record["cap_references"] is not None:
+                refs = record["cap_references"]
+                if not isinstance(refs, list) or not all(
+                    isinstance(ref, list)
+                    and len(ref) == 3
+                    and all(isinstance(x, str) for x in ref)
+                    for ref in refs
+                ):
+                    return False
+    if "outbox" in persisted:
+        outbox = persisted["outbox"]
+        if not isinstance(outbox, list):
+            return False
+        for item in outbox:
+            if not isinstance(item, dict):
+                return False
+            for str_key in (
+                "key",
+                "incident_id",
+                "fingerprint",
+                "kind",
+                "target",
+                "created",
+            ):
+                if not isinstance(item.get(str_key), str):
+                    return False
+            attempts = item.get("attempts")
+            if not isinstance(attempts, int) or isinstance(attempts, bool):
+                return False
+    if "outcomes" in persisted:
+        outcomes = persisted["outcomes"]
+        if not isinstance(outcomes, list) or not all(
+            isinstance(item, dict) for item in outcomes
+        ):
+            return False
+    return True
+
+
+def _outbox_signature(groups, item):
+    return (
+        groups.get(item["incident_id"]),
+        item["fingerprint"],
+        item["kind"],
+        item["target"],
+        item["location"],
+    )
+
+
+def _is_conflicting_cancel(event, old):
+    if old is None:
+        return False
+    matches = (
+        event.get("status") == "Actual"
+        and event.get("message_type") == "Cancel"
+        and event.get("cap_identity") == old.get("cap_identity")
+        and event.get("reference_identities") == old.get("cap_references")
+    )
+    if old.get("cancel_message") or old.get("cancellation_expired"):
+        return not matches
+    return event.get("status") == "Actual" and event.get("message_type") == "Cancel"
+
+
 class SituarenessCoordinator(DataUpdateCoordinator):
     def __init__(self, hass, config, store, persisted):
         super().__init__(
@@ -43,39 +154,54 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
         self.config = config
         self.store = store
-        malformed_store = persisted is not None and not isinstance(persisted, dict)
-        persisted = persisted if isinstance(persisted, dict) else {}
-        self.records = (
-            persisted.get("records", {})
-            if isinstance(persisted.get("records", {}), dict)
-            else {}
-        )
-        self.outbox = (
-            persisted.get("outbox", [])
-            if isinstance(persisted.get("outbox", []), list)
-            else []
-        )
-        self.outcomes = (
-            persisted.get("outcomes", [])
-            if isinstance(persisted.get("outcomes", []), list)
-            else []
-        )
-        self.initialized = persisted.get("initialized") is True or (
-            "initialized" not in persisted and bool(self.records or self.outbox)
-        )
-        # An absent legacy gate marker is not a new live-mode transition.
-        self.was_live = persisted.get("was_live") is True or (
-            "was_live" not in persisted and self.initialized
-        )
-        self.degraded = (
-            malformed_store
-            or persisted.get("degraded") is True
-            or (
-                persisted.get("initialized") is True
-                and not isinstance(persisted.get("records"), dict)
+        self._store_recovered = False
+        if not _valid_persisted_store(persisted):
+            self.records = {}
+            self.outbox = []
+            self.outcomes = []
+            self.initialized = False
+            self.was_live = False
+            self.degraded = True
+            self.degraded_reason = "malformed_store"
+            self.degraded_at = None
+            self.degraded_until = None
+        else:
+            persisted = persisted if isinstance(persisted, dict) else {}
+            self.records = persisted.get("records", {})
+            self.outbox = persisted.get("outbox", [])
+            self.outcomes = persisted.get("outcomes", [])
+            self.initialized = persisted.get("initialized") is True or (
+                "initialized" not in persisted and bool(self.records or self.outbox)
             )
-            or ("outbox" in persisted and not isinstance(persisted["outbox"], list))
-        )
+            # An absent legacy gate marker is not a new live-mode transition.
+            self.was_live = persisted.get("was_live") is True or (
+                "was_live" not in persisted and self.initialized
+            )
+            self.degraded = persisted.get("degraded") is True
+            self.degraded_reason = (
+                persisted.get("degraded_reason") or "cancellation_evidence_overflow"
+                if self.degraded
+                else None
+            )
+            self.degraded_at = persisted.get("degraded_at") if self.degraded else None
+            self.degraded_until = (
+                persisted.get("degraded_until") if self.degraded else None
+            )
+        ack = config.get("acknowledge_degraded_at")
+        if self.degraded and ack is not None:
+            degraded_at_ts = timestamp(self.degraded_at)
+            ack_ts = timestamp(ack)
+            if (
+                self.degraded_reason == "malformed_store"
+                or degraded_at_ts is None
+                or (ack_ts is not None and ack_ts >= degraded_at_ts)
+            ):
+                if self.degraded_reason == "malformed_store":
+                    self._store_recovered = True
+                self.degraded = False
+                self.degraded_reason = None
+                self.degraded_at = None
+                self.degraded_until = None
         self.session = async_get_clientsession(hass)
         self._refresh_lock = asyncio.Lock()
         self._stopping = False
@@ -89,6 +215,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 "initialized": True,
                 "was_live": live(self.config),
                 "degraded": self.degraded,
+                "degraded_reason": self.degraded_reason,
+                "degraded_at": self.degraded_at,
+                "degraded_until": self.degraded_until,
             }
         )
         self.records, self.outbox, self.outcomes, self.initialized = (
@@ -98,6 +227,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             True,
         )
         self.was_live = live(self.config)
+        self._store_recovered = False
 
     async def async_stop(self):
         self._stopping = True
@@ -110,22 +240,64 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 raise UpdateFailed("integration is stopping")
             return await self._update_once()
 
-    def _degraded_health(self):
-        """Expose a redacted durable evidence-loss state without delivering."""
+    def _degraded_health(self, events=None, records=None, now=None):
+        """Expose a redacted durable degraded state without delivering."""
         previous = getattr(self, "data", None) or {}
+        quarantined_count = 0
+        event_summaries = []
+        if events is not None:
+            record_map = records or {}
+            quarantined_count = getattr(events, "quarantined", 0) + sum(
+                record_map.get(e["id"], {}).get("state") == "quarantined"
+                for e in events
+            )
+            event_summaries = [
+                {
+                    "id": e["id"],
+                    "event": (e["event"] or "")[:100],
+                    "headline": (e["headline"] or "")[:160],
+                    "sent": e["sent"],
+                    "expires": e["expires"],
+                    "state": record_map.get(e["id"], {}).get("state", "unknown"),
+                    "reasons": record_map.get(e["id"], {}).get("reasons", []),
+                }
+                for e in events[:25]
+            ]
+        quarantine_ambiguous = self.degraded_reason == "malformed_cancellation" or bool(
+            getattr(events, "quarantine_ambiguous", False)
+        )
+        cancellation_uncertain = self.degraded_reason in (
+            "cancellation_evidence_overflow",
+            "malformed_cancellation",
+            "conflicting_cancellation",
+        )
         return {
-            "last_success": previous.get("last_success"),
-            "event_count": 0,
-            "source_feature_count": 0,
+            "last_success": (
+                now.isoformat()
+                if events is not None and now is not None
+                else previous.get("last_success")
+            ),
+            "event_count": len(events) if events is not None else 0,
+            "source_feature_count": (
+                getattr(events, "source_count", len(events))
+                if events is not None
+                else 0
+            ),
             "active_count": None,
-            "partial": True,
-            "quarantined_count": 0,
-            "quarantine_ambiguous": True,
-            "cancellation_uncertain": True,
+            "partial": (
+                bool(quarantined_count)
+                or quarantine_ambiguous
+                or cancellation_uncertain
+            ),
+            "quarantined_count": quarantined_count,
+            "quarantine_ambiguous": quarantine_ambiguous,
+            "cancellation_uncertain": cancellation_uncertain,
             "evidence_degraded": True,
             "output_blocked": True,
+            "degraded_reason": self.degraded_reason,
+            "degraded_at": self.degraded_at,
             "shadow": not live(self.config),
-            "events": [],
+            "events": event_summaries,
             "planned_count": 0,
             "pending_count": len(self.outbox),
             "deliverable_count": 0,
@@ -134,161 +306,137 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_failures": 0,
         }
 
+    def _migrate_and_prune_outbox(self, records, events, now, groups):
+        if not live(self.config):
+            return []
+        event_index = {}
+        for event in events:
+            eid = event["id"]
+            record = records.get(eid, {})
+            if record.get("state") in ("active", "ineligible"):
+                for fp in action_history(record):
+                    event_index.setdefault((groups[eid], fp), []).append(eid)
+        for ids in event_index.values():
+            ids.sort(key=lambda eid: (records[eid]["state"] != "active", eid))
+        candidates = []
+        for item in self.outbox:
+            if not isinstance(item, dict):
+                continue
+            incident = item.get("incident_id")
+            if records.get(incident, {}).get("state") == "cancelled":
+                continue
+            successors = event_index.get(
+                (groups.get(incident), item.get("fingerprint")), []
+            )
+            if records.get(incident, {}).get("state") == "quarantined":
+                successors = []
+            if successors:
+                successor = successors[0]
+                candidate = {
+                    **item,
+                    "incident_id": successor,
+                    "source_url": successor,
+                }
+                if pending_valid(
+                    candidate, records, self.config, now, allow_suspended=True
+                ):
+                    item = candidate
+            candidates.append(item)
+        outbox = [
+            x
+            for x in candidates
+            if pending_valid(x, records, self.config, now, allow_suspended=True)
+        ]
+        unique = {}
+        for item in outbox:
+            key = _outbox_signature(groups, item)
+            if key in unique:
+                prior_item = unique[key]
+                # Keep the strictest retry bounds when lineages merge.
+                unique[key] = {
+                    **prior_item,
+                    "created": min(prior_item["created"], item["created"]),
+                    "attempts": max(prior_item["attempts"], item["attempts"]),
+                }
+            else:
+                unique[key] = item
+        return list(unique.values())
+
     async def _update_once(self):
         try:
-            if self.degraded:
+            if self.degraded and self.degraded_reason == "malformed_store":
                 return self._degraded_health()
             events = await fetch(self.session, self.config["states"])
             source_events = getattr(events, "all_events", events)
             conflicting_cancel = any(
-                (old := self.records.get(event["id"], {})).get("cancel_message")
-                and (
-                    event.get("status") != "Actual"
-                    or event.get("message_type") != "Cancel"
-                    or event.get("cap_identity") != old.get("cap_identity")
-                    or event.get("reference_identities") != old.get("cap_references")
-                )
-                or (
-                    event.get("status") == "Actual"
-                    and event.get("message_type") == "Cancel"
-                    and (old := self.records.get(event["id"])) is not None
-                    and not old.get("cancel_message")
-                )
+                _is_conflicting_cancel(event, self.records.get(event["id"]))
                 for event in source_events
             )
-            if (
-                conflicting_cancel
-                or getattr(events, "uncertain_cancellation", False)
-                or any(
-                    event.get("status") == "Actual"
-                    and event.get("message_type") == "Cancel"
-                    and not cap_event_valid(event)
-                    for event in source_events
-                )
-            ):
-                self.degraded = True
-                await self._save(self.records, self.outbox, self.outcomes)
-                return self._degraded_health()
+            malformed_cancel = bool(getattr(events, "uncertain_cancellation", False))
             now = datetime.now(timezone.utc)
             # Initial shadow setup establishes a baseline; every subsequent restart reconciles normally.
             baseline = not self.initialized and not live(self.config)
-            records, plans = reconcile(
-                self.records,
-                events,
-                self.config,
-                now,
-                baseline=baseline,
-                activate=live(self.config) and not self.was_live,
-                partial=bool(getattr(events, "quarantined", 0)),
-                quarantine_lineages=getattr(events, "quarantined_lineages", ()),
-                quarantine_all=getattr(events, "quarantine_ambiguous", False),
-                graph_events=getattr(events, "all_events", events),
+            degraded_trigger = (
+                "conflicting_cancellation"
+                if conflicting_cancel
+                else "malformed_cancellation"
+                if malformed_cancel
+                else None
             )
+            plans = []
+            try:
+                records, plans = reconcile(
+                    self.records,
+                    events,
+                    self.config,
+                    now,
+                    baseline=baseline,
+                    activate=live(self.config) and not self.was_live,
+                    partial=bool(getattr(events, "quarantined", 0)),
+                    quarantine_lineages=getattr(events, "quarantined_lineages", ()),
+                    quarantine_all=getattr(events, "quarantine_ambiguous", False),
+                    graph_events=getattr(events, "all_events", events),
+                )
+            except CancellationEvidenceOverflow as err:
+                records = err.records if err.records is not None else self.records
+                degraded_trigger = "cancellation_evidence_overflow"
+            if degraded_trigger is not None:
+                self.degraded = True
+                self.degraded_reason = degraded_trigger
+                self.degraded_at = self.degraded_at or now.isoformat()
+                self.degraded_until = (now + MAX_ACCEPTANCE_AGE).isoformat()
+            elif self.degraded:
+                if self.degraded_until is None:
+                    self.degraded_at = self.degraded_at or now.isoformat()
+                    self.degraded_until = (
+                        (timestamp(self.degraded_at) or now) + MAX_ACCEPTANCE_AGE
+                    ).isoformat()
+                until = timestamp(self.degraded_until)
+                if until is not None and now > until:
+                    self.degraded = False
+                    self.degraded_reason = None
+                    self.degraded_at = None
+                    self.degraded_until = None
             # Carry an undelivered item through equivalent NWS update identifiers.
             # Reconciled records contain only trusted Alert/Update edges;
             # raw source references could reconnect a quarantined forgery.
             groups, _ = lineage_index(records, [])
-            event_index = {}
-            for event in events:
-                eid = event["id"]
-                record = records[eid]
-                if record["state"] in ("active", "ineligible"):
-                    for fp in action_history(record):
-                        event_index.setdefault((groups[eid], fp), []).append(eid)
-            for ids in event_index.values():
-                ids.sort(key=lambda eid: (records[eid]["state"] != "active", eid))
-            cancellation_groups = {
-                groups.get(eid)
-                for eid, record in records.items()
-                if record.get("cancel_message")
-            }
-            current_events = {event["id"]: event for event in events}
-            candidates = []
-            for item in self.outbox:
-                if not isinstance(item, dict):
-                    continue
-                incident = item.get("incident_id")
-                if records.get(incident, {}).get("state") == "cancelled":
-                    continue
-                successors = event_index.get(
-                    (groups.get(incident), item.get("fingerprint")), []
-                )
-                if records.get(incident, {}).get("state") == "quarantined":
-                    successors = []
-                elif groups.get(incident) in cancellation_groups:
-                    source_identity = records.get(incident, {}).get("cap_identity")
-                    successors = [
-                        eid
-                        for eid in successors
-                        if eid == incident
-                        or (
-                            source_identity
-                            and source_identity
-                            in current_events[eid].get("reference_identities", [])
-                            and current_events[eid].get("cap_references_valid")
-                        )
-                    ]
-                    if (
-                        not successors
-                        and records.get(incident, {}).get("state") == "superseded"
-                    ):
-                        records[incident] = {
-                            **records[incident],
-                            "state": "unconfirmed",
-                            "prior_state": "active",
-                        }
-                if successors:
-                    successor = successors[0]
-                    candidate = {
-                        **item,
-                        "incident_id": successor,
-                        "source_url": successor,
-                    }
-                    if pending_valid(
-                        candidate, records, self.config, now, allow_suspended=True
-                    ):
-                        item = candidate
-                candidates.append(item)
-            outbox = (
-                [
-                    x
-                    for x in candidates
-                    if pending_valid(x, records, self.config, now, allow_suspended=True)
-                ]
-                if live(self.config)
-                else []
-            )
+            outbox = self._migrate_and_prune_outbox(records, events, now, groups)
+            if self.degraded:
+                try:
+                    await self._save(records, outbox, list(self.outcomes))
+                except Exception as save_err:
+                    raise UpdateFailed(
+                        "Could not persist cancellation evidence safety state"
+                    ) from save_err
+                return self._degraded_health(events=events, records=records, now=now)
             if live(self.config):
-
-                def signature(x):
-                    return (
-                        groups.get(x["incident_id"]),
-                        x["fingerprint"],
-                        x["kind"],
-                        x["target"],
-                        x["location"],
-                    )
-
-                unique = {}
-                for item in outbox:
-                    key = signature(item)
-                    if key in unique:
-                        prior_item = unique[key]
-                        # Keep the strictest retry bounds when lineages merge.
-                        unique[key] = {
-                            **prior_item,
-                            "created": min(prior_item["created"], item["created"]),
-                            "attempts": max(prior_item["attempts"], item["attempts"]),
-                        }
-                    else:
-                        unique[key] = item
-                outbox = list(unique.values())
-                existing = set(unique)
+                existing = {_outbox_signature(groups, item) for item in outbox}
                 for plan in plans:
                     for item in targets(plan, self.config, now):
-                        if signature(item) not in existing:
+                        if _outbox_signature(groups, item) not in existing:
                             outbox.append(item)
-                            existing.add(signature(item))
+                            existing.add(_outbox_signature(groups, item))
             if len(outbox) > 5000:
                 raise ValueError("delivery outbox limit reached")
             await self._save(records, outbox, list(self.outcomes))
@@ -347,15 +495,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         }
                     ]
                     await self._save(self.records, remaining, outcomes)
-        except (CancellationEvidenceLost, CancellationEvidenceOverflow):
-            self.degraded = True
-            try:
-                await self._save(self.records, self.outbox, self.outcomes)
-            except Exception as save_err:
-                raise UpdateFailed(
-                    "Could not persist cancellation evidence safety state"
-                ) from save_err
-            return self._degraded_health()
+        except UpdateFailed:
+            raise
         except Exception as err:
             raise UpdateFailed(
                 f"NWS collection or state persistence failed: {type(err).__name__}"
@@ -376,24 +517,42 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         quarantine_count = getattr(events, "quarantined", 0) + sum(
             records[e["id"]]["state"] == "quarantined" for e in events
         )
-        cancellation_uncertain = any(
-            record.get("state") == "quarantined"
-            and "cancellation scope uncertain" in record.get("reasons", [])
-            for record in records.values()
+        cancellation_uncertain = (
+            any(
+                records[e["id"]].get("state") == "quarantined"
+                and "cancellation scope uncertain"
+                in records[e["id"]].get("reasons", [])
+                for e in events
+            )
+            or any(
+                record.get("state") == "quarantined"
+                and "cancellation scope uncertain" in record.get("reasons", [])
+                and record.get("updated") == now.isoformat()
+                for record in records.values()
+            )
+            or any(
+                "cancellation scope uncertain"
+                in records.get(item.get("incident_id"), {}).get("reasons", [])
+                for item in self.outbox
+            )
+        )
+        quarantine_ambiguous = bool(getattr(events, "quarantine_ambiguous", False))
+        partial = (
+            bool(quarantine_count) or cancellation_uncertain or quarantine_ambiguous
         )
         return {
             "last_success": now.isoformat(),
             "event_count": len(events),
             "source_feature_count": getattr(events, "source_count", len(events)),
             "active_count": sum(records[e["id"]]["state"] == "active" for e in events),
-            "partial": bool(quarantine_count) or cancellation_uncertain,
+            "partial": partial,
             "cancellation_uncertain": cancellation_uncertain,
             "evidence_degraded": False,
             "output_blocked": False,
+            "degraded_reason": self.degraded_reason,
+            "degraded_at": self.degraded_at,
             "quarantined_count": quarantine_count,
-            "quarantine_ambiguous": bool(
-                getattr(events, "quarantine_ambiguous", False)
-            ),
+            "quarantine_ambiguous": quarantine_ambiguous,
             "shadow": not live(self.config),
             "events": [
                 {

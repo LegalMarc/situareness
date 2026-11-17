@@ -417,3 +417,71 @@ test("a source timestamp in the future is not presented as fresh", () => {
     "stale",
   );
 });
+
+test("USGS and BBC items are marked cached when their source is unavailable or overdue", () => {
+  const now = Date.now();
+  const sources = [
+    { id: "usgs", kind: "usgs", interval_minutes: 1 },
+    { id: "bbc_world", kind: "rss", interval_minutes: 5 },
+  ];
+  const usgsEvent = { source_id: "usgs", category: "earthquake" };
+  const bbcEvent = { source_id: "bbc_world", category: "news" };
+
+  assert.equal(nwsAwarenessLifecycle(usgsEvent, now, sources), null);
+  assert.equal(nwsAwarenessLifecycle(bbcEvent, now, sources), null);
+
+  assert.equal(
+    nwsAwarenessLifecycle(usgsEvent, now, sources, [
+      {
+        id: "usgs",
+        enabled: true,
+        status: "ok",
+        last_success_at: new Date(now).toISOString(),
+      },
+    ]),
+    null,
+  );
+  assert.equal(
+    nwsAwarenessLifecycle(bbcEvent, now, sources, [
+      {
+        id: "bbc_world",
+        enabled: true,
+        status: "ok",
+        last_success_at: new Date(now).toISOString(),
+      },
+    ]),
+    null,
+  );
+
+  for (const [event, id, staleAgeMs] of [
+    [usgsEvent, "usgs", 180_000],
+    [bbcEvent, "bbc_world", 660_000],
+  ]) {
+    for (const source of [
+      {
+        id,
+        enabled: false,
+        status: "ok",
+        last_success_at: new Date(now).toISOString(),
+      },
+      {
+        id,
+        enabled: true,
+        status: "error",
+        last_success_at: new Date(now).toISOString(),
+      },
+      {
+        id,
+        enabled: true,
+        status: "ok",
+        last_success_at: new Date(now - staleAgeMs).toISOString(),
+      },
+    ]) {
+      assert.equal(
+        nwsAwarenessLifecycle(event, now, sources, [source]),
+        "cached",
+      );
+    }
+    assert.equal(nwsAwarenessLifecycle(event, now, sources, []), "cached");
+  }
+});

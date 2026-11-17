@@ -265,3 +265,77 @@ async def test_removal_cannot_recreate_store_during_refresh(hass, monkeypatch):
     assert not (
         Path(hass.config.path(".storage")) / ("situareness." + entry.entry_id)
     ).exists()
+
+
+async def test_real_ha_degraded_collection_withholds_output_and_recovers_on_ack(
+    hass, monkeypatch
+):
+    from custom_components.situareness.collector import CollectedEvents
+
+    cfg = {
+        "states": ["NY"],
+        "locations": {"new_york_ny": {"name": "New York", "point": [0.5, 0.5]}},
+        "approved_rules": {"Tornado Warning": ["Take shelter immediately"]},
+        "phones": ["mobile_app_test"],
+        "live_enabled": True,
+        "commissioning_passed": True,
+    }
+    config_path = Path(hass.config.path("situareness.json"))
+    config_path.write_text(json.dumps(cfg))
+    calls = []
+    hass.services.async_register(
+        "notify", "mobile_app_test", lambda call: calls.append(call.data)
+    )
+    ev = alert()
+    degraded_events = CollectedEvents([ev], 1, [], False, uncertain_cancellation=True)
+    component = await integration_module(hass, monkeypatch, degraded_events)
+    entry = MockConfigEntry(domain="situareness", title="Situareness", data={})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    state = hass.states.get("sensor.situareness_monitoring")
+    assert state is not None and state.state == "unknown"
+    assert state.attributes["evidence_degraded"] is True
+    assert state.attributes["output_blocked"] is True
+    assert state.attributes["degraded_reason"] == "malformed_cancellation"
+    assert state.attributes["event_count"] == 1
+    assert calls == []
+
+    # Clean poll while degraded still collects without delivering.
+    clean_events = CollectedEvents([ev], 0, [], False)
+
+    async def fetch_clean(session, states):
+        return clean_events
+
+    monkeypatch.setattr(component, "fetch", fetch_clean)
+    coordinator = hass.data["situareness"][entry.entry_id]
+    await coordinator.async_request_refresh()
+    await hass.async_block_till_done()
+    state = hass.states.get("sensor.situareness_monitoring")
+    assert state.attributes["evidence_degraded"] is True
+    assert state.attributes["output_blocked"] is True
+    assert calls == []
+
+    # Reload with acknowledge_degraded_at restores normal monitoring and output.
+    ack_time = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    config_path.write_text(json.dumps({**cfg, "acknowledge_degraded_at": ack_time}))
+    fresh_ev = alert()
+    fresh_ev["id"] += "-fresh"
+    fresh_ev["cap_identity"][1] += "-fresh"
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    monkeypatch.setattr(
+        component,
+        "fetch",
+        lambda session, states: asyncio.sleep(0, result=[fresh_ev]),
+    )
+    await hass.data["situareness"][entry.entry_id].async_request_refresh()
+    await hass.async_block_till_done()
+    state = hass.states.get("sensor.situareness_monitoring")
+    assert state.state == "1"
+    assert state.attributes["evidence_degraded"] is False
+    assert state.attributes["output_blocked"] is False
+    assert state.attributes["degraded_reason"] is None
+    assert len(calls) == 1
+    assert await hass.config_entries.async_unload(entry.entry_id)

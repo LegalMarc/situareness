@@ -9,8 +9,13 @@ The release gate is open until the current candidate has zero supported unresolv
 | `6f55e0aa9699a2fd2a8ccf6b11a74421b6bb5d83` | Public privacy and clean history | Claude Opus 5.5, medium effort | PASS, zero findings |
 | `6f55e0aa9699a2fd2a8ccf6b11a74421b6bb5d83` | Standards | Claude Opus 5.5, medium effort | Seven findings; repaired in next checkpoint |
 | `6f55e0aa9699a2fd2a8ccf6b11a74421b6bb5d83` | Specification | Claude Opus 5.5, medium effort | Seven findings; repaired in next checkpoint |
-| `2c0f1e1864d1738e5c5488d3c0e423c0f0a7ebee` | Standards | Claude Opus 5.5, medium effort | Ten findings; repaired in the next checkpoint; re-review pending |
-| `2c0f1e1864d1738e5c5488d3c0e423c0f0a7ebee` | Specification | Claude Opus 5.5, medium effort | Twelve findings; repaired in the next checkpoint; re-review pending |
+| `2c0f1e1864d1738e5c5488d3c0e423c0f0a7ebee` | Standards | Claude Opus 5.5, medium effort | Ten findings; repaired in the next checkpoint |
+| `2c0f1e1864d1738e5c5488d3c0e423c0f0a7ebee` | Specification | Claude Opus 5.5, medium effort | Twelve findings; repaired in the next checkpoint |
+| `847d0e56853f4d9bfdf4cdf3d1812f836bf58eba` | Standards | Claude Opus 5.5, medium effort | Ten findings; repaired on WIP branch |
+| `847d0e56853f4d9bfdf4cdf3d1812f836bf58eba` | Specification | Claude Opus 5.5, medium effort | Nine findings; repaired on WIP branch |
+| `63da80f6660667a529a3c4e0d1a0b7bc368760b5` | Focused browser/package | OpenAI `gpt-6-astra`, ultra | One P2 finding (`BROWSE-01`); repaired in `5ec38ac` |
+| `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Standards | Claude Opus 5.5, medium effort | Seven findings (`run_id`: `20261117T164428Z-8b628a`, 260.4s); repaired for next candidate |
+| `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Specification | Claude Opus 5.5, medium effort | Twelve findings (`run_id`: `20261117T164428Z-8b628a`, 225.2s); repaired for next candidate |
 
 The exact model reported by completed CLI result metadata was `claude-opus-5-5`. The second standards/specification passes took 204.4 and 205.3 seconds respectively. They independently read an immutable full-source snapshot, complete change diff from the public root, documented contract/standards, and raw local test evidence. They executed no code or physical output.
 
@@ -89,19 +94,35 @@ Candidate `2c0f1e1` passed 79 automated tests and `847d0e5` passed 93, plus live
 
 ## Supervisor continuation findings
 
-The user replaced the review policy during continuation: implementation and fresh reviews remain within the same model family/provider. Current workers use OpenAI `gpt-6.1-terra`, high effort, and fresh reviewers use `gpt-6-astra`, ultra effort. Historical Opus reviews above remain evidence of their own candidates; they do not approve this continuation.
+Candidate `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` passed 128 local tests, but independent Claude Opus 5.5 medium-effort reviews (`run_id`: `20261117T164428Z-8b628a`; 260.4s standards, 225.2s specification) failed with seven standards and twelve specification findings. Prior focused browser review at `63da80f6660667a529a3c4e0d1a0b7bc368760b5` ([BROWSE-01](browser-focused-63da80f.md)) and earlier internal checks (`CAP-SCOPE-01`, `CAP-RENEW-01`, `CAP-STORE-01`, `CAP-ID-01`) are preserved in history.
 
-The focused browser review at immutable `63da80f6660667a529a3c4e0d1a0b7bc368760b5` found one P2 issue, [BROWSE-01](browser-focused-63da80f.md). Its outage-age repair passed 40 Node and 16 browser tests and is checkpointed at `5ec38ac`. Full-candidate re-review is pending.
+### Standards findings at fcc9072
 
-The supervisor also identified the following supported integration cases in the uncommitted HA continuation; these observations are not an independent immutable-candidate release review:
+| Code | Severity | Finding | Current disposition |
+| --- | --- | --- | --- |
+| HA-01 | High | Unbounded cancellation protection eventually triggers permanent `CancellationEvidenceOverflow` shutdown. | Enforced 7-day `MAX_ACCEPTANCE_AGE` and anchored `cancellation_horizon`; re-review pending. |
+| HA-02 | Medium | `seen_cancel` turns unrelated or transient fetch errors into permanent `CancellationEvidenceLost`. | Removed `seen_cancel` / `CancellationEvidenceLost` and kept malformed-cancel scoping bounded; re-review pending. |
+| HA-03 | Medium | Coordinator retry filter restricts the entire component instead of uncertain records. | Removed component-wide filter while keeping `"cancelled"` drop and `"quarantined"` retry suspension; re-review pending. |
+| HA-04 | Low | `CancelledError` is swallowed after seeing a Cancel and latches degraded mode on unload/shutdown. | Let `asyncio.CancelledError` propagate untouched; re-review pending. |
+| HA-05 | Low | Degraded health misreports `quarantine_ambiguous` and `cancellation_uncertain` regardless of cause. | Added `degraded_reason`/`degraded_at` and accurate diagnostic flags; re-review pending. |
+| HA-06 | Low | Superseded cancellation-group records force `prior_state: "active"`, and long non-Cancel features fail the whole poll. | Removed forged `prior_state`; quarantined oversized/malformed non-Cancel features per feature/lineage; re-review pending. |
+| DOC-01 | Nit | `tests/fixtures/cap/**` omitted from `docs/INDEX.md` coverage. | Added `covers: tests/fixtures/cap/**` on the `cap-cancellation.md` entry. |
 
-| Code | Finding | Current disposition |
-| --- | --- | --- |
-| CAP-SCOPE-01 | A global missing-predecessor rule could quarantine unrelated updates after any retained Cancel. | Scoped to established cancellation components; regression passes, independent review pending. |
-| CAP-RENEW-01 | A renewal referencing both a Cancel and the historical root could remain blocked by historical traversal. | Explicit renewal boundary retained without deleting tombstones; regression passes, independent review pending. |
-| CAP-STORE-01 | A malformed non-None saved journal or a conflicting replay of a cancellation identity could erase protection. | Durable degradation and restart/no-output regressions pass; independent review pending. |
-| CAP-ID-01 | A current Alert/Update with conflicting or incomplete CAP identity/reference metadata could still qualify and deliver outside a known cancellation group; its invalid references could suppress valid candidates in collection. | Repair completed after preserving the interrupted WIP. Current tuple validation, mixed-reference collector isolation, cancellation uncertainty, mocked live-boundary and restart regressions pass; independent immutable review pending. |
+### Specification findings at fcc9072
 
-Before CAP-ID-01 was found, integrated checks passed 40 Node, 56 standard-library HA, seven source-skill, 16 browser and five actual-HA tests (124 total), lint/format, anonymous live read and deterministic archive builds. Those logs are preserved locally as a pre-identity-audit run and must not be used to approve changed files. Five upstream HA dependency deprecations remain unsuppressed. Complete current gates and independent standards, specification and fresh adversarial review are still required.
+| Code | Severity | Finding | Current disposition |
+| --- | --- | --- | --- |
+| SIT-H1 | High | Historic cancellation uncertainty sets poll-wide `quarantined = True` and stalls resolution indefinitely. | Scoped unconfirmed/quarantined resolution per group and active/current-cancel presence; re-review pending. |
+| SIT-H2 | High | Cancellation evidence has no retention horizon and deterministically hits the 1,000-record cap. | Added 7-day `MAX_ACCEPTANCE_AGE` and source-anchored `cancellation_horizon` expiry; re-review pending. |
+| SIT-H3 | High | Transient or unrelated fetch errors after observing a Cancel permanently latch degraded state. | Removed `CancellationEvidenceLost` fetch-error latching; re-review pending. |
+| SIT-M1 | Medium | `CancelledError` is swallowed and writes a degraded latch during unload/shutdown. | Propagates `asyncio.CancelledError` untouched; re-review pending. |
+| SIT-M2 | Medium | Degraded mode stops collection and lacks an authorized recovery path. | Continues collection while output-blocked for uncorrupted degradation; recovers via 7-day `degraded_until` or `acknowledge_degraded_at`; re-review pending. |
+| SIT-M3 | Medium | Continuing descendant retry is blocked by an unrelated Cancel in the same component. | Removed component-wide outbox filter so uncancelled siblings/descendants migrate cleanly; re-review pending. |
+| SIT-M4 | Medium | Single malformed non-Cancel feature fails the entire poll. | Quarantines malformed/oversized non-Cancel features per feature/lineage in `collector.py`; re-review pending. |
+| SIT-M5 | Medium | Nested malformed persisted journal entries crash every poll instead of latching `malformed_store`. | Added `_valid_persisted_store` deep schema validation; re-review pending. |
+| SIT-M6 | Medium | `_degraded_health()` reports invented `partial`/`quarantine_ambiguous`/`cancellation_uncertain` values. | Reports actual collected counts/events and cause-accurate flags; re-review pending. |
+| SIT-L1 | Low | Worker bundled-config errors render as collector disconnect and `runAction` regex omits them. | Added `isBundledConfigError`, schema bootstrap check, and `runAction` regex fix; re-review pending. |
+| SIT-L2 | Low | Disabled/failed/overdue USGS and BBC items lack visible cached badges, drifting from `o3-mvp.md`. | Extended `"cached"` badge to non-weather items when `sourceStates` is unavailable/overdue and updated `docs/setup.md`; re-review pending. |
+| SIT-N1 | Nit | Superseded records in cancellation groups hardcode `prior_state: "active"`. | Removed the hardcode and guarded `referenced` updates; re-review pending. |
 
-The repaired continuation now passes 128 complete local tests (40 Node, 59 stdlib HA, seven source-skill, 16 browser and six actual-HA), static/lint/format and deterministic packaging. Current live NWS requests returned HTTP 503; other browser feeds succeeded. This is not release approval: independent full-candidate reviews and the live-health gate remain open.
+All 19 findings from `fcc9072` are repaired and pass 141 local automated tests, Ruff, deterministic packaging, and live anonymous smoke. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.

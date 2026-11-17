@@ -214,6 +214,21 @@ export function nwsAwarenessLifecycle(
   sources = [],
   sourceStates = null,
 ) {
+  const isSourceUnavailable = () => {
+    const state = (Array.isArray(sourceStates) ? sourceStates : []).find(
+      (source) => source?.id === event?.source_id,
+    );
+    const config = Array.isArray(sources)
+      ? sources.find((source) => source?.id === event?.source_id)
+      : undefined;
+    return (
+      !state ||
+      sourceFreshness(
+        { ...state, interval_minutes: config?.interval_minutes },
+        now,
+      ) !== "ok"
+    );
+  };
   const sourceIsWeather =
     Array.isArray(sources) &&
     sources.some(
@@ -225,29 +240,15 @@ export function nwsAwarenessLifecycle(
     ) &&
     event?.category === "weather" &&
     event?.official === true;
-  if (!sourceIsWeather && !carriesWeatherLifecycle) return null;
+  if (!sourceIsWeather && !carriesWeatherLifecycle)
+    return sourceStates && isSourceUnavailable() ? "cached" : null;
   const expiry = Date.parse(event?.expires_at || "");
   if (Number.isFinite(expiry) && expiry <= now) return "expired";
   if (event.awareness_lifecycle === "expired") return "expired";
   if (event.awareness_lifecycle === "not_in_latest_fetch")
     return "not_in_latest_fetch";
   if (event.awareness_lifecycle === "current") {
-    if (sourceStates) {
-      const state = (Array.isArray(sourceStates) ? sourceStates : []).find(
-        (source) => source.id === event.source_id,
-      );
-      const config = Array.isArray(sources)
-        ? sources.find((source) => source.id === event.source_id)
-        : undefined;
-      if (
-        !state ||
-        sourceFreshness(
-          { ...state, interval_minutes: config?.interval_minutes },
-          now,
-        ) !== "ok"
-      )
-        return "cached";
-    }
+    if (sourceStates && isSourceUnavailable()) return "cached";
     return "current";
   }
   return "unknown";

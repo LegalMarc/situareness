@@ -9,6 +9,8 @@ import json
 import math
 from urllib.parse import urlparse
 
+MAX_ACCEPTANCE_AGE = timedelta(days=7)
+
 
 def timestamp(value):
     try:
@@ -36,6 +38,10 @@ def safe_url(value):
 
 class CancellationEvidenceOverflow(ValueError):
     """Cancellation evidence cannot fit safely in the durable journal."""
+
+    def __init__(self, message, records=None):
+        super().__init__(message)
+        self.records = records
 
 
 class OversizedFeature(ValueError):
@@ -89,10 +95,12 @@ def normalize(feature):
         "instruction",
         "headline",
     ):
-        if p.get(key) is not None and (
-            not isinstance(p[key], str) or len(p[key]) > 10000
-        ):
-            return None
+        value = p.get(key)
+        if value is not None:
+            if not isinstance(value, str):
+                return None
+            if len(value) > 10000:
+                raise OversizedFeature("NWS property length limit exceeded")
     refs = p.get("references") if isinstance(p.get("references"), list) else []
     if len(refs) > 100 or any(
         isinstance(r, dict) and isinstance(r.get("@id"), str) and len(r["@id"]) > 512
@@ -280,6 +288,7 @@ def qualify(event, config, now):
     if (
         not all((sent, effective, expires, onset, ends))
         or sent > now + timedelta(minutes=5)
+        or now - sent > MAX_ACCEPTANCE_AGE
         or effective > now
         or expires <= now
         or ends <= now
@@ -386,6 +395,33 @@ def lineage_index(records, events):
     for eid in records:
         members.setdefault(find(eid), []).append(eid)
     return {eid: find(eid) for eid in parent}, members
+
+
+def cancellation_horizon(group_ids, records):
+    """Return the retention horizon across all timestamps in a lineage component."""
+    timestamps = []
+    for eid in group_ids:
+        record = records.get(eid)
+        if not isinstance(record, dict):
+            continue
+        record_timestamps = []
+        for key in ("ends", "expires", "sent"):
+            parsed = timestamp(record.get(key))
+            if parsed is not None:
+                record_timestamps.append(parsed)
+        refs = record.get("cap_references")
+        if isinstance(refs, list):
+            for ref in refs:
+                if isinstance(ref, list) and len(ref) == 3:
+                    parsed = timestamp(ref[2])
+                    if parsed is not None:
+                        record_timestamps.append(parsed)
+        if not record_timestamps:
+            parsed = timestamp(record.get("updated"))
+            if parsed is not None:
+                record_timestamps.append(parsed)
+        timestamps.extend(record_timestamps)
+    return max(timestamps) + MAX_ACCEPTANCE_AGE if timestamps else None
 
 
 def cancellation_evidence(records, events, groups, now=None):
@@ -611,6 +647,21 @@ def reconcile(
         for source in graph_events
     ]
     groups, members = lineage_index(prior, [*grouping_events, *quarantine_events])
+    active_feed_groups = {
+        groups[source["id"]] for source in graph_events if source["id"] in groups
+    }
+    for group, ids in members.items():
+        if group in active_feed_groups:
+            continue
+        if not any(prior[eid].get("cancel_message") for eid in ids):
+            continue
+        horizon = cancellation_horizon(ids, prior)
+        if horizon is None or now > horizon:
+            for eid in ids:
+                if prior[eid].get("cancel_message"):
+                    prior[eid]["cancel_message"] = False
+                    records[eid]["cancel_message"] = False
+                    records[eid]["cancellation_expired"] = True
     trusted_events = [
         source
         for source in graph_events
@@ -625,7 +676,6 @@ def reconcile(
     planned_in_poll = set()
     seen = set()
     referenced = set()
-    quarantined = False
     inactive_states = {"ineligible", "ended_or_absent", "quarantined", "unconfirmed"}
     summaries = {}
 
@@ -683,6 +733,9 @@ def reconcile(
                 if source.get("cap_references_valid")
                 else None,
                 "cancel_message": False,
+                "sent": source.get("sent"),
+                "expires": source.get("expires"),
+                "ends": source.get("ends"),
                 "updated": now.isoformat(),
             }
 
@@ -734,10 +787,27 @@ def reconcile(
                     else None
                 ),
                 "cancel_message": cancelled or old_record.get("cancel_message", False),
+                "cancellation_expired": False
+                if (cancelled or old_record.get("cancel_message"))
+                else old_record.get("cancellation_expired", False),
+                "sent": old_record.get("sent")
+                if identity_uncertain
+                else event.get("sent")
+                if event.get("sent") is not None
+                else old_record.get("sent"),
+                "expires": old_record.get("expires")
+                if identity_uncertain
+                else event.get("expires")
+                if event.get("expires") is not None
+                else old_record.get("expires"),
+                "ends": old_record.get("ends")
+                if identity_uncertain
+                else event.get("ends")
+                if event.get("ends") is not None
+                else old_record.get("ends"),
                 "affected": [],
             }
             seen.add(eid)
-            quarantined = True
             continue
         actions = {}
 
@@ -766,7 +836,6 @@ def reconcile(
                 if decision["qualifies"] or record.get("action_identity") == identity:
                     merge_bounded(actions, action_history(record))
         if len(actions) > 100:
-            quarantined = True
             old_record = records.get(eid, {})
             records[eid] = {
                 **suspend_record(old_record, "quarantined", now),
@@ -780,6 +849,18 @@ def reconcile(
                 if event.get("cap_references_valid")
                 else None,
                 "cancel_message": cancelled or old_record.get("cancel_message", False),
+                "cancellation_expired": False
+                if (cancelled or old_record.get("cancel_message"))
+                else old_record.get("cancellation_expired", False),
+                "sent": event.get("sent")
+                if event.get("sent") is not None
+                else old_record.get("sent"),
+                "expires": event.get("expires")
+                if event.get("expires") is not None
+                else old_record.get("expires"),
+                "ends": event.get("ends")
+                if event.get("ends") is not None
+                else old_record.get("ends"),
                 "affected": [],
             }
             seen.add(eid)
@@ -826,6 +907,10 @@ def reconcile(
             if event.get("cap_references_valid")
             else None,
             "cancel_message": cancelled,
+            "cancellation_expired": False,
+            "sent": event.get("sent"),
+            "expires": event.get("expires"),
+            "ends": event.get("ends"),
             "reasons": ["message explicitly referenced by cancellation"]
             if blocked and not cancelled
             else decision["reasons"],
@@ -833,7 +918,8 @@ def reconcile(
             "updated": now.isoformat(),
         }
         seen.add(eid)
-        referenced.update(ref for ref in refs if ref != eid)
+        if not (cancelled or blocked):
+            referenced.update(ref for ref in refs if ref != eid)
     for eid in cancelled_ids:
         if eid in records and not records[eid].get("cancel_message"):
             records[eid] = {
@@ -842,11 +928,37 @@ def reconcile(
                 "actions": {},
                 "reasons": ["message explicitly referenced by cancellation"],
             }
+    current_cancel_groups = {
+        groups.get(source["id"]) for source in trusted_events if actual_cancel(source)
+    }
+    uncertain_handled = set()
     for eid in uncertain_ids - cancelled_ids:
-        if eid in records and not records[eid].get("cancel_message"):
+        if eid in seen or eid not in records or records[eid].get("cancel_message"):
+            continue
+        group_has_current_cancel = groups.get(eid) in current_cancel_groups
+        group_unconfirmed = (
+            quarantine_all
+            or (partial and not quarantine_groups)
+            or groups.get(eid) in quarantine_groups
+        )
+        if records[eid].get("state") == "active" or group_has_current_cancel:
+            inactive_since = records[eid].get("inactive_since") or now.isoformat()
             records[eid] = suspend_record(records[eid], "quarantined", now)
+            records[eid]["inactive_since"] = inactive_since
             records[eid]["reasons"] = ["cancellation scope uncertain"]
-            quarantined = True
+            uncertain_handled.add(eid)
+        elif not group_unconfirmed and records[eid].get("state") in (
+            "quarantined",
+            "unconfirmed",
+        ):
+            inactive_since = records[eid].get("inactive_since") or now.isoformat()
+            records[eid].update(
+                state="ended_or_absent",
+                inactive_since=inactive_since,
+                reasons=["cancellation scope uncertain"],
+                updated=now.isoformat(),
+            )
+            uncertain_handled.add(eid)
     for ref in referenced:
         if (
             ref in records
@@ -855,8 +967,15 @@ def reconcile(
         ):
             records[ref]["state"] = "superseded"
     for eid, record in records.items():
-        if eid not in seen and record.get("state") == "active":
-            if partial or quarantined:
+        if eid in seen or eid in uncertain_handled:
+            continue
+        group_unconfirmed = (
+            quarantine_all
+            or (partial and not quarantine_groups)
+            or groups.get(eid) in quarantine_groups
+        )
+        if record.get("state") == "active":
+            if group_unconfirmed:
                 records[eid] = suspend_record(record, "unconfirmed", now)
             else:
                 record.update(
@@ -864,10 +983,9 @@ def reconcile(
                     inactive_since=now.isoformat(),
                     updated=now.isoformat(),
                 )
-        elif (
-            eid not in seen
-            and not (partial or quarantined)
-            and record.get("state") in ("unconfirmed", "quarantined")
+        elif not group_unconfirmed and record.get("state") in (
+            "unconfirmed",
+            "quarantined",
         ):
             since = (
                 record.get("inactive_since")
@@ -882,14 +1000,28 @@ def reconcile(
         for eid, record in records.items()
         if record.get("cancel_message")
     }
+    current_graph_ids = {event["id"] for event in graph_events}
     protected = (
         seen
-        | {event["id"] for event in graph_events}
+        | current_graph_ids
         | {eid for eid in records if groups.get(eid) in cancellation_groups}
     )
     if len(protected) > 1000:
+        bounded = dict(
+            sorted(
+                records.items(),
+                key=lambda item: (
+                    item[0] in seen,
+                    item[0] in current_graph_ids,
+                    item[0] in protected,
+                    item[1].get("updated", ""),
+                ),
+                reverse=True,
+            )[:1000]
+        )
         raise CancellationEvidenceOverflow(
-            "current messages and cancellation evidence exceed journal limit"
+            "current messages and cancellation evidence exceed journal limit",
+            records=bounded,
         )
     records = dict(
         sorted(

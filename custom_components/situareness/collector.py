@@ -9,10 +9,6 @@ MAX_BYTES = 8 * 1024 * 1024
 MAX_PAGES = 10
 
 
-class CancellationEvidenceLost(ValueError):
-    """A partial failed fetch observed cancellation evidence it cannot retain."""
-
-
 class CollectedEvents(list):
     """Successful paginated fetch with a count of quarantined features."""
 
@@ -38,24 +34,6 @@ class CollectedEvents(list):
 
 
 async def fetch(session, states):
-    seen_cancel = [False]
-    try:
-        return await _fetch(session, states, seen_cancel)
-    except asyncio.CancelledError as err:
-        if seen_cancel[0]:
-            raise CancellationEvidenceLost(
-                "cancelled fetch after cancellation evidence"
-            ) from err
-        raise
-    except Exception as err:
-        if seen_cancel[0]:
-            raise CancellationEvidenceLost(
-                "incomplete fetch after cancellation evidence"
-            ) from err
-        raise
-
-
-async def _fetch(session, states, seen_cancel):
     events = {}
     quarantined = 0
     quarantined_lineages = []
@@ -100,57 +78,65 @@ async def _fetch(session, states, seen_cancel):
         ):
             raise ValueError("invalid NWS response")
         for feature in payload["features"]:
-            properties = (
-                feature.get("properties") if isinstance(feature, dict) else None
-            )
-            if (
-                isinstance(properties, dict)
-                and properties.get("status") == "Actual"
-                and properties.get("messageType") == "Cancel"
-            ):
-                seen_cancel[0] = True
             feature_count += 1
             if feature_count > 1000:
                 raise ValueError("NWS event limit reached")
             try:
                 event = normalize(feature)
             except OversizedFeature:
-                quarantined += 1
-                if (
-                    feature["properties"].get("status") == "Actual"
-                    and feature["properties"].get("messageType") == "Cancel"
-                ):
-                    uncertain_cancellation = True
-                refs = feature["properties"].get("references", [])
-                ids = [feature["id"]]
-                for ref in refs:
-                    if isinstance(ref, dict) and isinstance(ref.get("@id"), str):
-                        if len(ref["@id"]) > 512:
-                            quarantine_ambiguous = True
-                        elif safe_url(ref["@id"]):
-                            if quarantine_refs >= 5000:
-                                quarantine_ambiguous = True
-                                break
-                            ids.append(ref["@id"])
-                            quarantine_refs += 1
-                quarantined_lineages.append(ids)
-                continue
+                event = None
             if event is None:
+                quarantined += 1
                 properties = (
                     feature.get("properties") if isinstance(feature, dict) else None
                 )
-                if (
+                is_cancel = (
                     isinstance(properties, dict)
                     and properties.get("status") == "Actual"
                     and properties.get("messageType") == "Cancel"
-                ):
-                    # Even malformed cancellation evidence must not disappear on
-                    # a later poll and allow an uncertain retry to resume.
+                )
+                if is_cancel:
                     uncertain_cancellation = True
+                raw_id = feature.get("id") if isinstance(feature, dict) else None
+                feature_id = (
+                    raw_id
+                    if isinstance(raw_id, str)
+                    and len(raw_id) <= 512
+                    and raw_id.isascii()
+                    and safe_url(raw_id)
+                    and raw_id.startswith("https://api.weather.gov/alerts/")
+                    else None
+                )
+                raw_refs = (
+                    properties.get("references")
+                    if isinstance(properties, dict)
+                    else None
+                )
+                if (
+                    feature_id
+                    and isinstance(properties, dict)
+                    and (raw_refs is None or isinstance(raw_refs, list))
+                ):
+                    refs = raw_refs or []
+                    ids = [feature_id]
+                    for ref in refs:
+                        ref_id = ref.get("@id") if isinstance(ref, dict) else None
+                        if (
+                            not isinstance(ref_id, str)
+                            or len(ref_id) > 512
+                            or not safe_url(ref_id)
+                        ):
+                            quarantine_ambiguous = True
+                        elif quarantine_refs >= 5000:
+                            quarantine_ambiguous = True
+                            break
+                        else:
+                            ids.append(ref_id)
+                            quarantine_refs += 1
+                    quarantined_lineages.append(ids)
+                else:
                     quarantine_ambiguous = True
-                    quarantined += 1
-                    continue
-                raise ValueError("invalid NWS feature")
+                continue
             if event["id"] in events and events[event["id"]] != event:
                 raise ValueError("conflicting duplicate NWS message identity")
             events[event["id"]] = event

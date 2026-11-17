@@ -32,7 +32,7 @@ Start with the [project context](CONTEXT.md) and [continuation guide](plans/RESU
 - `docs/plans/supervision-20261117.md` — Bounded delegated repair plan, immutable review gates, checkpoint discipline, and continuation priorities. anchors: initial-repair-and-evidence-gate, completion-evidence
 
 ## docs/reference/
-- `docs/reference/cap-cancellation.md` — Primary CAP/NWS evidence, observed branch fixtures, conservative cancellation policy, and unresolved scope limits. anchors: evidence-and-its-limits, conservative-processing-policy
+- `docs/reference/cap-cancellation.md` — Primary CAP/NWS evidence, observed branch fixtures, conservative cancellation policy, and unresolved scope limits. anchors: evidence-and-its-limits, conservative-processing-policy covers: tests/fixtures/cap/**
 - `docs/reference/primary-sources.md` — Verified official-channel references and access limitations for weather, earthquakes, NYC/DC, IPAWS, hurricanes, and space weather. anchors: weather-warnings-and-faster-transports, earthquakes, nyc-and-dc-local-authority-channels, national-all-hazards-coverage, preparation-and-national-impact-candidates, how-to-maintain-this-evidence
 
 ## docs/reports/

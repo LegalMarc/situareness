@@ -75,6 +75,8 @@ async function routeFixtures(targetContext = context) {
       control.requests.push(url);
       if (control.failNws && url.includes("api.weather.gov"))
         return route.fulfill({ status: 503, body: "fixture unavailable" });
+      if (control.failUsgs && url.includes("earthquake.usgs.gov"))
+        return route.fulfill({ status: 503, body: "fixture unavailable" });
       if (url.includes("api.weather.gov"))
         return route.fulfill({
           status: 200,
@@ -140,7 +142,7 @@ test.beforeEach(async () => {
   test.setTimeout(90_000);
   await mkdir(profileRoot, { recursive: true });
   profile = await mkdtemp(path.join(profileRoot, "room-"));
-  control = { failNws: false, requests: [] };
+  control = { failNws: false, failUsgs: false, requests: [] };
   context = await launch();
   await extensionId();
   await routeFixtures();
@@ -696,7 +698,10 @@ test("disabled failed sources are neutral and storage truncation is visible", as
       .locator(".source-status"),
   ).toHaveClass(/disabled/);
   await expect(page.getByText("Old failure")).toHaveCount(0);
-  await expect(page.getByText("Cached · source unavailable")).toBeVisible();
+  const weather = page.locator(".event-card").filter({
+    has: page.getByRole("heading", { name: "Wind advisory for New York City" }),
+  });
+  await expect(weather.getByText("Cached · source unavailable")).toBeVisible();
   await expect(page.locator("#collector-dot")).not.toHaveClass(/error/);
   await expect(page.locator("#retention-note")).toContainText(
     "500-item storage limit omitted some items",
@@ -735,4 +740,102 @@ test("a broken bundled defaults response produces an explicit startup error", as
   await expect(
     page.getByRole("button", { name: "Open settings" }),
   ).toBeDisabled();
+});
+
+test("bundled defaults failing public schema validation produce an explicit startup error", async () => {
+  await page.route("**/defaults/config.json", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        schema_version: 2,
+        sources: [
+          { id: "nws", interval_minutes: 1 },
+          { id: "usgs", interval_minutes: 1 },
+          { id: "bbc_world", interval_minutes: 5 },
+          { id: "bbc_us_canada", interval_minutes: 5 },
+        ],
+      }),
+    }),
+  );
+  await page.reload();
+  await expect(page.locator("#collector-label")).toHaveText(
+    "Room could not start",
+  );
+  await expect(page.locator("#feed-state")).toContainText(
+    "Bundled source defaults are invalid",
+  );
+  await expect(
+    page.getByRole("button", { name: "Open settings" }),
+  ).toBeDisabled();
+});
+
+test("a worker bundled configuration failure on GET_STATE shows an explicit startup error", async () => {
+  await page.addInitScript(() => {
+    const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+    Object.defineProperty(chrome.runtime, "sendMessage", {
+      configurable: true,
+      value: async (message) => {
+        if (message?.type === "GET_STATE") {
+          return {
+            ok: false,
+            error: "Bundled configuration is unavailable or invalid.",
+          };
+        }
+        return original(message);
+      },
+    });
+  });
+  await page.reload();
+  await expect(page.locator("#collector-label")).toHaveText(
+    "Room could not start",
+  );
+  await expect(page.locator("#feed-state")).toContainText(
+    "Unable to start room",
+  );
+  await expect(page.locator("#feed-state")).toContainText(
+    "Bundled configuration is unavailable or invalid.",
+  );
+  await expect(page.locator("#collector-label")).not.toHaveText(
+    "Collector disconnected",
+  );
+  await expect(page.locator("#notice")).not.toContainText(
+    "Showing cached data",
+  );
+  await expect(page.locator("#notice")).toContainText(
+    "Bundled configuration is unavailable or invalid.",
+  );
+  await expect(
+    page.getByRole("button", { name: "Open settings" }),
+  ).toBeDisabled();
+});
+
+test("cached USGS and BBC items display cached unavailable badge when their source fails or is disabled", async () => {
+  const usgsCard = page.locator(".event-card").filter({
+    has: page.getByRole("heading", { name: "Magnitude 4.1 earthquake" }),
+  });
+  const bbcCard = page.locator(".event-card").filter({
+    has: page.getByRole("heading", { name: maliciousTitle }),
+  });
+
+  await expect(usgsCard.locator(".presence-pill")).toHaveCount(0);
+  await expect(bbcCard.locator(".presence-pill")).toHaveCount(0);
+
+  control.failUsgs = true;
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await expect(usgsCard.getByText("Cached · source unavailable")).toBeVisible();
+  await expect(usgsCard.locator(".presence-pill")).toHaveAttribute(
+    "title",
+    /Previously collected from this source; the source is disabled, failed, or overdue/,
+  );
+  await expect(bbcCard.locator(".presence-pill")).toHaveCount(0);
+
+  const config = structuredClone(
+    (await send({ type: "GET_STATE" })).state.config,
+  );
+  config.sources.find((source) => source.id === "bbc_world").enabled = false;
+  expect((await send({ type: "UPDATE_CONFIG", config })).ok).toBe(true);
+  await page.reload();
+  await expect(usgsCard.getByText("Cached · source unavailable")).toBeVisible();
+  await expect(bbcCard.getByText("Cached · source unavailable")).toBeVisible();
 });
