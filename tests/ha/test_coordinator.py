@@ -50,8 +50,18 @@ class Services:
         self.calls.append(args)
 
 
+_DEFAULT_PN = module(
+    "homeassistant.components.persistent_notification",
+    async_create=lambda *args, **kwargs: None,
+    async_dismiss=lambda *args, **kwargs: None,
+)
+
 HA_MODULES = {
     "homeassistant": module("homeassistant"),
+    "homeassistant.components": module(
+        "homeassistant.components", persistent_notification=_DEFAULT_PN
+    ),
+    "homeassistant.components.persistent_notification": _DEFAULT_PN,
     "homeassistant.const": module(
         "homeassistant.const", Platform=types.SimpleNamespace(SENSOR="sensor")
     ),
@@ -2226,6 +2236,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["active_count"])
         self.assertEqual(result["pending_count"], 1)
         self.assertEqual(result["suspended_count"], 1)
+        self.assertEqual(result["withheld_count"], 0)
 
         # Stopping a degraded coordinator with no prior data still reports degraded health.
         started2 = asyncio.Event()
@@ -2508,43 +2519,74 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             spec.loader.exec_module(mod)
 
         # Upgraded entry with empty data and malformed persisted store marks journal_initialized.
-        entry = types.SimpleNamespace(entry_id="up1", data={})
-        hass = types.SimpleNamespace(
-            data={},
-            services=Services(),
-            config_entries=types.SimpleNamespace(
-                async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
-            ),
-        )
-        coord = mod.SituarenessCoordinator(
-            hass, config(), Store(), {"records": "corrupt"}, entry=entry
-        )
-        self.assertTrue(coord.degraded)
-        self.assertEqual(coord.degraded_reason, "malformed_store")
-        self.assertTrue(entry.data.get("journal_initialized"))
-
-        # Subsequent reload with missing store transitions cleanly to journal_lost.
-        lost = mod.SituarenessCoordinator(hass, config(), Store(), None, entry=entry)
-        self.assertTrue(lost.degraded)
-        self.assertEqual(lost.degraded_reason, "journal_lost")
-        self.assertIn("situareness_degraded", notifications)
-
-        # async_remove_entry dismisses notification BEFORE calling async_remove() and uses private=True.
-        await mod.async_remove_entry(hass, entry)
-        self.assertEqual(events, ["dismiss", "remove"])
-        self.assertEqual(seen_private, [True])
-        self.assertNotIn("situareness_degraded", notifications)
-
-        # async_setup_entry treats decode/version errors as malformed_store and I/O errors
-        # as ConfigEntryNotReady without marking malformed_store_at or journal_initialized.
         with tempfile.TemporaryDirectory() as tmp:
             import asyncio
 
-            cfg_file = Path(tmp) / "situareness.json"
-            cfg_file.write_text("{}", encoding="utf-8")
-
             async def run_exec(fn, *args):
                 return fn(*args)
+
+            entry = types.SimpleNamespace(entry_id="up1", data={})
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                async_add_executor_job=run_exec,
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+                ),
+            )
+            coord = mod.SituarenessCoordinator(
+                hass, config(), Store(), {"records": "corrupt"}, entry=entry
+            )
+            self.assertTrue(coord.degraded)
+            self.assertEqual(coord.degraded_reason, "malformed_store")
+            self.assertTrue(entry.data.get("journal_initialized"))
+
+            # Subsequent reload with missing store transitions cleanly to journal_lost.
+            lost = mod.SituarenessCoordinator(
+                hass, config(), Store(), None, entry=entry
+            )
+            self.assertTrue(lost.degraded)
+            self.assertEqual(lost.degraded_reason, "journal_lost")
+            self.assertIn("situareness_degraded", notifications)
+
+            # async_remove_entry dismisses notification BEFORE calling async_remove() and uses private=True.
+            await mod.async_remove_entry(hass, entry)
+            self.assertEqual(events, ["dismiss", "remove"])
+            self.assertEqual(seen_private, [True])
+            self.assertNotIn("situareness_degraded", notifications)
+
+            # Invalid or disallowed degraded_reason values fail store validation, and
+            # degraded=False normalizes any stale degraded_reason to None.
+            for bad_reason in ("malformed_store", "unknown_reason", 123):
+                bad_coord = mod.SituarenessCoordinator(
+                    hass,
+                    config(),
+                    Store(),
+                    {"degraded": True, "degraded_reason": bad_reason, "records": {}},
+                )
+                self.assertEqual(bad_coord.degraded_reason, "malformed_store")
+                self.assertIsNone(bad_coord.degraded_until)
+
+            clean_stale = mod.SituarenessCoordinator(
+                hass,
+                config(),
+                Store(),
+                {
+                    "degraded": False,
+                    "degraded_reason": "outbox_overflow",
+                    "records": {},
+                },
+            )
+            self.assertFalse(clean_stale.degraded)
+            self.assertIsNone(clean_stale.degraded_reason)
+
+            # async_setup_entry treats decode/version errors as malformed_store and I/O errors
+            # as ConfigEntryNotReady without marking malformed_store_at or journal_initialized.
+            cfg_file = Path(tmp) / "situareness.json"
+            cfg_file.write_text("{}", encoding="utf-8")
 
             setup_hass = types.SimpleNamespace(
                 data={},
@@ -2590,6 +2632,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
 
     async def test_outbox_overflow_latches_degraded_and_recovers_after_prune(self):
         from datetime import datetime, timedelta, timezone
+        from test_domain import c
 
         path = (
             Path(__file__).resolve().parents[2]
@@ -2621,46 +2664,70 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             spec.loader.exec_module(mod)
 
         now = datetime.now(timezone.utc)
-        ev = d.normalize(feature())
-        for key, delta in [
-            ("sent", -120),
-            ("effective", -120),
-            ("onset", 0),
-            ("expires", 1800),
-            ("ends", 1800),
-        ]:
-            ev[key] = (now + timedelta(seconds=delta)).isoformat()
-        cohere(ev)
 
-        cfg = config()
-        cfg.update(
+        def make_alerts(base_time):
+            items = []
+            for i in range(101):
+                ev = d.normalize(feature())
+                ev["id"] = f"https://api.weather.gov/alerts/ov-multi-{i}"
+                ev["instruction"] = f"Take shelter immediately zone {i}."
+                for key, delta in [
+                    ("sent", -120),
+                    ("effective", -120),
+                    ("onset", 0),
+                    ("expires", 1800),
+                    ("ends", 1800),
+                ]:
+                    ev[key] = (base_time + timedelta(seconds=delta)).isoformat()
+                items.append(cohere(ev))
+            return items
+
+        alerts = make_alerts(now)
+        raw_cfg = config()
+        raw_cfg.update(
             live_enabled=True,
             commissioning_passed=True,
-            phones=[f"mobile_app_{i}" for i in range(5001)],
+            phones=[f"mobile_app_{i}" for i in range(50)],
             tts_entity=None,
         )
+        cfg = c.validate(raw_cfg)
         services = Services()
         store = Store()
         hass = types.SimpleNamespace(data={}, services=services)
         coordinator = mod.SituarenessCoordinator(hass, cfg, store, {})
-        with patch.object(mod, "fetch", return_value=[ev]):
+
+        # Poll 1: 100 plans fit (5,000 targets); 101st plan overflows atomically and is stripped.
+        with patch.object(mod, "fetch", return_value=alerts):
             h1 = await coordinator._async_update_data()
         self.assertTrue(h1["evidence_degraded"])
         self.assertTrue(h1["output_blocked"])
         self.assertEqual(h1["degraded_reason"], "outbox_overflow")
+        self.assertEqual(len(coordinator.outbox), 5000)
         self.assertEqual(len(store.saved[-1]["outbox"]), 5000)
+        self.assertEqual(h1["planned_count"], 100)
+        self.assertEqual(h1["withheld_count"], 1)
+        self.assertEqual(h1["delivery_attempts"], 0)
+        self.assertTrue(bool(coordinator.records[alerts[0]["id"]]["actions"]))
+        self.assertTrue(bool(coordinator.records[alerts[99]["id"]]["actions"]))
+        self.assertEqual(coordinator.records[alerts[100]["id"]]["actions"], {})
         self.assertEqual(services.calls, [])
         self.assertIn("situareness_degraded", notifications)
 
-        # Reloading with acknowledge_degraded_at while the SAME overflowing alert and 5001 phones
-        # remain active within 15m does NOT self-relatch outbox_overflow and delivers the first batch.
-        ack_same_cfg = config()
-        ack_same_cfg.update(
-            live_enabled=True,
-            commissioning_passed=True,
-            phones=[f"mobile_app_{i}" for i in range(5001)],
-            tts_entity=None,
-            acknowledge_degraded_at=(now + timedelta(minutes=1)).isoformat(),
+        # Poll 2 (still degraded with same 101 alerts): 1 plan withheld, 0 delivered.
+        with patch.object(mod, "fetch", return_value=alerts):
+            h2 = await coordinator._async_update_data()
+        self.assertEqual(h2["degraded_reason"], "outbox_overflow")
+        self.assertEqual(h2["planned_count"], 0)
+        self.assertEqual(h2["withheld_count"], 1)
+        self.assertEqual(services.calls, [])
+
+        # Poll 3: Reload with valid acknowledge_degraded_at while all 101 alerts remain active within 15m.
+        # Pre-drain delivers 100 items (5000 -> 4900) and atomically queues alert 101 (4950 total).
+        ack_cfg = c.validate(
+            {
+                **raw_cfg,
+                "acknowledge_degraded_at": (now + timedelta(minutes=1)).isoformat(),
+            }
         )
 
         class SameWindowClock:
@@ -2673,31 +2740,85 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         SameWindowClock.current = now + timedelta(minutes=2)
 
         with patch.object(mod, "datetime", SameWindowClock):
-            same_window_recovered = mod.SituarenessCoordinator(
-                hass, ack_same_cfg, Store(), store.saved[-1]
+            recovered = mod.SituarenessCoordinator(
+                hass, ack_cfg, Store(), store.saved[-1]
             )
-            self.assertFalse(same_window_recovered.degraded)
-            with patch.object(mod, "fetch", return_value=[ev]):
-                h_same = await same_window_recovered._async_update_data()
-        self.assertFalse(h_same["evidence_degraded"])
-        self.assertFalse(h_same["output_blocked"])
+            self.assertFalse(recovered.degraded)
+            with patch.object(mod, "fetch", return_value=alerts):
+                h3 = await recovered._async_update_data()
+        self.assertFalse(h3["evidence_degraded"])
+        self.assertFalse(h3["output_blocked"])
+        self.assertEqual(h3["delivery_attempts"], 100)
         self.assertEqual(len(services.calls), 100)
-        self.assertEqual(len(same_window_recovered.outbox), 4900)
-        services.calls.clear()
+        self.assertEqual(len(recovered.outbox), 4950)
+        self.assertEqual(h3["planned_count"], 1)
+        self.assertEqual(h3["withheld_count"], 0)
+        self.assertTrue(bool(recovered.records[alerts[100]["id"]]["actions"]))
+
+        # Partial pre-drain failures that leave insufficient headroom re-latch outbox_overflow
+        # and surface exact pre-drain delivery_attempts / delivery_failures.
+        class PartialFlakyServices:
+            def __init__(self):
+                self.calls = []
+
+            async def async_call(self, *args, **kwargs):
+                self.calls.append(args)
+                if len(self.calls) <= 60:
+                    raise OSError("transient delivery error")
+
+        extra_alert = make_alerts(now + timedelta(minutes=3))[0]
+        extra_alert["id"] = "https://api.weather.gov/alerts/ov-extra-101"
+        extra_alert["instruction"] = "Take shelter immediately zone extra."
+        cohere(extra_alert)
+        fail_services = PartialFlakyServices()
+        fail_hass = types.SimpleNamespace(data={}, services=fail_services)
+        # Outbox currently has 4950 items; draining 100 with 60 failures leaves 4910,
+        # which cannot fit two 50-target plans (4910 + 100 > 5000).
+        extra_alert2 = make_alerts(now + timedelta(minutes=3))[1]
+        extra_alert2["id"] = "https://api.weather.gov/alerts/ov-extra-102"
+        extra_alert2["instruction"] = "Take shelter immediately zone extra 2."
+        cohere(extra_alert2)
+        retry_store = Store()
+        SameWindowClock.current = now + timedelta(minutes=4)
+        with patch.object(mod, "datetime", SameWindowClock):
+            partial_coord = mod.SituarenessCoordinator(
+                fail_hass,
+                ack_cfg,
+                retry_store,
+                {
+                    "records": recovered.records,
+                    "outbox": recovered.outbox,
+                    "initialized": True,
+                    "was_live": True,
+                },
+            )
+            with patch.object(
+                mod, "fetch", return_value=[*alerts, extra_alert, extra_alert2]
+            ):
+                h_partial = await partial_coord._async_update_data()
+        self.assertTrue(h_partial["evidence_degraded"])
+        self.assertEqual(h_partial["degraded_reason"], "outbox_overflow")
+        self.assertEqual(h_partial["delivery_attempts"], 100)
+        self.assertEqual(h_partial["delivery_failures"], 60)
+        self.assertEqual(h_partial["planned_count"], 1)
+        self.assertEqual(h_partial["withheld_count"], 1)
+        self.assertEqual(len(partial_coord.outbox), 4960)
 
         # Once outbox items expire past 15m and user reloads with valid acknowledge_degraded_at,
         # normal delivery recovers cleanly.
-        later_cfg = config()
-        later_cfg.update(
-            live_enabled=True,
-            commissioning_passed=True,
-            phones=["mobile_app_ok"],
-            tts_entity=None,
-            acknowledge_degraded_at=(now + timedelta(minutes=16)).isoformat(),
+        later_cfg = c.validate(
+            {
+                **config(),
+                "live_enabled": True,
+                "commissioning_passed": True,
+                "phones": ["mobile_app_ok"],
+                "tts_entity": None,
+                "acknowledge_degraded_at": (now + timedelta(minutes=20)).isoformat(),
+            }
         )
-        later = now + timedelta(minutes=17)
-        ev2 = d.normalize(feature())
-        ev2["id"] += "-after-overflow"
+        later = now + timedelta(minutes=21)
+        ev_later = d.normalize(feature())
+        ev_later["id"] += "-after-overflow"
         for key, delta in [
             ("sent", -120),
             ("effective", -120),
@@ -2705,26 +2826,29 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             ("expires", 1800),
             ("ends", 1800),
         ]:
-            ev2[key] = (later + timedelta(seconds=delta)).isoformat()
-        cohere(ev2)
+            ev_later[key] = (later + timedelta(seconds=delta)).isoformat()
+        cohere(ev_later)
 
         class Clock:
-            current = later
+            current = None
 
             @classmethod
             def now(cls, tz):
                 return cls.current
 
+        Clock.current = later
+        services.calls.clear()
         with patch.object(mod, "datetime", Clock):
-            recovered = mod.SituarenessCoordinator(
+            after_prune = mod.SituarenessCoordinator(
                 hass, later_cfg, Store(), store.saved[-1]
             )
-            self.assertFalse(recovered.degraded)
+            self.assertFalse(after_prune.degraded)
             self.assertNotIn("situareness_degraded", notifications)
-            with patch.object(mod, "fetch", return_value=[ev2]):
-                h2 = await recovered._async_update_data()
-        self.assertFalse(h2["evidence_degraded"])
-        self.assertFalse(h2["output_blocked"])
+            with patch.object(mod, "fetch", return_value=[ev_later]):
+                h_final = await after_prune._async_update_data()
+        self.assertFalse(h_final["evidence_degraded"])
+        self.assertFalse(h_final["output_blocked"])
+        self.assertEqual(h_final["withheld_count"], 0)
         self.assertEqual(len(services.calls), 1)
 
     async def test_degraded_notification_fires_once_and_clean_save_skips_corrupt_cleanup(

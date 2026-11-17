@@ -998,6 +998,63 @@ class Policy(unittest.TestCase):
         self.assertEqual(res_u3[u3["id"]]["state"], "active")
         self.assertEqual([pl["id"] for pl in plans_u3], [u3["id"]])
 
+    def test_reconcile_thousand_record_bounded_latency(self):
+        import time
+
+        prior = {}
+        for i in range(500):
+            eid = f"https://api.weather.gov/alerts/scale-act-{i}"
+            prior[eid] = {
+                "state": "active" if i < 250 else "ended_or_absent",
+                "fingerprint": f"fp-{i}",
+                "actions": {f"fp-{i}": ["new_york_ny"]},
+                "lineage": [eid],
+                "sent": (NOW - timedelta(minutes=30)).isoformat(),
+                "expires": (NOW + timedelta(hours=1)).isoformat(),
+                "ends": (NOW + timedelta(hours=1)).isoformat(),
+                "updated": (NOW - timedelta(minutes=10)).isoformat(),
+            }
+        for i in range(250):
+            target_id = f"https://api.weather.gov/alerts/scale-t-{i}"
+            cancel_id = f"https://api.weather.gov/alerts/scale-c-{i}"
+            target_ev = cap_event(f"scale-t-{i}", -20, message_type="Alert")
+            cancel_ev = cap_event(f"scale-c-{i}", -10, [target_ev], "Cancel")
+            prior[target_id] = {
+                "state": "cancelled",
+                "actions": {},
+                "lineage": [target_id, cancel_id],
+                "cap_identity": target_ev["cap_identity"],
+                "cap_references": [],
+                "cancel_message": False,
+                "cancelled_at": cancel_ev["sent"],
+                "sent": target_ev["sent"],
+                "expires": target_ev["expires"],
+                "ends": target_ev["ends"],
+                "updated": (NOW - timedelta(minutes=5)).isoformat(),
+            }
+            prior[cancel_id] = {
+                "state": "cancelled",
+                "actions": {},
+                "lineage": [cancel_id, target_id],
+                "cap_identity": cancel_ev["cap_identity"],
+                "cap_references": cancel_ev["reference_identities"],
+                "cancel_message": True,
+                "cancellation_expired": False,
+                "sent": cancel_ev["sent"],
+                "expires": cancel_ev["expires"],
+                "ends": cancel_ev["ends"],
+                "updated": (NOW - timedelta(minutes=5)).isoformat(),
+            }
+        current = [
+            cap_event(f"scale-act-{i}", -2, message_type="Alert") for i in range(100)
+        ]
+        cfg = config()
+        start = time.perf_counter()
+        records, _ = d.reconcile(prior, current, cfg, NOW)
+        elapsed = time.perf_counter() - start
+        self.assertLessEqual(len(records), 1000)
+        self.assertLess(elapsed, 0.5)
+
     def test_normalize_oversized_and_non_string_properties(self):
         oversized = feature()
         oversized["properties"]["instruction"] = "x" * 10001
@@ -1810,6 +1867,25 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         body["features"] = [feature()] * 1001
         with self.assertRaises(ValueError):
             await collector.fetch(Session(Response(json.dumps(body).encode())), ["NY"])
+
+    async def test_null_properties_with_valid_feature_id_quarantines_locally(self):
+        import json
+
+        bad = {
+            "type": "Feature",
+            "id": "https://api.weather.gov/alerts/null-props",
+            "properties": None,
+            "geometry": None,
+        }
+        valid = feature()
+        body = {"type": "FeatureCollection", "features": [bad, valid]}
+        events = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertFalse(events.quarantine_ambiguous)
+        self.assertEqual(events.quarantined, 1)
+        self.assertEqual(events.quarantined_lineages, [[bad["id"]]])
+        self.assertEqual([e["id"] for e in events], [valid["id"]])
 
     async def test_fetch_and_failures(self):
         import json

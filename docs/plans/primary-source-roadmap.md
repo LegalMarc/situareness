@@ -19,9 +19,9 @@ There is no defensible single guarantee of the earliest warning across every haz
 
 ## Current baseline and remaining gaps
 
-Implemented: bundled NWS/USGS/BBC adapters, Chrome worker persistence and room reuse, configurable regional associations, source freshness and bounded retention, browser settings import/export, a source-research skill and catalog validator, and an independent NWS Home Assistant integration with conservative qualification and gated delivery.
+Implemented: bundled NWS/USGS/BBC adapters, Chrome worker persistence and room reuse, configurable regional associations, source freshness and bounded retention, browser settings import/export, a source-research skill and catalog validator, and an independent NWS Home Assistant integration with conservative qualification, gated delivery, output-blocked degraded mode, local `situareness_degraded` persistent notifications, and load-time `acknowledge_degraded_at` degraded-state resets.
 
-Still required before reliance: authenticated household inventory, private exposure and rule configuration, actual phone/speaker commissioning, sustained shadow observation, automatic health notifications, acknowledgment and controlled repeats. The room currently has no authenticated Home Assistant health bridge. Zone-only weather warnings cannot qualify using the current point-and-polygon policy. Broader non-weather and international critical policies are not implemented.
+Still required before reliance: authenticated household inventory, private exposure and rule configuration, actual phone/speaker commissioning, sustained shadow observation, external/push maintenance notifications for a stale or dead collector, recipient alert acknowledgment, and controlled repeats. The room currently has no authenticated Home Assistant health bridge. Zone-only weather warnings cannot qualify using the current point-and-polygon policy. Broader non-weather and international critical policies are not implemented.
 
 ## Source order and evidence
 

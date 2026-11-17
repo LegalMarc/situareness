@@ -2,6 +2,23 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 tenth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `221ed9b` (`run_id`: `20261117T203507Z-d741fd`, 316.3s standards and 287.4s specification) reported **0 Critical, 0 High, and 0 CAP/cancellation, browser/UI, packaging, catalog, or live/shadow gate findings**, leaving 8 unique Home Assistant, test, and doc findings (1 Medium, 5 Low, 2 Nit).
+
+All 8 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor contract/doc/report updates:
+- **`SIT-01` / `SPEC-HA-01`**: Implemented whole-plan atomic queueing in `_queue_outbox_plans()` up to `5,000` targets with conditional single-batch pre-drain (`deliverable_existing` headroom check) and `_strip_withheld_actions()` cleanup so only completely queued plans retain action fingerprints, and documented the ~1,500-target/15m delivery bound.
+- **`SPEC-HA-02`**: Scoped quarantine to `[feature_id, *valid_refs]` whenever `feature_id` is extractable even when `properties` is non-object/`null`.
+- **`STD-HA-03` / `SIT-07`**: Added `PERSISTED_DEGRADED_REASONS` validation in `_valid_persisted_store()` and fixed operator precedence in coordinator `degraded_reason` restoration.
+- **`SIT-02`**: Added `"withheld_count"` across coordinator health snapshots (`_healthy_snapshot`, `_stopped_health`, `_degraded_health`, `_persist_degraded_poll`) alongside queued `planned_count` and pre-drain delivery counters on initial `outbox_overflow`.
+- **`SIT-03`**: Eliminated the double `deepcopy` in `domain.py` `reconcile()`, used `itertools.islice(..., 100)` in `_deliver_outbox_batch()`, replaced the unvalidated 5,001-phone overflow test with a validated 50-phone × 101-alert multi-plan test (eliminating asyncio slow-callback warnings), and added a `<0.5s` 1,000-record `reconcile` benchmark (`0.0221s` measured).
+- **`SIT-04` & `SIT-05`**: Synchronized `docs/CONTEXT.md` and `docs/plans/primary-source-roadmap.md` with degraded/output-blocked mode and `situareness_degraded` notifications; consolidated normative CAP/degraded-mode rules into `docs/spec/o3-mvp.md#home-assistant` with concise operator summaries and cross-links in `docs/ha/README.md`, `home-assistant/README.md`, and `docs/reference/cap-cancellation.md`.
+- **`SIT-06`**: Removed `ImportError`/`hasattr`/`isinstance` test-compatibility shims from `custom_components/situareness/__init__.py` and moved default `persistent_notification` and mock `hass` attributes into `tests/ha/test_coordinator.py`.
+
+The complete local gates passed: 43 Node, 87 stdlib HA (`-W error`, zero slow-callback warnings), 7 source-skill, 21 Chromium browser, and 10 actual-HA tests (168 total), plus static checks, Ruff lint/format, and two identical deterministic ZIP builds (`823de6d0...` extension, `8829a299...` HA). Actual HA reports five known upstream deprecations without suppression. Live anonymous smoke (`node tools/live-browser-smoke.mjs`) passed at `2026-11-17T21:44:06.766Z` with HTTP 200 across NWS (0 alerts), USGS (8 items), BBC World (27 items), and BBC US & Canada (23 items).
+
+Next: run `audit_private.py`, commit and push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, run independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews, and once both pass, run a fresh independent Opus `adversarial` review on that immutable candidate. Household outputs remain disabled and no commissioning occurred. `main` remains at `847d0e5`; once all release gates pass, fast-forward `main` and advance roadmap **S0** and **S1**.
+
 ## Continuation update: November 17 ninth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `c0a909c` (`run_id`: `20261117T194649Z-7a1803`, 329.5s standards and 390.8s specification) reported **0 Critical, 0 High, and 0 browser/UI/packaging/catalog/output-gate findings**, leaving 10 Home Assistant and documentation findings (3 Medium, 3 Low, 4 Nit).

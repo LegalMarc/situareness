@@ -150,7 +150,7 @@ async def fetch(session, states):
                     if isinstance(properties, dict)
                     else None
                 )
-                if feature_id and isinstance(properties, dict):
+                if feature_id:
                     refs = raw_refs if isinstance(raw_refs, list) else []
                     valid_ref_ids = [
                         ref_id
@@ -163,8 +163,10 @@ async def fetch(session, states):
                         and ref_id.startswith("https://api.weather.gov/alerts/")
                     ]
                     refs_valid = (
-                        raw_refs is None or isinstance(raw_refs, list)
-                    ) and len(valid_ref_ids) == len(refs)
+                        isinstance(properties, dict)
+                        and (raw_refs is None or isinstance(raw_refs, list))
+                        and len(valid_ref_ids) == len(refs)
+                    )
                     fits = add_quarantined_lineage(
                         [feature_id, *valid_ref_ids], is_cancel=is_cancel
                     )

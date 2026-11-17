@@ -1,21 +1,19 @@
 """Independent NWS monitoring for Home Assistant."""
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 import json
 import logging
 from pathlib import Path
 
+from homeassistant.components import persistent_notification
 from homeassistant.const import Platform
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-
-try:
-    from homeassistant.components import persistent_notification
-except ImportError:
-    persistent_notification = None
 from .collector import fetch
 from .config import validate
 from .const import DOMAIN
@@ -34,6 +32,13 @@ from .domain import (
 
 _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.SENSOR]
+PERSISTED_DEGRADED_REASONS = {
+    "cancellation_evidence_overflow",
+    "outbox_overflow",
+    "malformed_cancellation",
+    "conflicting_cancellation",
+    "journal_lost",
+}
 
 
 def _read_config(path):
@@ -62,7 +67,9 @@ def _valid_persisted_store(persisted):
         if val is not None and (not isinstance(val, str) or timestamp(val) is None):
             return False
     reason = persisted.get("degraded_reason")
-    if reason is not None and not isinstance(reason, str):
+    if reason is not None and (
+        not isinstance(reason, str) or reason not in PERSISTED_DEGRADED_REASONS
+    ):
         return False
     if persisted.get("initialized") is True and "records" not in persisted:
         return False
@@ -341,7 +348,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             )
             self.degraded = persisted.get("degraded") is True
             self.degraded_reason = (
-                persisted.get("degraded_reason") or "cancellation_evidence_overflow"
+                (persisted.get("degraded_reason") or "cancellation_evidence_overflow")
                 if self.degraded
                 else None
             )
@@ -427,12 +434,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
         self.was_live = live(self.config)
         if self._needs_corrupt_cleanup:
-            if (
-                self._entry is not None
-                and hasattr(self.hass, "async_add_executor_job")
-                and hasattr(self.hass, "config")
-                and hasattr(self.hass.config, "path")
-            ):
+            if self._entry is not None:
                 await self.hass.async_add_executor_job(
                     _clear_corrupt_store_backups,
                     self.hass.config.path(".storage"),
@@ -454,10 +456,6 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.hass.config_entries.async_update_entry(self._entry, data=new_data)
 
     def _sync_degraded_notification(self, quarantine_ambiguous=False):
-        if persistent_notification is None or not isinstance(
-            getattr(self.hass, "data", None), dict
-        ):
-            return
         if self.degraded:
             state = self.degraded_reason
             if self._notified_degraded_state != state:
@@ -519,6 +517,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         *,
         triggered_now=False,
         recoverable_prior_conflict=False,
+        planned_count=0,
+        withheld_count=0,
+        delivery_attempts=0,
+        delivery_failures=0,
     ):
         """Expose a redacted durable degraded state without delivering."""
         previous = getattr(self, "data", None) or {}
@@ -589,12 +591,13 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "degraded_until": self.degraded_until,
             "shadow": not live(self.config),
             "events": event_summaries,
-            "planned_count": 0,
+            "planned_count": planned_count,
+            "withheld_count": withheld_count,
             "pending_count": len(self.outbox),
             "deliverable_count": 0,
             "suspended_count": len(self.outbox),
-            "delivery_attempts": 0,
-            "delivery_failures": 0,
+            "delivery_attempts": delivery_attempts,
+            "delivery_failures": delivery_failures,
         }
 
     def _stopped_health(self):
@@ -618,6 +621,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "shadow": not live(self.config),
             "events": [],
             "planned_count": 0,
+            "withheld_count": 0,
             "pending_count": len(self.outbox),
             "deliverable_count": 0,
             "suspended_count": len(self.outbox),
@@ -710,6 +714,20 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.degraded_at = now.isoformat()
         self.degraded_until = new_until.isoformat()
 
+    @staticmethod
+    def _strip_withheld_actions(records, plans, groups, now):
+        withheld_keys = {
+            (groups.get(plan["id"]), plan["fingerprint"]) for plan in plans
+        }
+        now_iso = now.isoformat()
+        for eid, record in records.items():
+            if record.get("updated") == now_iso:
+                rec_actions = record.get("actions")
+                if isinstance(rec_actions, dict):
+                    for fp in list(rec_actions):
+                        if (groups.get(eid), fp) in withheld_keys:
+                            rec_actions.pop(fp, None)
+
     async def _persist_degraded_poll(
         self,
         records,
@@ -722,17 +740,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         *,
         triggered_now=False,
         recoverable_prior_conflict=False,
+        planned_count=0,
+        delivery_attempts=0,
+        delivery_failures=0,
     ):
-        withheld_keys = {
-            (groups.get(plan["id"]), plan["fingerprint"]) for plan in plans
-        }
-        for eid, record in records.items():
-            if record.get("updated") == now.isoformat():
-                rec_actions = record.get("actions")
-                if isinstance(rec_actions, dict):
-                    for fp in list(rec_actions):
-                        if (groups.get(eid), fp) in withheld_keys:
-                            rec_actions.pop(fp, None)
+        self._strip_withheld_actions(records, plans, groups, now)
         self.last_degraded_poll = now.isoformat()
         try:
             await self._save(records, outbox, list(self.outcomes))
@@ -748,15 +760,94 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             now=now,
             triggered_now=triggered_now,
             recoverable_prior_conflict=recoverable_prior_conflict,
+            planned_count=planned_count,
+            withheld_count=len(plans),
+            delivery_attempts=delivery_attempts,
+            delivery_failures=delivery_failures,
+        )
+
+    async def _queue_outbox_plans(
+        self, records, plans, outbox, candidate_events, groups, now
+    ):
+        """Queue plans atomically up to 5,000 targets; drain pending deliverable work first if needed."""
+        attempts = failures = 0
+        if len(outbox) > 5000:
+            return outbox[:5000], True, list(plans), records, attempts, failures, False
+        if not live(self.config) or not plans:
+            return outbox, False, [], records, attempts, failures, False
+
+        def build_planned_items(current_outbox, current_records):
+            existing = {
+                _outbox_signature(groups, item, current_records)
+                for item in current_outbox
+            }
+            seen_in_plans = set(existing)
+            planned_items = []
+            projected_count = len(current_outbox)
+            for plan in plans:
+                new_items = []
+                for item in targets(plan, self.config, now):
+                    sig = _outbox_signature(groups, item, current_records)
+                    if sig not in seen_in_plans:
+                        new_items.append((item, sig))
+                        seen_in_plans.add(sig)
+                planned_items.append((plan, new_items))
+                projected_count += len(new_items)
+            return existing, planned_items, projected_count
+
+        existing, planned_items, projected_count = build_planned_items(outbox, records)
+        deliverable_existing = sum(
+            1 for x in outbox if pending_valid(x, records, self.config, now)
+        )
+        already_delivered = False
+        if (
+            projected_count > 5000
+            and deliverable_existing > 0
+            and projected_count - min(100, deliverable_existing) <= 5000
+        ):
+            pre_drain_records = deepcopy(records)
+            self._strip_withheld_actions(records, plans, groups, now)
+            await self._save(records, outbox, list(self.outcomes))
+            attempts, failures = await self._deliver_outbox_batch(candidate_events, now)
+            already_delivered = True
+            records = pre_drain_records
+            outbox = list(self.outbox)
+            existing, planned_items, _ = build_planned_items(outbox, records)
+
+        outbox_overflow = False
+        dropped_plans = []
+        for plan, new_items in planned_items:
+            if not outbox_overflow and len(outbox) + len(new_items) <= 5000:
+                for item, sig in new_items:
+                    outbox.append(item)
+                    existing.add(sig)
+            else:
+                outbox_overflow = True
+                dropped_plans.append(plan)
+        return (
+            outbox,
+            outbox_overflow,
+            dropped_plans,
+            records,
+            attempts,
+            failures,
+            already_delivered,
         )
 
     async def _deliver_outbox_batch(self, candidate_events, now):
         """Deliver one bounded poll batch (max 100 targets, 30s deadline)."""
         attempts = failures = 0
         # Each completed attempt is persisted. A crash between service call and save may duplicate it.
-        batch = [
-            x for x in self.outbox if pending_valid(x, self.records, self.config, now)
-        ][:100]
+        batch = list(
+            islice(
+                (
+                    x
+                    for x in self.outbox
+                    if pending_valid(x, self.records, self.config, now)
+                ),
+                100,
+            )
+        )
         by_id = {event["id"]: event for event in candidate_events}
         deadline = now + timedelta(seconds=30)
         for offset in range(0, len(batch), 10):
@@ -878,6 +969,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 for e in candidate_events[:25]
             ],
             "planned_count": len(plans),
+            "withheld_count": 0,
             "pending_count": len(self.outbox),
             "deliverable_count": deliverable,
             "suspended_count": len(self.outbox) - deliverable,
@@ -1029,23 +1121,22 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     triggered_now=(degraded_trigger is not None),
                     recoverable_prior_conflict=recoverable_prior_conflict,
                 )
-            outbox_overflow = False
-            if live(self.config):
-                existing = {_outbox_signature(groups, item, records) for item in outbox}
-                for plan in plans:
-                    for item in targets(plan, self.config, now):
-                        sig = _outbox_signature(groups, item, records)
-                        if sig not in existing:
-                            outbox.append(item)
-                            existing.add(sig)
-            if len(outbox) > 5000:
-                outbox = outbox[:5000]
-                outbox_overflow = True
+            (
+                outbox,
+                outbox_overflow,
+                dropped_plans,
+                records,
+                attempts,
+                failures,
+                already_delivered,
+            ) = await self._queue_outbox_plans(
+                records, plans, outbox, candidate_events, groups, now
+            )
             if outbox_overflow:
                 self._latch_degraded("outbox_overflow", now)
                 return await self._persist_degraded_poll(
                     records,
-                    [],
+                    dropped_plans,
                     outbox,
                     groups,
                     events,
@@ -1053,10 +1144,16 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     now,
                     triggered_now=True,
                     recoverable_prior_conflict=recoverable_prior_conflict,
+                    planned_count=len(plans) - len(dropped_plans),
+                    delivery_attempts=attempts,
+                    delivery_failures=failures,
                 )
             self.last_degraded_poll = None
             await self._save(records, outbox, list(self.outcomes))
-            attempts, failures = await self._deliver_outbox_batch(candidate_events, now)
+            if not already_delivered:
+                attempts, failures = await self._deliver_outbox_batch(
+                    candidate_events, now
+                )
         except UpdateFailed:
             raise
         except Exception as err:
@@ -1100,13 +1197,8 @@ async def async_setup_entry(hass, entry):
             persisted = ["unreadable"]
         else:
             raise ConfigEntryNotReady(f"Could not load persisted store: {err}") from err
-    if (
-        persisted is None
-        and hasattr(hass, "config")
-        and hasattr(hass.config, "path")
-        and await hass.async_add_executor_job(
-            _has_corrupt_store_backup, hass.config.path(".storage"), prefix
-        )
+    if persisted is None and await hass.async_add_executor_job(
+        _has_corrupt_store_backup, hass.config.path(".storage"), prefix
     ):
         has_corrupt_backup = True
         persisted = ["corrupt_json"]
@@ -1125,10 +1217,7 @@ async def async_setup_entry(hass, entry):
 
 
 def _dismiss_degraded_notification(hass):
-    if persistent_notification is not None and isinstance(
-        getattr(hass, "data", None), dict
-    ):
-        persistent_notification.async_dismiss(hass, "situareness_degraded")
+    persistent_notification.async_dismiss(hass, "situareness_degraded")
 
 
 async def async_unload_entry(hass, entry):
@@ -1145,11 +1234,6 @@ async def async_remove_entry(hass, entry):
     _dismiss_degraded_notification(hass)
     prefix = f"{DOMAIN}.{entry.entry_id}"
     await Store(hass, 1, prefix, private=True).async_remove()
-    if (
-        hasattr(hass, "async_add_executor_job")
-        and hasattr(hass, "config")
-        and hasattr(hass.config, "path")
-    ):
-        await hass.async_add_executor_job(
-            _clear_corrupt_store_backups, hass.config.path(".storage"), prefix
-        )
+    await hass.async_add_executor_job(
+        _clear_corrupt_store_backups, hass.config.path(".storage"), prefix
+    )

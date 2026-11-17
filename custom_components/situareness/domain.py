@@ -1074,7 +1074,8 @@ def reconcile(
 ):
     """Reconcile bounded history; quarantined inputs cannot end unrelated records."""
     graph_events = list(events if graph_events is None else graph_events)
-    prior = deepcopy(previous or {})
+    records = deepcopy(previous or {})
+    prior = {eid: dict(record) for eid, record in records.items()}
     events = resolve_candidates(prior, events, graph_events, now=now)
     # Cancels are source evidence even when a later message references them.
     present = {event["id"] for event in events}
@@ -1085,7 +1086,6 @@ def reconcile(
         and event.get("status") == "Actual"
         and event.get("message_type") == "Cancel"
     ]
-    records = deepcopy(prior)
     plans = []
     invalid_ids = _invalid_graph_ids(prior, graph_events, now=now)
 
