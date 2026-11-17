@@ -3656,3 +3656,60 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertIn(".storage", mal_msg)
             h_mal = await mal_coord._async_update_data()
             self.assertTrue(h_mal["acknowledge_rejected"])
+
+            # Validating and loading naive/future acknowledge_degraded_at does not fail setup;
+            # naive strings keep stored ISO state valid, and future timestamps are consumed immediately
+            # on entry.data even when no store save occurs before a later restart.
+            from test_domain import c
+
+            naive_cfg = c.validate(
+                {**cfg, "acknowledge_degraded_at": "2026-11-17T10:00:00"}
+            )
+            naive_entry = types.SimpleNamespace(entry_id="ack-naive", data={})
+            naive_hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+                ),
+            )
+            naive_store = Store()
+            naive_coord = mod.SituarenessCoordinator(
+                naive_hass, naive_cfg, naive_store, persisted_deg, entry=naive_entry
+            )
+            self.assertTrue(naive_coord.degraded)
+            self.assertTrue(naive_coord.acknowledge_rejected)
+            self.assertNotIn("acknowledged_degraded_at", naive_entry.data)
+            self.assertEqual(
+                naive_coord.acknowledged_degraded_at,
+                persisted_deg["acknowledged_degraded_at"],
+            )
+            naive_msg = notifications["situareness_degraded"]["message"]
+            self.assertIn("missing timezone offset", naive_msg)
+            with patch.object(mod, "fetch", return_value=[]):
+                await naive_coord._async_update_data()
+            self.assertTrue(mod._valid_persisted_store(naive_store.saved[-1]))
+
+            future_ack = (t0 + timedelta(minutes=10)).isoformat()
+            future_cfg = c.validate({**cfg, "acknowledge_degraded_at": future_ack})
+            fut_entry = types.SimpleNamespace(entry_id="ack-future", data={})
+            fut_hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+                ),
+            )
+            fut_coord = mod.SituarenessCoordinator(
+                fut_hass, future_cfg, Store(), persisted_deg, entry=fut_entry
+            )
+            self.assertTrue(fut_coord.degraded)
+            self.assertTrue(fut_coord.acknowledge_rejected)
+            self.assertEqual(fut_entry.data.get("acknowledged_degraded_at"), future_ack)
+            # No _save() occurred; advance clock past future_ack and reload with original persisted_deg.
+            Clock.current = t0 + timedelta(minutes=15)
+            fut_reload = mod.SituarenessCoordinator(
+                fut_hass, future_cfg, Store(), persisted_deg, entry=fut_entry
+            )
+            self.assertTrue(fut_reload.degraded)
+            self.assertTrue(fut_reload.acknowledge_rejected)

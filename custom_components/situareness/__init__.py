@@ -393,9 +393,20 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             and self.degraded_reason == "journal_lost"
             and (persisted is None or persisted == {})
         )
+        entry_ack = (
+            self._entry.data.get("acknowledged_degraded_at")
+            if self._entry is not None
+            else None
+        )
+        if (
+            self.acknowledged_degraded_at is None
+            and isinstance(entry_ack, str)
+            and timestamp(entry_ack) is not None
+        ):
+            self.acknowledged_degraded_at = entry_ack
         self.acknowledge_rejected = False
         self._ack_cleared_on_load = False
-        self._try_acknowledge(datetime.now(timezone.utc))
+        self._try_acknowledge(datetime.now(timezone.utc), entry_ack=entry_ack)
         self.session = async_get_clientsession(hass)
         self._refresh_lock = asyncio.Lock()
         self._fetch_task = None
@@ -404,29 +415,43 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self._checked_notification_clear = False
         self._sync_degraded_notification()
 
-    def _try_acknowledge(self, current_now):
+    def _record_consumed_ack(self, ack):
+        self.acknowledged_degraded_at = ack
+        if (
+            self._entry is not None
+            and self._entry.data.get("acknowledged_degraded_at") != ack
+        ):
+            self.hass.config_entries.async_update_entry(
+                self._entry,
+                data={**self._entry.data, "acknowledged_degraded_at": ack},
+            )
+
+    def _try_acknowledge(self, current_now, entry_ack=None):
+        if entry_ack is None and self._entry is not None:
+            entry_ack = self._entry.data.get("acknowledged_degraded_at")
         ack = self.config.get("acknowledge_degraded_at")
         if ack is None:
             self.acknowledge_rejected = False
             return False
+        ack_ts = timestamp(ack)
+        if ack_ts is None:
+            self.acknowledge_rejected = bool(self.degraded)
+            return False
         if not self.degraded:
-            self.acknowledged_degraded_at = ack
+            self._record_consumed_ack(ack)
             self.acknowledge_rejected = False
             return False
-        if (
-            self.degraded_reason == "malformed_store"
-            or ack == self.acknowledged_degraded_at
+        if self.degraded_reason == "malformed_store" or ack in (
+            self.acknowledged_degraded_at,
+            entry_ack,
         ):
+            if self.degraded_reason != "malformed_store":
+                self._record_consumed_ack(ack)
             self.acknowledge_rejected = True
             return False
         degraded_at_ts = timestamp(self.degraded_at)
-        ack_ts = timestamp(ack)
-        if (
-            degraded_at_ts is None
-            or ack_ts is None
-            or not (degraded_at_ts <= ack_ts <= current_now)
-        ):
-            self.acknowledged_degraded_at = ack
+        if degraded_at_ts is None or not (degraded_at_ts <= ack_ts <= current_now):
+            self._record_consumed_ack(ack)
             self.acknowledge_rejected = True
             return False
         self.acknowledged_degraded_at = ack
@@ -470,10 +495,17 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
             self._needs_corrupt_cleanup = False
         clear_lost_at = not preserve_lost_at
+        needs_entry_ack = (
+            self._entry is not None
+            and isinstance(self.acknowledged_degraded_at, str)
+            and self._entry.data.get("acknowledged_degraded_at")
+            != self.acknowledged_degraded_at
+        )
         if self._entry is not None and (
             self._entry.data.get("journal_initialized") is not True
             or "malformed_store_at" in self._entry.data
             or (clear_lost_at and "journal_lost_at" in self._entry.data)
+            or needs_entry_ack
         ):
             new_data = {
                 k: v
@@ -482,6 +514,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 and (not clear_lost_at or k != "journal_lost_at")
             }
             new_data["journal_initialized"] = True
+            if isinstance(self.acknowledged_degraded_at, str):
+                new_data["acknowledged_degraded_at"] = self.acknowledged_degraded_at
             self.hass.config_entries.async_update_entry(self._entry, data=new_data)
 
     def _sync_degraded_notification(self, quarantine_ambiguous=False):
@@ -491,8 +525,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if self._notified_degraded_state != state:
                 rej_note = (
                     "Configured acknowledge_degraded_at did not clear this state "
-                    "(malformed_store cannot be acknowledged, or acknowledge_degraded_at preceded degraded_at, "
-                    "was already consumed, or the triggering condition remained active and re-latched). "
+                    "(malformed_store cannot be acknowledged, or acknowledge_degraded_at was invalid/missing timezone offset, "
+                    "in the future, preceded degraded_at, was already consumed, or the triggering condition remained active and re-latched). "
                     if self.acknowledge_rejected
                     else ""
                 )

@@ -327,6 +327,18 @@ async def test_real_ha_degraded_collection_withholds_output_and_recovers_on_ack(
     assert state.attributes["output_blocked"] is True
     assert calls == []
 
+    # Reload with a future acknowledge_degraded_at stays loaded in degraded mode (not SETUP_RETRY)
+    # and exposes acknowledge_rejected=True while keeping situareness_degraded raised.
+    future_ack = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    config_path.write_text(json.dumps({**cfg, "acknowledge_degraded_at": future_ack}))
+    await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    state = hass.states.get("sensor.situareness_monitoring")
+    assert state is not None and state.state == "unknown"
+    assert state.attributes["evidence_degraded"] is True
+    assert state.attributes["acknowledge_rejected"] is True
+    assert "situareness_degraded" in hass.data.get("persistent_notification", {})
+
     # Reload with a valid non-future acknowledge_degraded_at (>= degraded_at) restores normal output.
     ack_time = datetime.now(timezone.utc).isoformat()
     assert state.attributes["degraded_at"] <= ack_time

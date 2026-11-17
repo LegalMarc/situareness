@@ -1,6 +1,5 @@
 """Validate private administrator-owned configuration."""
 
-from datetime import datetime, timezone
 import math
 import re
 from .domain import timestamp
@@ -104,13 +103,15 @@ def validate(raw, now=None):
             raise ValueError("live gates must be boolean")
     ack = raw.get("acknowledge_degraded_at")
     if ack is not None:
-        ack_ts = timestamp(ack) if isinstance(ack, str) else None
-        cutoff = now if now is not None else datetime.now(timezone.utc)
-        if ack_ts is None or ack_ts > cutoff:
-            raise ValueError(
-                "acknowledge_degraded_at must be a non-future timezone-aware ISO-8601 timestamp"
-            )
-        ack = ack_ts.isoformat()
+        if (
+            not isinstance(ack, str)
+            or not ack.strip()
+            or len(ack) > 100
+            or any(ord(ch) < 32 for ch in ack)
+        ):
+            raise ValueError("acknowledge_degraded_at must be a string")
+        ack_ts = timestamp(ack)
+        ack = ack_ts.isoformat() if ack_ts is not None else ack.strip()
     return {
         "states": list(dict.fromkeys(states)),
         "locations": locations,

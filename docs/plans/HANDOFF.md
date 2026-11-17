@@ -2,6 +2,17 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 fourteenth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `c81fb7f` (`run_id`: `20261117T224454Z-a299b9`, 217.6s standards and 373.9s specification) reported **0 Critical, 0 High, and zero room/catalog/quarantine/overflow/lifecycle defects**, leaving only 3 unique HA/documentation findings (`HA-ACK-01`/`SPEC-HA-01`/`DOC-HA-02` Medium/Low, `HA-DOC-02` Low, `SPEC-HA-03` Low).
+
+All 3 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor contract/README/report updates:
+- **`HA-ACK-01` / `SPEC-HA-01` / `DOC-HA-02`**: Restricted `config.validate()` to basic string/length/control-character checks on `acknowledge_degraded_at` and handled unparseable/timezone-naive/future/premature/reused strings cleanly inside `SituarenessCoordinator._try_acknowledge()` (keeping monitoring online, setting `acknowledge_rejected: true`, updating `situareness_degraded`, and recording valid ISO timestamp consumption in `entry.data` and store so retries cannot auto-apply it later), with full unit (`c.validate` -> coordinator) and real-HA reload coverage.
+- **`HA-DOC-02`**: Clarified in `home-assistant/README.md` that exceeding 5,000 quarantined non-Cancel IDs sets poll-scoped `quarantine_ambiguous` while `malformed_cancellation`/`conflicting_cancellation` apply to unrecoverable or over-cap `Actual Cancel` / conflicting cancellation evidence.
+- **`SPEC-HA-03`**: Restricted `dropped_groups` in `domain.py` `_bound_records()` to `eid in protected` so unprotected old history cannot extend `dropped_horizon` / `degraded_until`, and verified an unprotected 30-day record does not inflate `dropped_horizon`.
+
+Next: run complete local gates (`43` Node, `89` stdlib HA, `7` skill, `21` Chromium, `11` actual HA = `171` total), deterministic packaging (`823de6d0...` extension, `026b10b4...` HA), live anonymous smoke (`2026-11-17T22:57:35.151Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, and run Opus `axes` + fresh `adversarial` reviews. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 17 thirteenth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `6236ea8` (`run_id`: `20261117T223104Z-7fe723`, 215.8s standards and 202.2s specification) reported **0 Critical, 0 High, and zero room/live-gate/routing/quarantine/overflow defects**, leaving 7 HA/documentation findings (`SIT-HA-ACK-01`/`SIT-HA-02` Medium/Low, `SIT-DOC-01` Medium, `SIT-HA-CANCEL-02` Low, `SIT-HA-STORE-03` Low, `SIT-DOC-RETRY-04` Low, `SIT-NIT-05` Nit, `SIT-DOC-03` Nit).

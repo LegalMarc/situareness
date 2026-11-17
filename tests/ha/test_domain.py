@@ -786,18 +786,18 @@ class Policy(unittest.TestCase):
         self.assertEqual(
             validated["acknowledge_degraded_at"], "2026-11-17T15:00:00+00:00"
         )
+        future_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+        for passthrough in ("2026-11-17T10:00:00", "not-a-timestamp", future_iso):
+            parsed = c.validate({"acknowledge_degraded_at": passthrough})
+            self.assertEqual(parsed["acknowledge_degraded_at"], passthrough)
         for raw in (
             {"phones": ["notify.bad"]},
             {"live_enabled": "true"},
             {"locations": {"x": {"point": [999, 0]}}},
             {"states": ["NY&bad=1"]},
-            {"acknowledge_degraded_at": "2026-11-17T10:00:00"},
-            {
-                "acknowledge_degraded_at": (
-                    datetime.now(timezone.utc) + timedelta(minutes=1)
-                ).isoformat()
-            },
             {"acknowledge_degraded_at": 123},
+            {"acknowledge_degraded_at": "   "},
+            {"acknowledge_degraded_at": "2026-11-17T10:00:00Z\n"},
         ):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 c.validate(raw)
@@ -1802,8 +1802,10 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p["id"] for p in plans_b], [sibling["id"]])
 
         # Overflow prioritizes Cancel / state=="cancelled" over non-cancel protected records
-        # and propagates dropped_horizon across evicted components.
-        long_expiry = (NOW + timedelta(days=3)).isoformat()
+        # and computes dropped_horizon strictly from dropped protected/cancellation groups.
+        protected_expiry = (NOW + timedelta(days=3)).isoformat()
+        unprotected_expiry = (NOW + timedelta(days=30)).isoformat()
+        older_updated = (NOW - timedelta(seconds=1)).isoformat()
         overflow_prior = {}
         for i in range(1002):
             eid = f"https://api.weather.gov/alerts/ov-{i}"
@@ -1812,8 +1814,14 @@ class Collector(unittest.IsolatedAsyncioTestCase):
                 "cancel_message": i < 100,
                 "lineage": [eid],
                 "sent": NOW.isoformat(),
-                "expires": long_expiry if i == 1001 else NOW.isoformat(),
-                "updated": NOW.isoformat(),
+                "expires": (
+                    protected_expiry
+                    if i == 599
+                    else unprotected_expiry
+                    if i == 1001
+                    else NOW.isoformat()
+                ),
+                "updated": older_updated if i == 599 else NOW.isoformat(),
             }
         # Put all records in protected via a shared cancel component or 1002 active/cancelled records:
         # 100 Cancel + 500 cancelled + 402 current graph events -> 1002 protected.

@@ -1039,7 +1039,9 @@ def _bound_records(
         all_members_by_group = {}
         for eid in records:
             all_members_by_group.setdefault(groups.get(eid), []).append(eid)
-        dropped_groups = {groups.get(eid) for eid, _ in dropped_items}
+        dropped_groups = {
+            groups.get(eid) for eid, _ in dropped_items if eid in protected
+        }
         dropped_component_horizons = [
             h
             for g in dropped_groups
