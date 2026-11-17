@@ -86,3 +86,20 @@ Candidate `847d0e56853f4d9bfdf4cdf3d1812f836bf58eba` passed 93 local automated t
 ## Evidence limits
 
 Candidate `2c0f1e1` passed 79 automated tests and `847d0e5` passed 93, plus live anonymous browser reads and deterministic packaging, before their respective findings were discovered. These results do not describe the newer failing WIP. Those successes did not cover the reported triggers. Home Assistant source and delivery targets were simulated. The live smoke returned no NWS alerts, so it cannot validate real CAP lineage. Physical commissioning, broader primary-source adapters, automatic health escalation and the browser-to-HA health bridge remain separate work.
+
+## Supervisor continuation findings
+
+The user replaced the review policy during continuation: implementation and fresh reviews remain within the same model family/provider. Current workers use OpenAI `gpt-6.1-terra`, high effort, and fresh reviewers use `gpt-6-astra`, ultra effort. Historical Opus reviews above remain evidence of their own candidates; they do not approve this continuation.
+
+The focused browser review at immutable `63da80f6660667a529a3c4e0d1a0b7bc368760b5` found one P2 issue, [BROWSE-01](browser-focused-63da80f.md). Its outage-age repair passed 40 Node and 16 browser tests and is checkpointed at `5ec38ac`. Full-candidate re-review is pending.
+
+The supervisor also identified the following supported integration cases in the uncommitted HA continuation; these observations are not an independent immutable-candidate release review:
+
+| Code | Finding | Current disposition |
+| --- | --- | --- |
+| CAP-SCOPE-01 | A global missing-predecessor rule could quarantine unrelated updates after any retained Cancel. | Scoped to established cancellation components; regression passes, independent review pending. |
+| CAP-RENEW-01 | A renewal referencing both a Cancel and the historical root could remain blocked by historical traversal. | Explicit renewal boundary retained without deleting tombstones; regression passes, independent review pending. |
+| CAP-STORE-01 | A malformed non-None saved journal or a conflicting replay of a cancellation identity could erase protection. | Durable degradation and restart/no-output regressions pass; independent review pending. |
+| CAP-ID-01 | A current Alert/Update with conflicting or incomplete CAP identity/reference metadata could still qualify and deliver outside a known cancellation group; its invalid references could suppress valid candidates in collection. | Reproduced before candidate freeze; repair interrupted by worker usage limit. Resumed 56-test stdlib run reports six failures, including lost invalid-Cancel uncertainty; repair and realistic live/restart regressions remain in progress. |
+
+Before CAP-ID-01 was found, integrated checks passed 40 Node, 56 standard-library HA, seven source-skill, 16 browser and five actual-HA tests (124 total), lint/format, anonymous live read and deterministic archive builds. Those logs are preserved locally as a pre-identity-audit run and must not be used to approve changed files. Five upstream HA dependency deprecations remain unsuppressed. Complete current gates and independent standards, specification and fresh adversarial review are still required.

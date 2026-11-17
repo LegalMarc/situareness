@@ -34,13 +34,17 @@ def hass_config_dir(tmp_path):
 def alert():
     # Synthetic coordinates do not represent a household or either sample city.
     now = datetime.now(timezone.utc)
+    sent = (now - timedelta(hours=2)).isoformat()
     return {
         "id": "https://api.weather.gov/alerts/urn:oid:test",
         "event": "Tornado Warning",
         "headline": "Test fixture",
         "status": "Actual",
         "message_type": "Alert",
-        "sent": (now - timedelta(hours=2)).isoformat(),
+        "sent": sent,
+        "cap_identity": ["nws@example.test", "urn:oid:test", sent],
+        "reference_identities": [],
+        "cap_references_valid": True,
         "effective": (now - timedelta(hours=2)).isoformat(),
         "onset": now.isoformat(),
         "expires": (now + timedelta(hours=1)).isoformat(),

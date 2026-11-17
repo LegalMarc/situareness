@@ -1,6 +1,7 @@
 import copy
 from datetime import datetime, timedelta, timezone
 import importlib
+import json
 from pathlib import Path
 import sys
 import types
@@ -31,6 +32,7 @@ def feature():
         "geometry": POLY,
         "properties": {
             "id": "urn:oid:123",
+            "sender": "nws@example.test",
             "event": "Tornado Warning",
             "status": "Actual",
             "messageType": "Alert",
@@ -45,6 +47,39 @@ def feature():
             "references": [],
         },
     }
+
+
+def cap_event(name, minutes, refs=(), message_type="Update"):
+    """Build a complete synthetic CAP message identity and directed references."""
+    result = d.normalize(feature())
+    url = "https://api.weather.gov/alerts/" + name
+    sent = (NOW + timedelta(minutes=minutes)).isoformat()
+    result.update(
+        id=url,
+        sent=sent,
+        message_type=message_type,
+        cap_identity=["nws@example.test", name, sent],
+        references=[ref["id"] for ref in refs],
+        reference_identities=[ref["cap_identity"] for ref in refs],
+        cap_references_valid=True,
+    )
+    return result
+
+
+def cohere(event, *refs):
+    """Construct consistent synthetic CAP identity and directed references."""
+    sent = d.timestamp(event["sent"])
+    if refs:
+        sent = max(
+            sent, max(d.timestamp(ref["sent"]) for ref in refs) + timedelta(seconds=1)
+        )
+    event["sent"] = sent.isoformat()
+    identifier = event["id"].split("/alerts/", 1)[1]
+    event["cap_identity"] = ["nws@example.test", identifier, event["sent"]]
+    event["references"] = [ref["id"] for ref in refs]
+    event["reference_identities"] = [ref["cap_identity"] for ref in refs]
+    event["cap_references_valid"] = True
+    return event
 
 
 def config():
@@ -78,6 +113,184 @@ class Policy(unittest.TestCase):
         with self.assertRaises(d.OversizedFeature):
             d.normalize(bad)
 
+    def test_observed_nws_cap_tuples_and_conflicting_reference(self):
+        # The public projection omits Feature.id; reconstruct only that API URL
+        # from the retained property identifier as documented in its provenance.
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "fixtures/cap/nws-observed-segments.json"
+        )
+        fixture = json.loads(path.read_text(encoding="utf-8"))
+        events = []
+        for raw in fixture["features"]:
+            raw["id"] = "https://api.weather.gov/alerts/" + raw["properties"]["id"]
+            event = d.normalize(raw)
+            self.assertIsNotNone(event["cap_identity"])
+            self.assertEqual(
+                len(event["reference_identities"]), len(event["references"])
+            )
+            self.assertTrue(all(event["reference_identities"]))
+            events.append(event)
+        # Replay the observed pairs as separate historical polls: their null
+        # geometries cannot qualify, and both real Cancel identities persist.
+        cancellations = [event for event in events if event["message_type"] == "Cancel"]
+        replay_time = datetime(2026, 11, 17, tzinfo=timezone.utc)
+        replay, plans = d.reconcile({}, cancellations, config(), replay_time)
+        self.assertFalse(plans)
+        self.assertEqual(
+            sum(bool(record.get("cancel_message")) for record in replay.values()), 2
+        )
+        self.assertNotEqual(
+            replay[cancellations[0]["id"]]["cap_references"],
+            replay[cancellations[1]["id"]]["cap_references"],
+        )
+        updates = [event for event in events if event["message_type"] == "Update"]
+        self.assertEqual(len(updates), 2)
+        sibling_records, plans = d.reconcile({}, updates, config(), replay_time)
+        self.assertFalse(plans)
+        self.assertTrue(
+            all(
+                sibling_records[event["id"]]["state"] == "ineligible"
+                for event in updates
+            )
+        )
+        self.assertNotEqual(updates[0]["cap_identity"], updates[1]["cap_identity"])
+        self.assertTrue(
+            set(map(tuple, updates[0]["reference_identities"]))
+            & set(map(tuple, updates[1]["reference_identities"]))
+        )
+        bad = fixture["features"][0]
+        bad["properties"]["references"][0]["identifier"] = "different"
+        self.assertIsNone(d.normalize(bad)["reference_identities"][0])
+
+    def test_cancel_replay_and_siblings_use_directed_edges_across_restart(self):
+        root = cap_event("root", -5, message_type="Alert")
+        a = cap_event("a", -4, [root])
+        sibling = cap_event("sibling", -4, [root])
+        child = cap_event("child", -3, [a])
+        cancel = cap_event("cancel", -2, [a], "Cancel")
+        records, _ = d.reconcile({}, [root], config(), NOW)
+        records, _ = d.reconcile(records, [a, sibling], config(), NOW)
+        records, _ = d.reconcile(records, [child, sibling], config(), NOW)
+        for ordered in ([cancel, child, sibling], [sibling, child, cancel]):
+            result, plans = d.reconcile(copy.deepcopy(records), ordered, config(), NOW)
+            self.assertEqual(result[a["id"]]["state"], "cancelled")
+            self.assertEqual(result[child["id"]]["state"], "quarantined")
+            self.assertEqual(result[sibling["id"]]["state"], "active")
+            self.assertTrue(result[cancel["id"]]["cancel_message"])
+            self.assertTrue(all(plan["id"] != child["id"] for plan in plans))
+            # Reloading the persisted records cannot turn delayed exact replay into output.
+            restored = json.loads(json.dumps(result))
+            restored, replay_plans = d.reconcile(restored, [a, sibling], config(), NOW)
+            self.assertEqual(restored[a["id"]]["state"], "cancelled")
+            self.assertFalse(any(plan["id"] == a["id"] for plan in replay_plans))
+            self.assertEqual(restored[sibling["id"]]["state"], "active")
+
+    def test_missing_intermediate_path_is_uncertain_without_blocking_older_sibling(
+        self,
+    ):
+        root = cap_event("old-root", -8, message_type="Alert")
+        cancelled = cap_event("cancelled-part", -6, [root])
+        missing = cap_event("missing-intermediate", -5, [cancelled])
+        unknown = cap_event("unknown-child", -3, [missing, root])
+        sibling = cap_event("verified-sibling", -3, [root])
+        cancel = cap_event("cancel-part", -2, [cancelled], "Cancel")
+        # The missing intermediate was pruned; its timestamp leaves a possible path.
+        prior, _ = d.reconcile({}, [root, cancelled], config(), NOW)
+        result, plans = d.reconcile(prior, [cancel, unknown, sibling], config(), NOW)
+        self.assertEqual(result[unknown["id"]]["state"], "quarantined")
+        self.assertEqual(result[sibling["id"]]["state"], "active")
+        self.assertFalse(any(plan["id"] == unknown["id"] for plan in plans))
+
+    def test_unrelated_missing_predecessor_stays_eligible_after_cancellation(self):
+        target = cap_event("old-target", -10, message_type="Alert")
+        cancel = cap_event("old-cancel", -9, [target], "Cancel")
+        records, _ = d.reconcile({}, [cancel], config(), NOW)
+        absent = cap_event("unrelated-missing", -4, message_type="Alert")
+        unrelated = cap_event("unrelated-current", -3, [absent])
+        result, plans = d.reconcile(records, [unrelated], config(), NOW)
+        self.assertEqual(result[unrelated["id"]]["state"], "active")
+        self.assertEqual(len(plans), 1)
+
+    def test_cancellation_component_edges_survive_normal_history_pruning(self):
+        root = cap_event("retained-root", -10, message_type="Alert")
+        child = cap_event("retained-child", -9, [root])
+        cancel = cap_event("retained-cancel", -8, [child], "Cancel")
+        records, _ = d.reconcile({}, [root], config(), NOW)
+        records, _ = d.reconcile(records, [child], config(), NOW)
+        records, _ = d.reconcile(records, [cancel], config(), NOW)
+        records.update(
+            {
+                f"old-{i}": {
+                    "state": "ended_or_absent",
+                    "actions": {},
+                    "updated": (NOW + timedelta(days=1)).isoformat(),
+                }
+                for i in range(1000)
+            }
+        )
+        result, _ = d.reconcile(records, [], config(), NOW)
+        self.assertEqual(len(result), 1000)
+        self.assertTrue({root["id"], child["id"], cancel["id"]} <= set(result))
+
+    def test_cancel_arrives_before_target_and_blocks_delayed_exact_replay(self):
+        target = cap_event("delayed-target", -5, message_type="Alert")
+        cancel = cap_event("first-cancel", -4, [target], "Cancel")
+        records, plans = d.reconcile({}, [cancel], config(), NOW)
+        self.assertFalse(plans)
+        restored = json.loads(json.dumps(records))
+        result, plans = d.reconcile(restored, [target], config(), NOW)
+        self.assertFalse(plans)
+        self.assertEqual(result[target["id"]]["state"], "cancelled")
+        self.assertTrue(result[cancel["id"]]["cancel_message"])
+
+    def test_equal_time_and_conflicting_tuples_never_claim_cancellation(self):
+        target = cap_event("time-target", -5, message_type="Alert")
+        for change in ("equal", "sender", "future"):
+            with self.subTest(change=change):
+                cancel = cap_event("bad-cancel", -4, [target], "Cancel")
+                if change == "equal":
+                    cancel["sent"] = target["sent"]
+                    cancel["cap_identity"][2] = target["cap_identity"][2]
+                elif change == "sender":
+                    cancel["reference_identities"][0] = [
+                        "other@example.test",
+                        *target["cap_identity"][1:],
+                    ]
+                else:
+                    cancel["sent"] = (NOW + timedelta(minutes=6)).isoformat()
+                    cancel["cap_identity"][2] = cancel["sent"]
+                result, plans = d.reconcile({}, [target, cancel], config(), NOW)
+                self.assertEqual(result[target["id"]]["state"], "quarantined")
+                self.assertFalse(plans)
+
+    def test_later_explicit_renewal_is_independently_evaluated(self):
+        root = cap_event("root-renew", -5, message_type="Alert")
+        cancel = cap_event("cancel-renew", -4, [root], "Cancel")
+        renewal = cap_event("renewal", -3, [cancel, root])
+        records, _ = d.reconcile({}, [root], config(), NOW)
+        records, _ = d.reconcile(records, [cancel], config(), NOW)
+        records, plans = d.reconcile(records, [renewal], config(), NOW)
+        self.assertEqual(records[renewal["id"]]["state"], "active")
+        self.assertEqual(len(plans), 1)
+        bad = cap_event("renewal-invalid", -2, [cancel])
+        bad["geometry"] = None
+        result, plans = d.reconcile(records, [bad], config(), NOW)
+        self.assertEqual(result[bad["id"]]["state"], "ineligible")
+        self.assertFalse(plans)
+
+    def test_directed_cancellation_keeps_uncancelled_sibling_separate(self):
+        root = cap_event("root", -5, message_type="Alert")
+        a = cap_event("a", -4, [root])
+        b = cap_event("b", -4, [root])
+        child = cap_event("child", -3, [a])
+        cancel = cap_event("cancel", -2, [a], "Cancel")
+        for batch in ([root, a, b, child, cancel], [cancel, child, b, a, root]):
+            groups, _ = d.lineage_index({}, batch)
+            direct, uncertain = d.cancellation_evidence({}, batch, groups, NOW)
+            self.assertEqual(direct, {a["id"]})
+            self.assertEqual(uncertain, {child["id"]})
+
     def test_positive_and_boundary(self):
         e = d.normalize(feature())
         self.assertEqual(
@@ -90,6 +303,7 @@ class Policy(unittest.TestCase):
     def test_old_sent_but_current_actionable(self):
         e = d.normalize(feature())
         e["sent"] = "2026-11-14T10:00:00Z"
+        cohere(e)
         self.assertTrue(d.qualify(e, config(), NOW)["qualifies"])
         e["expires"] = "2026-11-15T19:59:00Z"
         self.assertFalse(d.qualify(e, config(), NOW)["qualifies"])
@@ -149,6 +363,7 @@ class Policy(unittest.TestCase):
         update = copy.deepcopy(e)
         update["id"] += "-update"
         update["references"] = [e["id"]]
+        cohere(update, e)
         records, plans = d.reconcile(records, [update], config(), NOW)
         self.assertFalse(plans)
         self.assertEqual(records[e["id"]]["state"], "superseded")
@@ -159,6 +374,7 @@ class Policy(unittest.TestCase):
         update = copy.deepcopy(e)
         update["id"] += "-update"
         update["references"] = [e["id"]]
+        cohere(update, e)
         update["expires"] = "2026-11-15T22:00:00Z"
         update["ends"] = "2026-11-15T22:00:00Z"
         records, plans = d.reconcile(records, [update], config(), NOW)
@@ -175,6 +391,7 @@ class Policy(unittest.TestCase):
                 self.assertEqual(len(plans), 1)
                 b = copy.deepcopy(a)
                 b.update(id=a["id"] + "-b", references=[a["id"]])
+                cohere(b, a)
                 records, plans = d.reconcile(records, [b], config(), NOW)
                 self.assertFalse(plans)
                 c = copy.deepcopy(b)
@@ -185,6 +402,7 @@ class Policy(unittest.TestCase):
                     expires="2026-11-15T22:00:00Z",
                     ends="2026-11-15T22:00:00Z",
                 )
+                cohere(c, *(b, a) if reverse else (a, b))
                 records, plans = d.reconcile(records, [c], config(), NOW)
                 self.assertFalse(plans)
                 self.assertEqual(records[b["id"]]["state"], "superseded")
@@ -194,11 +412,13 @@ class Policy(unittest.TestCase):
                     references=[a["id"], c["id"]],
                     instruction="Take shelter in the basement.",
                 )
+                cohere(changed, a, c)
                 records, plans = d.reconcile(records, [changed], config(), NOW)
                 self.assertEqual(len(plans), 1)
                 # An old equivalent ancestor must not suppress a changed current action.
                 reverted = copy.deepcopy(c)
                 reverted.update(id=a["id"] + "-e", references=[a["id"], changed["id"]])
+                cohere(reverted, a, changed)
                 _, plans = d.reconcile(records, [reverted], config(), NOW)
                 self.assertEqual(len(plans), 1)
 
@@ -208,10 +428,12 @@ class Policy(unittest.TestCase):
         records, _ = d.reconcile({}, [a], cfg, NOW)
         b = copy.deepcopy(a)
         b.update(id=a["id"] + "-b", references=[a["id"]])
+        cohere(b, a)
         records, _ = d.reconcile(records, [b], cfg, NOW)
         cfg["locations"]["second"] = {"point": [0.6, 0.4], "speakers": []}
         c = copy.deepcopy(b)
         c.update(id=a["id"] + "-c", references=[a["id"], b["id"]])
+        cohere(c, a, b)
         records, plans = d.reconcile(records, [c], cfg, NOW)
         self.assertEqual(plans[0]["affected"], ["new_york_ny", "second"])
         cancel = copy.deepcopy(c)
@@ -220,7 +442,8 @@ class Policy(unittest.TestCase):
         )
         records, plans = d.reconcile(records, [cancel], cfg, NOW)
         self.assertFalse(plans)
-        self.assertEqual(records[c["id"]]["state"], "cancelled")
+        # Incomplete legacy tuple data cannot establish the referenced scope.
+        self.assertEqual(records[c["id"]]["state"], "quarantined")
         self.assertEqual(records[cancel["id"]]["state"], "cancelled")
 
     def test_siblings_and_transient_loss(self):
@@ -230,6 +453,7 @@ class Policy(unittest.TestCase):
                 with self.subTest(reverse=reverse, cancelled=cancelled):
                     b = copy.deepcopy(a)
                     b.update(id=a["id"] + "-b", references=[a["id"]])
+                    cohere(b, a)
                     c = copy.deepcopy(b)
                     c["id"] = a["id"] + "-c"
                     if cancelled:
@@ -242,7 +466,7 @@ class Policy(unittest.TestCase):
                     self.assertFalse(plans)
                     self.assertEqual(
                         records[b["id"]]["state"],
-                        "cancelled" if cancelled else "active",
+                        "quarantined" if cancelled else "active",
                     )
                     # A first-observed pair with the same qualifying action plans once.
                     c = copy.deepcopy(b)
@@ -269,8 +493,9 @@ class Policy(unittest.TestCase):
         records, _ = d.reconcile(records, [cancel], config(), NOW)
         renewed = copy.deepcopy(a)
         renewed.update(id=a["id"] + "-new", references=[cancel["id"]])
-        _, plans = d.reconcile(records, [renewed], config(), NOW)
-        self.assertEqual(len(plans), 1)
+        renewed_records, plans = d.reconcile(records, [renewed], config(), NOW)
+        self.assertFalse(plans)
+        self.assertEqual(renewed_records[renewed["id"]]["state"], "quarantined")
 
     def test_inconsistent_windows_fail_closed(self):
         for changes in (
@@ -292,18 +517,136 @@ class Policy(unittest.TestCase):
 
     def test_merged_action_history_is_bounded(self):
         e = d.normalize(feature())
-        e["references"] = [str(i) for i in range(101)]
+        e["references"] = [str(i) for i in range(100)]
         records = {
             str(i): {
                 "state": "ineligible",
                 "updated": NOW.isoformat(),
                 "actions": {str(i): ["new_york_ny"]},
+                "action_identity": d.action_identity(e),
             }
-            for i in range(101)
+            for i in range(100)
         }
+        records["0"]["actions"]["extra"] = ["new_york_ny"]
         e["geometry"] = None
         result, plans = d.reconcile(records, [e], config(), NOW)
         self.assertEqual(result[e["id"]]["state"], "quarantined")
+        self.assertFalse(plans)
+
+    def test_cancellation_tombstone_survives_history_quarantine(self):
+        event = d.normalize(feature())
+        event.update(message_type="Cancel", references=[str(i) for i in range(100)])
+        prior = {
+            str(i): {
+                "state": "ineligible",
+                "updated": NOW.isoformat(),
+                "actions": {str(i): ["new_york_ny"]},
+                "action_identity": d.action_identity(event),
+            }
+            for i in range(100)
+        }
+        prior["0"]["actions"]["extra"] = ["new_york_ny"]
+        result, plans = d.reconcile(prior, [event], config(), NOW)
+        self.assertEqual(result[event["id"]]["state"], "cancelled")
+        self.assertTrue(result[event["id"]]["cancel_message"])
+        self.assertFalse(plans)
+
+    def test_action_history_overflow_retains_valid_cancellation_evidence(self):
+        root = cap_event("overflow-root", -10, message_type="Alert")
+        branch = cap_event("overflow-branch", -9, [root])
+        cancel = cap_event("overflow-cancel", -2, [branch], "Cancel")
+        records, _ = d.reconcile({}, [root], config(), NOW)
+        records, _ = d.reconcile(records, [branch], config(), NOW)
+        for i in range(100):
+            sibling = cap_event(f"overflow-sibling-{i}", -8, [root])
+            records[sibling["id"]] = {
+                "state": "ineligible",
+                "updated": NOW.isoformat(),
+                "actions": {f"fingerprint-{i}": ["new_york_ny"]},
+                "action_identity": d.action_identity(cancel),
+                "lineage": [sibling["id"], root["id"]],
+                "cap_identity": sibling["cap_identity"],
+                "cap_references": sibling["reference_identities"],
+            }
+        records[next(key for key in records if "overflow-sibling-" in key)]["actions"][
+            "extra"
+        ] = ["new_york_ny"]
+        result, plans = d.reconcile(records, [cancel], config(), NOW)
+        self.assertFalse(plans)
+        self.assertEqual(result[cancel["id"]]["state"], "quarantined")
+        self.assertEqual(
+            result[cancel["id"]]["reasons"], ["action history limit exceeded"]
+        )
+        self.assertTrue(result[cancel["id"]]["cancel_message"])
+        self.assertEqual(result[branch["id"]]["state"], "cancelled")
+
+    def test_unknown_legacy_identity_does_not_preserve_changed_ineligible_action(self):
+        a = d.normalize(feature())
+        records, _ = d.reconcile({}, [a], config(), NOW)
+        legacy = records[a["id"]]
+        legacy.pop("actions")
+        legacy.pop("action_identity")
+        b = copy.deepcopy(a)
+        b.update(
+            id=a["id"] + "-changed",
+            references=[a["id"]],
+            instruction="No protective action needed.",
+        )
+        result, plans = d.reconcile(records, [b], config(), NOW)
+        self.assertFalse(plans)
+        self.assertFalse(result[b["id"]]["actions"])
+
+    def test_current_records_survive_journal_retention_limit(self):
+        a = d.normalize(feature())
+        prior = {
+            f"old-{i}": {
+                "state": "ended_or_absent",
+                "actions": {},
+                "updated": (NOW + timedelta(days=1)).isoformat(),
+            }
+            for i in range(1000)
+        }
+        result, _ = d.reconcile(prior, [a], config(), NOW)
+        self.assertEqual(len(result), 1000)
+        self.assertEqual(result[a["id"]]["state"], "active")
+
+    def test_inactive_quarantine_does_not_restart_history_window(self):
+        a = d.normalize(feature())
+        records, _ = d.reconcile({}, [a], config(), NOW)
+        records, _ = d.reconcile(records, [], config(), NOW + timedelta(minutes=1))
+        records, _ = d.reconcile(
+            records,
+            [],
+            config(),
+            NOW + timedelta(minutes=2),
+            partial=True,
+            quarantine_lineages=[[a["id"]]],
+        )
+        records, _ = d.reconcile(records, [], config(), NOW + timedelta(minutes=20))
+        self.assertEqual(records[a["id"]]["state"], "ended_or_absent")
+        self.assertEqual(
+            records[a["id"]]["inactive_since"], (NOW + timedelta(minutes=1)).isoformat()
+        )
+        _, plans = d.reconcile(records, [a], config(), NOW + timedelta(minutes=21))
+        self.assertEqual(len(plans), 1)
+
+    def test_long_quarantine_preserves_active_action_until_safe_poll(self):
+        a = d.normalize(feature())
+        records, _ = d.reconcile({}, [a], config(), NOW)
+        for minutes in (1, 20, 40):
+            records, _ = d.reconcile(
+                records,
+                [],
+                config(),
+                NOW + timedelta(minutes=minutes),
+                partial=True,
+                quarantine_lineages=[[a["id"]]],
+            )
+        later = NOW + timedelta(minutes=41)
+        a["expires"] = (later + timedelta(hours=1)).isoformat()
+        a["ends"] = a["expires"]
+        result, plans = d.reconcile(records, [a], config(), later)
+        self.assertEqual(result[a["id"]]["state"], "active")
         self.assertFalse(plans)
 
     def test_root_reference_and_reversion_use_current_action(self):
@@ -311,18 +654,22 @@ class Policy(unittest.TestCase):
         records, _ = d.reconcile({}, [a], config(), NOW)
         b = copy.deepcopy(a)
         b.update(id=a["id"] + "-b", references=[a["id"]])
+        cohere(b, a)
         records, plans = d.reconcile(records, [b], config(), NOW)
         self.assertFalse(plans)
         c = copy.deepcopy(a)
         c.update(id=a["id"] + "-c", references=[a["id"]])
+        cohere(c, a)
         records, plans = d.reconcile(records, [c], config(), NOW)
         self.assertFalse(plans)
         changed = copy.deepcopy(c)
         changed.update(id=a["id"] + "-d", instruction="Take shelter in the basement.")
+        cohere(changed, a)
         records, plans = d.reconcile(records, [changed], config(), NOW)
         self.assertEqual(len(plans), 1)
         reverted = copy.deepcopy(a)
         reverted.update(id=a["id"] + "-e", references=[a["id"]])
+        cohere(reverted, a)
         _, plans = d.reconcile(records, [reverted], config(), NOW)
         self.assertEqual(len(plans), 1)
 
@@ -334,6 +681,7 @@ class Policy(unittest.TestCase):
                     records, _ = d.reconcile({}, [a], config(), NOW)
                     b = copy.deepcopy(a)
                     b.update(id=a["id"] + "-b", references=[a["id"]])
+                    cohere(b, a)
                     if loss == "geometry":
                         b["geometry"] = None
                     elif loss == "urgency":
@@ -346,6 +694,7 @@ class Policy(unittest.TestCase):
                         id=a["id"] + "-c",
                         references=[a["id"] if loss == "absent" else b["id"]],
                     )
+                    cohere(update, a if loss == "absent" else b)
                     _, plans = d.reconcile(
                         records, [update], config(), NOW + timedelta(minutes=minutes)
                     )
@@ -357,34 +706,27 @@ class Policy(unittest.TestCase):
             references=[a["id"]],
             instruction="No protective action needed.",
         )
+        cohere(b, a)
         records, _ = d.reconcile(records, [b], config(), NOW)
         self.assertFalse(records[b["id"]]["actions"])
 
-    def test_ancestor_cancellation_blocks_stale_reappearance_and_allows_explicit_renewal(
-        self,
-    ):
+    def test_legacy_cancellation_relationship_remains_uncertain(self):
         a = d.normalize(feature())
         records, _ = d.reconcile({}, [a], config(), NOW)
         b = copy.deepcopy(a)
         b.update(id=a["id"] + "-b", references=[a["id"]])
+        cohere(b, a)
         records, _ = d.reconcile(records, [b], config(), NOW)
         cancel = copy.deepcopy(a)
         cancel.update(
             id=a["id"] + "-cancel", references=[a["id"]], message_type="Cancel"
         )
-        records, _ = d.reconcile(records, [cancel], config(), NOW)
-        self.assertEqual(records[b["id"]]["state"], "cancelled")
+        records, plans = d.reconcile(records, [cancel], config(), NOW)
+        self.assertFalse(plans)
+        self.assertEqual(records[b["id"]]["state"], "quarantined")
         records, plans = d.reconcile(records, [b], config(), NOW)
         self.assertFalse(plans)
-        self.assertEqual(records[b["id"]]["state"], "cancelled")
-        renewal = copy.deepcopy(a)
-        renewal.update(id=a["id"] + "-renewal", references=[cancel["id"]])
-        records, plans = d.reconcile(records, [renewal], config(), NOW)
-        self.assertEqual(len(plans), 1)
-        successor = copy.deepcopy(renewal)
-        successor.update(id=a["id"] + "-next", references=[renewal["id"]])
-        _, plans = d.reconcile(records, [successor], config(), NOW)
-        self.assertFalse(plans)
+        self.assertEqual(records[b["id"]]["state"], "quarantined")
 
     def test_partial_quarantine_preserves_unrelated_history_and_processes_fresh_alerts(
         self,
@@ -393,6 +735,7 @@ class Policy(unittest.TestCase):
         records, _ = d.reconcile({}, [a], config(), NOW)
         unrelated = copy.deepcopy(a)
         unrelated["id"] += "-unrelated"
+        cohere(unrelated)
         records, plans = d.reconcile(
             records,
             [unrelated],
@@ -413,6 +756,7 @@ class Policy(unittest.TestCase):
 
         other = copy.deepcopy(a)
         other["id"] += "-previous"
+        cohere(other)
         prior, _ = d.reconcile({}, [other], config(), NOW)
         result, _ = d.reconcile(prior, [unrelated], config(), NOW, partial=True)
         self.assertEqual(result[other["id"]]["state"], "unconfirmed")
@@ -633,6 +977,64 @@ class Session:
 
 
 class Collector(unittest.IsolatedAsyncioTestCase):
+    async def test_superseded_messages_and_oversized_cancel_remain_evidence(self):
+        predecessor = feature()
+        successor = copy.deepcopy(predecessor)
+        successor["id"] += "-update"
+        successor["properties"]["id"] += "-update"
+        successor["properties"]["sent"] = "2026-11-15T19:56:00Z"
+        successor["properties"]["references"] = [
+            {
+                "@id": predecessor["id"],
+                "identifier": predecessor["properties"]["id"],
+                "sender": predecessor["properties"]["sender"],
+                "sent": predecessor["properties"]["sent"],
+            }
+        ]
+        cancel = copy.deepcopy(predecessor)
+        cancel["id"] += "-cancel"
+        cancel["properties"].update(
+            messageType="Cancel", references=[{"@id": predecessor["id"]}] * 101
+        )
+        body = {
+            "type": "FeatureCollection",
+            "features": [predecessor, successor, cancel],
+        }
+        result = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertEqual([e["id"] for e in result], [successor["id"]])
+        self.assertEqual(
+            {e["id"] for e in result.all_events}, {predecessor["id"], successor["id"]}
+        )
+        self.assertTrue(result.uncertain_cancellation)
+
+    async def test_failed_pagination_after_cancel_reports_lost_evidence(self):
+        cancel = feature()
+        cancel["properties"]["messageType"] = "Cancel"
+        body = {
+            "type": "FeatureCollection",
+            "features": [cancel],
+            "pagination": {
+                "next": "https://api.weather.gov/alerts/active?cursor=repeat"
+            },
+        }
+        with self.assertRaises(collector.CancellationEvidenceLost):
+            await collector.fetch(Session(Response(json.dumps(body).encode())), ["NY"])
+
+    async def test_malformed_actual_cancel_is_not_lost_as_a_simple_poll_error(self):
+        bad = feature()
+        bad["id"] = "not-a-valid-nws-id"
+        bad["properties"]["messageType"] = "Cancel"
+        body = {"type": "FeatureCollection", "features": [bad, feature()]}
+        result = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertTrue(result.uncertain_cancellation)
+        self.assertTrue(result.quarantine_ambiguous)
+        self.assertEqual(result.quarantined, 1)
+        self.assertEqual(len(result), 1)
+
     async def test_oversized_feature_is_quarantined_without_losing_other_alerts(self):
         import json
 

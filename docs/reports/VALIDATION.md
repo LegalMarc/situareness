@@ -2,7 +2,7 @@
 
 ## Current status
 
-November 17, 2026 UTC continuation: public `main` remains at `847d0e5`, which passed 93 local tests but failed independent standards/specification review. Repairs continue on `wip/supervisor-handoff-20261117`. The browser/package slice reports 40 Node and 15 Chromium tests, including startup and fixture collection from the extracted ZIP; the omitted freshness module is repaired. Focused HA lifecycle repairs report 38 standard-library and five actual-HA tests, with the same upstream warnings. Directed cancellation and durable evidence are still being implemented under the user-approved uncertainty policy. Complete integrated gates and all independent review axes remain pending; these focused results are not release approval. See [handoff](../plans/HANDOFF.md) and [review findings](REVIEW.md).
+November 17, 2026 continuation: public `main` remains at `847d0e5`, which passed local checks but failed independent review. Browser/package repairs are checkpointed on `wip/supervisor-handoff-20261117` through `5ec38ac`, with 40 Node and 16 browser tests. Subsequent HA repairs were interrupted by a worker account usage limit. The resumed standard-library run executed 56 tests and reported six failures; cancellation uncertainty and CAP-ID-01 remain in repair. The earlier 124 passing integrated checks describe pre-identity-audit files and do not approve the current WIP. Complete gates and fresh independent same-family standards/specification/adversarial reviews are pending. See [handoff](../plans/HANDOFF.md) and [review findings](REVIEW.md).
 
 No production installation, audible commissioning or clean final adversarial review has occurred. Interrupted or quota-limited attempts are not approvals.
 

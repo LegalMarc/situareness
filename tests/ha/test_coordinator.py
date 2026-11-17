@@ -6,7 +6,7 @@ import sys
 import types
 import unittest
 from unittest.mock import patch
-from test_domain import PACKAGE, config, feature, d
+from test_domain import PACKAGE, config, feature, d, cohere
 
 
 def module(name, **attrs):
@@ -100,6 +100,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             ("ends", 30),
         ]:
             e[key] = (now + timedelta(minutes=delta)).isoformat()
+        cohere(e)
 
         async def fetch(*args):
             return [e]
@@ -151,6 +152,19 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             ("ends", 30),
         ]:
             e[key] = (now + timedelta(minutes=delta)).isoformat()
+        cohere(e)
+
+        def mark_cap(event, seconds, refs=()):
+            sent = (now + timedelta(seconds=seconds)).isoformat()
+            event["sent"] = sent
+            event["cap_identity"] = [
+                "nws@example.test",
+                event["id"].split("/alerts/", 1)[1],
+                sent,
+            ]
+            event["references"] = [ref["id"] for ref in refs]
+            event["reference_identities"] = [ref["cap_identity"] for ref in refs]
+            event["cap_references_valid"] = True
 
         async def fetch(*args):
             return [e]
@@ -210,12 +224,15 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             await first._async_update_data()
             e["id"] = original["id"] + "-b"
             e["references"] = [original["id"]]
+            cohere(e, original)
             restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
             data = await restarted._async_update_data()
             self.assertEqual((data["planned_count"], data["pending_count"]), (0, 1))
             self.assertEqual(store.snapshot["outbox"][0]["incident_id"], e["id"])
+            predecessor = copy.deepcopy(e)
             e["id"] = original["id"] + "-c"
             e["references"] = [original["id"], original["id"] + "-b"]
+            cohere(e, original, predecessor)
             e["expires"] = (now + timedelta(minutes=40)).isoformat()
             e["ends"] = e["expires"]
             services.fail = False
@@ -273,6 +290,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             await first._async_update_data()
             unrelated = copy.deepcopy(e)
             unrelated["id"] += "-unrelated"
+            cohere(unrelated)
 
             async def partial(*args):
                 from test_domain import collector
@@ -305,6 +323,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             await first._async_update_data()
             b = copy.deepcopy(e)
             b.update(id=e["id"] + "-b", references=[e["id"]])
+            cohere(b, e)
 
             async def current(*args):
                 return [b]
@@ -312,36 +331,41 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             with patch.object(mod, "fetch", current):
                 await first._async_update_data()
                 b["id"] = e["id"] + "-c"
+                cohere(b, e)
                 services.fail = False
                 data = await first._async_update_data()
             self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
             self.assertEqual(len(services.calls), 3)
             self.assertEqual(services.calls[-1][2]["data"]["url"], b["id"])
 
-            # A cancel referencing only the root invalidates a retry attached
-            # to its descendant; a stale reappearance cannot revive it.
+            # Root-only cancellation leaves a descendant retry uncertain, never sent.
+            original_event = copy.deepcopy(e)
+            mark_cap(e, -5)
             store = DurableStore()
             services = Flaky()
             hass = types.SimpleNamespace(services=services)
             first = mod.SituarenessCoordinator(hass, cfg, store, {})
             await first._async_update_data()
             b = copy.deepcopy(e)
-            b.update(id=e["id"] + "-b", references=[e["id"]])
+            b["id"] += "-b"
+            mark_cap(b, -4, [e])
             with patch.object(mod, "fetch", current):
                 await first._async_update_data()
                 cancelled = copy.deepcopy(e)
-                cancelled.update(
-                    id=e["id"] + "-cancel", references=[e["id"]], message_type="Cancel"
-                )
+                cancelled.update(id=e["id"] + "-cancel", message_type="Cancel")
+                mark_cap(cancelled, -3, [e])
                 saved_b = b
                 b = cancelled
                 services.fail = False
                 data = await first._async_update_data()
-                self.assertEqual(data["pending_count"], 0)
+                self.assertEqual(data["pending_count"], 1)
+                self.assertTrue(data["partial"])
                 b = saved_b
                 data = await first._async_update_data()
-            self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
+            self.assertEqual((data["planned_count"], data["pending_count"]), (0, 1))
             self.assertEqual(len(services.calls), 2)
+            e.clear()
+            e.update(original_event)
 
             # A failed target follows the eligible sibling, regardless of order.
             for reverse in (False, True):
@@ -352,8 +376,10 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 await first._async_update_data()
                 b = copy.deepcopy(e)
                 b.update(id=e["id"] + "-b", references=[e["id"]])
+                cohere(b, e)
                 c = copy.deepcopy(b)
                 c.update(id=e["id"] + "-c", geometry=None)
+                cohere(c, e)
 
                 async def siblings(*args):
                     return [b, c][:: -1 if reverse else 1]
@@ -372,8 +398,10 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             hass = types.SimpleNamespace(services=services)
             b = copy.deepcopy(e)
             b.update(id=e["id"] + "-b", references=[e["id"]])
+            cohere(b, e)
             c = copy.deepcopy(b)
             c["id"] = e["id"] + "-c"
+            cohere(c, e)
 
             async def both(*args):
                 return [b, c]
@@ -401,8 +429,10 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 hass = types.SimpleNamespace(services=services)
                 b = copy.deepcopy(e)
                 b.update(id=e["id"] + "-b", references=[e["id"]])
+                cohere(b, e)
                 c = copy.deepcopy(b)
                 c.update(id=e["id"] + "-c", instruction="Take shelter in the basement.")
+                cohere(c, e)
                 first = mod.SituarenessCoordinator(hass, cfg, store, {})
                 with patch.object(mod, "fetch", both):
                     data = await first._async_update_data()
@@ -414,6 +444,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                     references=refs[::-1] if reverse else refs,
                     expires=(now - timedelta(minutes=1)).isoformat(),
                 )
+                cohere(merged, *(c, b) if reverse else (b, c))
 
                 async def merge(*args):
                     return [merged]
@@ -442,6 +473,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 references=[e["id"]],
                 expires=(now - timedelta(minutes=1)).isoformat(),
             )
+            cohere(b, e)
 
             async def update(*args):
                 return [b]
@@ -457,22 +489,372 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
             self.assertEqual(len(services.calls), 2)
 
-            # An explicit cancellation removes pending work without sending it.
+            # An explicitly referenced message loses its pending retry.
+            original_event = copy.deepcopy(e)
+            mark_cap(e, -5)
             store = DurableStore()
             services = Flaky()
             hass = types.SimpleNamespace(services=services)
             first = mod.SituarenessCoordinator(hass, cfg, store, {})
             await first._async_update_data()
             b = copy.deepcopy(e)
-            b.update(
-                id=e["id"] + "-cancel", references=[e["id"]], message_type="Cancel"
-            )
+            b.update(id=e["id"] + "-cancel", message_type="Cancel")
+            mark_cap(b, -3, [e])
             services.fail = False
             restarted = mod.SituarenessCoordinator(hass, cfg, store, store.snapshot)
             with patch.object(mod, "fetch", update):
                 data = await restarted._async_update_data()
             self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
             self.assertEqual(len(services.calls), 1)
+
+    async def test_legacy_journal_without_gate_marker_does_not_force_live_realert(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+        now = datetime.now(timezone.utc)
+        event = d.normalize(feature())
+        for field, delta in [
+            ("sent", -1),
+            ("effective", -1),
+            ("onset", 0),
+            ("expires", 30),
+            ("ends", 30),
+        ]:
+            event[field] = (now + timedelta(minutes=delta)).isoformat()
+        cohere(event)
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+        records, _ = d.reconcile({}, [event], cfg, now)
+        services = Services()
+        coordinator = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services), cfg, Store(), {"records": records}
+        )
+
+        async def fetch(*args):
+            return [event]
+
+        with patch.object(mod, "fetch", fetch):
+            result = await coordinator._async_update_data()
+        self.assertEqual(result["planned_count"], 0)
+        self.assertFalse(services.calls)
+
+    async def test_malformed_existing_store_is_degraded_not_fresh_install(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+        cfg = config()
+        cfg.update(live_enabled=True, commissioning_passed=True)
+        services = Services()
+        coordinator = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services), cfg, Store(), ["corrupt"]
+        )
+        with patch.object(
+            mod, "fetch", side_effect=AssertionError("must not fetch while degraded")
+        ):
+            health = await coordinator._async_update_data()
+        self.assertTrue(health["evidence_degraded"])
+        self.assertTrue(health["output_blocked"])
+        self.assertIsNone(health["active_count"])
+        self.assertFalse(services.calls)
+        fresh = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services), cfg, Store(), None
+        )
+        self.assertFalse(fresh.degraded)
+
+    async def test_uncertain_retry_cannot_move_to_independent_sibling(self):
+        import copy
+        from datetime import datetime, timedelta, timezone
+        from test_domain import delivery
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+        now = datetime.now(timezone.utc)
+
+        def make(name, seconds, refs=(), kind="Update"):
+            event = d.normalize(feature())
+            event.update(id="https://api.weather.gov/alerts/" + name, message_type=kind)
+            for field, delta in [
+                ("sent", seconds),
+                ("effective", -120),
+                ("onset", -60),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                event[field] = (now + timedelta(seconds=delta)).isoformat()
+            event["cap_identity"] = ["nws@example.test", name, event["sent"]]
+            event["references"] = [ref["id"] for ref in refs]
+            event["reference_identities"] = [ref["cap_identity"] for ref in refs]
+            event["cap_references_valid"] = True
+            return event
+
+        root = make("root", -100, kind="Alert")
+        branch = make("branch", -90, [root])
+        child = make("child", -80, [branch])
+        sibling = make("sibling", -70, [root])
+        cancel = make("cancel", -60, [branch], "Cancel")
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+        records = {}
+        for event in (root, branch, child):
+            records, _ = d.reconcile(records, [event], cfg, now)
+        decision = d.qualify(child, cfg, now)
+        plan = {
+            "id": child["id"],
+            "fingerprint": d.fingerprint(child, decision),
+            "event": child["event"],
+            "instruction": child["instruction"],
+            "affected": decision["affected"],
+            "phones": cfg["phones"],
+        }
+        item = delivery.targets(plan, cfg, now)[0]
+        services, store = Services(), Store()
+        coordinator = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services),
+            cfg,
+            store,
+            {
+                "initialized": True,
+                "was_live": True,
+                "records": copy.deepcopy(records),
+                "outbox": [item],
+            },
+        )
+
+        async def fetch(*args):
+            return [cancel, sibling]
+
+        with patch.object(mod, "fetch", fetch):
+            health = await coordinator._async_update_data()
+        self.assertTrue(health["cancellation_uncertain"])
+        self.assertEqual(health["suspended_count"], 1)
+        self.assertEqual(coordinator.outbox[0]["incident_id"], child["id"])
+        self.assertNotIn(
+            child["id"], [call[2]["data"].get("url") for call in services.calls]
+        )
+
+    async def test_cancellation_evidence_loss_latches_before_delivery_and_survives_restart(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+        from test_domain import collector
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+        now = datetime.now(timezone.utc)
+        e = d.normalize(feature())
+        for key, minutes in [
+            ("sent", -1),
+            ("effective", -1),
+            ("onset", 0),
+            ("expires", 30),
+            ("ends", 30),
+        ]:
+            e[key] = (now + timedelta(minutes=minutes)).isoformat()
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+        for mode in ("oversized", "overflow", "failed_after_cancel", "conflict"):
+            with self.subTest(mode=mode):
+                records = (
+                    {
+                        f"old-{i}": {
+                            "state": "cancelled",
+                            "cancel_message": True,
+                            "lineage": [],
+                            "updated": now.isoformat(),
+                        }
+                        for i in range(1000)
+                    }
+                    if mode == "overflow"
+                    else {}
+                )
+                if mode == "conflict":
+                    records[e["id"]] = {
+                        "state": "cancelled",
+                        "cancel_message": True,
+                        "cap_identity": ["sender", "id", e["sent"]],
+                        "cap_references": [],
+                        "lineage": [e["id"]],
+                    }
+                persisted = {
+                    "initialized": True,
+                    "was_live": True,
+                    "records": records,
+                    "outbox": [],
+                }
+                source = collector.CollectedEvents(
+                    [e],
+                    1 if mode == "oversized" else 0,
+                    [],
+                    False,
+                    uncertain_cancellation=(mode == "oversized"),
+                )
+
+                async def fetch(*args):
+                    if mode == "failed_after_cancel":
+                        raise collector.CancellationEvidenceLost("partial fetch")
+                    return source
+
+                store, services = Store(), Services()
+                coordinator = mod.SituarenessCoordinator(
+                    types.SimpleNamespace(services=services), cfg, store, persisted
+                )
+                with patch.object(mod, "fetch", fetch):
+                    health = await coordinator._async_update_data()
+                self.assertTrue(health["evidence_degraded"])
+                self.assertTrue(health["output_blocked"])
+                self.assertIsNone(health["active_count"])
+                self.assertEqual(services.calls, [])
+                self.assertTrue(store.saved[-1]["degraded"])
+                restarted = mod.SituarenessCoordinator(
+                    types.SimpleNamespace(services=services),
+                    cfg,
+                    Store(),
+                    store.saved[-1],
+                )
+                with patch.object(
+                    mod,
+                    "fetch",
+                    side_effect=AssertionError("must not collect while latched"),
+                ):
+                    self.assertTrue(
+                        (await restarted._async_update_data())["evidence_degraded"]
+                    )
+                self.assertEqual(services.calls, [])
+
+    async def test_merged_retries_are_deduplicated_and_reload_waits_for_acceptance(
+        self,
+    ):
+        import asyncio
+        import copy
+        from datetime import datetime, timedelta, timezone
+        from test_domain import delivery
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+        now = datetime.now(timezone.utc)
+        a = d.normalize(feature())
+        for key, delta in [
+            ("sent", -1),
+            ("effective", -1),
+            ("onset", 0),
+            ("expires", 30),
+            ("ends", 30),
+        ]:
+            a[key] = (now + timedelta(minutes=delta)).isoformat()
+        cohere(a)
+        b = copy.deepcopy(a)
+        b["id"] += "-sibling"
+        cohere(b)
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+        ra, pa = d.reconcile({}, [a], cfg, now)
+        rb, pb = d.reconcile({}, [b], cfg, now)
+        items = delivery.targets(pa[0], cfg, now) + delivery.targets(pb[0], cfg, now)
+        merged = copy.deepcopy(a)
+        merged.update(id=a["id"] + "-merged", references=[a["id"], b["id"]])
+        cohere(merged, a, b)
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        class WaitingServices(Services):
+            async def async_call(self, *args, **kwargs):
+                self.calls.append(args)
+                started.set()
+                await finish.wait()
+
+        async def fetch(*args):
+            return [merged]
+
+        store = Store()
+        services = WaitingServices()
+        coordinator = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services),
+            cfg,
+            store,
+            {
+                "initialized": True,
+                "was_live": True,
+                "records": {**ra, **rb},
+                "outbox": items,
+            },
+        )
+        with patch.object(mod, "fetch", fetch):
+            update = asyncio.create_task(coordinator._async_update_data())
+            await asyncio.wait_for(started.wait(), 2)
+            stop = asyncio.create_task(coordinator.async_stop())
+            await asyncio.sleep(0)
+            self.assertFalse(stop.done())
+            finish.set()
+            await asyncio.wait_for(update, 2)
+            await asyncio.wait_for(stop, 2)
+        self.assertEqual(len(services.calls), 1)
+        self.assertEqual(store.saved[-1]["outbox"], [])
+        self.assertTrue(store.saved[-1]["outcomes"][-1]["accepted"])
+        restarted = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services), cfg, Store(), store.saved[-1]
+        )
+        with patch.object(mod, "fetch", fetch):
+            await restarted._async_update_data()
+        self.assertEqual(len(services.calls), 1)
 
     async def test_new_hazard_after_restart_is_not_baselined(self):
         from datetime import datetime, timezone, timedelta
@@ -497,6 +879,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             ("ends", 30),
         ]:
             e[key] = (now + timedelta(minutes=delta)).isoformat()
+        cohere(e)
 
         async def fetch(*args):
             return [e]
@@ -541,6 +924,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             ("ends", 5),
         ]:
             e[key] = (now + timedelta(seconds=delta)).isoformat()
+        cohere(e)
 
         class Clock:
             current = None

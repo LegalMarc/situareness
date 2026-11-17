@@ -2,6 +2,16 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 identity repair interrupted
+
+Resumed November 17, 2026 at approximately 16:18 UTC after an implementation worker hit its account usage limit. The saved HA patch is a known-failing WIP, not a release candidate. The last previously pushed checkpoint was `5ec38ac`; this checkpoint preserves the subsequent HA work without discarding it. Public `main` remains unchanged.
+
+A fresh warnings-as-errors standard-library run executed 56 tests and reported six failures: equal-time/conflicting cancellation quarantine, legacy cancellation relationships, lineage cancellation, and both orders of a sibling/cancellation replay. The log is local `ignored-resources/review-evidence/resume-identity-check.log`. CAP-ID-01 remains incomplete: full CAP identity/chronology validation and synthetic fixture corrections are present, but invalid Alert/Update edge isolation currently also drops invalid Cancel uncertainty in pure reconciliation. Preserve cancellation evidence and distinguish those cases; do not weaken supported safety assertions to obtain green tests.
+
+The resumed HA worker is available, owns the same HA files including actual-HA fixtures, and is assigned a 15–20 minute bounded repair with a 16:58 UTC stop bound. It must add realistic no-delivery, independent-sibling and restart regressions, then run focused checks. The supervisor owns integration, Git and the complete candidate gates. Browser/package work is already checkpointed, including the extracted-bundle check and outage-age repair.
+
+The 124 passing pre-identity-audit checks below describe the previous file state only. Complete current tests, lint, deterministic archives, extracted-bundle execution, anonymous source smoke, privacy inspection and fresh independent same-family standards/specification/adversarial reviews remain required. No new full-candidate review or adversarial approval exists. Household outputs remain disabled; no commissioning occurred.
+
 ## Continuation update: browser repair slice
 
 The user subsequently replaced the review policy: keep reviews within the implementation model family/provider and use a stronger suitable model when available. Planned current reviewer: fresh-context `gpt-6-astra`, ultra effort; the historical Opus requirements below are superseded. Separate standards/specification axes and fresh immutable adversarial review still apply.
