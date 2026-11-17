@@ -17,7 +17,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .collector import fetch
 from .config import validate
 from .const import DOMAIN
-from .delivery import deliver_one, live, pending_valid, targets
+from .delivery import MAX_AGE, deliver_one, live, pending_valid, targets
 from .domain import (
     CancellationEvidenceOverflow,
     MAX_ACCEPTANCE_AGE,
@@ -390,10 +390,13 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self._sync_degraded_notification()
 
     def _try_acknowledge(self, current_now):
-        if not self.degraded or self.degraded_reason == "malformed_store":
+        if self.degraded_reason == "malformed_store":
             return False
         ack = self.config.get("acknowledge_degraded_at")
         if ack is None or ack == self.acknowledged_degraded_at:
+            return False
+        if not self.degraded:
+            self.acknowledged_degraded_at = ack
             return False
         degraded_at_ts = timestamp(self.degraded_at)
         ack_ts = timestamp(ack)
@@ -402,6 +405,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             or ack_ts is None
             or not (degraded_at_ts <= ack_ts <= current_now)
         ):
+            self.acknowledged_degraded_at = ack
             return False
         self.acknowledged_degraded_at = ack
         self.degraded = False
@@ -459,16 +463,34 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         if self.degraded:
             state = self.degraded_reason
             if self._notified_degraded_state != state:
-                until_note = (
-                    " Output remains withheld until the triggering condition clears and the seven-day horizon expires or is acknowledged."
-                    if self.degraded_until
-                    else " Manual store repair or replacement required."
-                )
+                if self.degraded_reason == "outbox_overflow":
+                    title = "Situareness delivery outbox full"
+                    message = (
+                        "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld "
+                        "while already-queued targets continue bounded delivery until outbox space frees up, "
+                        "the 15-minute degraded_until horizon expires, or acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
+                        "Continue using independent official alert channels."
+                    )
+                elif self.degraded_until:
+                    title = "Situareness monitoring degraded"
+                    message = (
+                        f"Situareness output is blocked (reason: {self.degraded_reason}). "
+                        "Output remains withheld until the triggering condition clears and degraded_until "
+                        "(at least seven days or the latest evicted component horizon) expires, "
+                        "or until acknowledge_degraded_at is set in situareness.json and the integration is reloaded. "
+                        "Continue using independent official alert channels."
+                    )
+                else:
+                    title = "Situareness monitoring degraded"
+                    message = (
+                        f"Situareness output is blocked (reason: {self.degraded_reason}). "
+                        "Manual store repair or replacement in .storage (or removing and re-adding the integration entry) is required. "
+                        "Continue using independent official alert channels."
+                    )
                 persistent_notification.async_create(
                     self.hass,
-                    f"Situareness output is blocked (reason: {self.degraded_reason})."
-                    f"{until_note} Continue using independent official alert channels.",
-                    title="Situareness monitoring degraded",
+                    message,
+                    title=title,
                     notification_id="situareness_degraded",
                 )
                 self._notified_degraded_state = state
@@ -508,6 +530,20 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 raise UpdateFailed("integration is stopping")
             return await self._update_once()
 
+    def _deliverable_count(self, records, candidate_events, health_now):
+        by_id = {event["id"]: event for event in candidate_events}
+        current_eligible = {
+            eid
+            for eid, event in by_id.items()
+            if records.get(eid, {}).get("state") == "active"
+            and qualify(event, self.config, health_now)["qualifies"]
+        }
+        return sum(
+            item["incident_id"] in current_eligible
+            and pending_valid(item, records, self.config, health_now)
+            for item in self.outbox
+        )
+
     def _degraded_health(
         self,
         events=None,
@@ -522,13 +558,13 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         delivery_attempts=0,
         delivery_failures=0,
     ):
-        """Expose a redacted durable degraded state without delivering."""
+        """Expose a redacted durable degraded state without delivering (except bounded queued delivery during outbox_overflow)."""
         previous = getattr(self, "data", None) or {}
         shown = candidate_events if candidate_events is not None else events
+        record_map = records if records is not None else self.records
         quarantined_count = 0
         event_summaries = []
         if shown is not None:
-            record_map = records or {}
             quarantined_count = getattr(events, "quarantined", 0) + sum(
                 record_map.get(e["id"], {}).get("state") == "quarantined" for e in shown
             )
@@ -563,6 +599,22 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 for r in (records or {}).values()
             )
         )
+        is_outbox_overflow = self.degraded_reason == "outbox_overflow"
+        if is_outbox_overflow:
+            health_now = datetime.now(timezone.utc)
+            deliverable = self._deliverable_count(
+                record_map, candidate_events or (), health_now
+            )
+            suspended = len(self.outbox) - deliverable
+            active_count = (
+                sum(record_map.get(e["id"], {}).get("state") == "active" for e in shown)
+                if shown is not None
+                else None
+            )
+        else:
+            deliverable = 0
+            suspended = len(self.outbox)
+            active_count = None
         return {
             "last_success": (
                 now.isoformat()
@@ -575,17 +627,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 if events is not None
                 else 0
             ),
-            "active_count": None,
+            "active_count": active_count,
             "partial": (
                 bool(quarantined_count)
                 or quarantine_ambiguous
                 or cancellation_uncertain
+                or is_outbox_overflow
             ),
             "quarantined_count": quarantined_count,
             "quarantine_ambiguous": quarantine_ambiguous,
             "cancellation_uncertain": cancellation_uncertain,
-            "evidence_degraded": True,
-            "output_blocked": True,
+            "evidence_degraded": not is_outbox_overflow,
+            "output_blocked": not is_outbox_overflow,
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
             "degraded_until": self.degraded_until,
@@ -594,8 +647,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "planned_count": planned_count,
             "withheld_count": withheld_count,
             "pending_count": len(self.outbox),
-            "deliverable_count": 0,
-            "suspended_count": len(self.outbox),
+            "deliverable_count": deliverable,
+            "suspended_count": suspended,
             "delivery_attempts": delivery_attempts,
             "delivery_failures": delivery_failures,
         }
@@ -702,8 +755,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         return list(unique.values())
 
     def _latch_degraded(self, reason, now, until=None):
-        existing_until = timestamp(self.degraded_until)
-        candidate_until = until or (now + MAX_ACCEPTANCE_AGE)
+        default_window = MAX_AGE if reason == "outbox_overflow" else MAX_ACCEPTANCE_AGE
+        candidate_until = until or (now + default_window)
+        if self.degraded and (
+            self.degraded_reason == reason or reason != "outbox_overflow"
+        ):
+            existing_until = timestamp(self.degraded_until)
+        else:
+            existing_until = None
         new_until = (
             max(existing_until, candidate_until)
             if existing_until is not None
@@ -800,11 +859,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             1 for x in outbox if pending_valid(x, records, self.config, now)
         )
         already_delivered = False
-        if (
-            projected_count > 5000
-            and deliverable_existing > 0
-            and projected_count - min(100, deliverable_existing) <= 5000
-        ):
+        if projected_count > 5000 and deliverable_existing > 0:
             pre_drain_records = deepcopy(records)
             self._strip_withheld_actions(records, plans, groups, now)
             await self._save(records, outbox, list(self.outcomes))
@@ -857,6 +912,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if current >= deadline:
                 break
             group = []
+            expired_keys = set()
             for item in batch[offset : offset + 10]:
                 event = by_id.get(item["incident_id"])
                 if (
@@ -868,31 +924,42 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 elif not pending_valid(
                     item, self.records, self.config, current, allow_suspended=True
                 ):
-                    remaining = [x for x in self.outbox if x["key"] != item["key"]]
-                    await self._save(self.records, remaining, self.outcomes)
+                    expired_keys.add(item["key"])
+            if expired_keys:
+                remaining = [x for x in self.outbox if x["key"] not in expired_keys]
+                await self._save(self.records, remaining, self.outcomes)
+            if not group:
+                continue
             results = await asyncio.gather(
                 *(deliver_one(self.hass.services, item, self.config) for item in group)
             )
+            processed_keys = set()
+            requeued = []
+            new_outcomes = []
             for item, accepted in zip(group, results):
                 if accepted is None:
                     break
                 attempts += 1
                 failures += not accepted
+                processed_keys.add(item["key"])
                 updated = {**item, "attempts": item["attempts"] + 1}
-                remaining = [x for x in self.outbox if x["key"] != item["key"]]
                 if not accepted and pending_valid(
                     updated, self.records, self.config, datetime.now(timezone.utc)
                 ):
-                    remaining.append(updated)
-                outcomes = self.outcomes + [
+                    requeued.append(updated)
+                new_outcomes.append(
                     {
                         "key": item["key"],
                         "accepted": accepted,
                         "attempt": updated["attempts"],
                         "at": datetime.now(timezone.utc).isoformat(),
                     }
-                ]
-                await self._save(self.records, remaining, outcomes)
+                )
+            if processed_keys or new_outcomes:
+                remaining = [
+                    x for x in self.outbox if x["key"] not in processed_keys
+                ] + requeued
+                await self._save(self.records, remaining, self.outcomes + new_outcomes)
         return attempts, failures
 
     def _healthy_snapshot(
@@ -907,19 +974,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         recoverable_prior_conflict,
     ):
         """Build the redacted healthy coordinator snapshot and sync notifications."""
-        by_id = {event["id"]: event for event in candidate_events}
         health_now = datetime.now(timezone.utc)
-        current_eligible = {
-            eid
-            for eid, event in by_id.items()
-            if records[eid]["state"] == "active"
-            and qualify(event, self.config, health_now)["qualifies"]
-        }
-        deliverable = sum(
-            item["incident_id"] in current_eligible
-            and pending_valid(item, self.records, self.config, health_now)
-            for item in self.outbox
-        )
+        deliverable = self._deliverable_count(records, candidate_events, health_now)
         quarantine_count = getattr(events, "quarantined", 0) + sum(
             records[e["id"]]["state"] == "quarantined" for e in candidate_events
         )
@@ -1071,6 +1127,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
             except CancellationEvidenceOverflow as err:
                 records = err.records if err.records is not None else self.records
+                plans = list(getattr(err, "plans", None) or ())
                 degraded_trigger = "cancellation_evidence_overflow"
                 overflow_horizon = (
                     timestamp(err.dropped_horizon)
@@ -1080,12 +1137,17 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if degraded_trigger is not None:
                 self._latch_degraded(degraded_trigger, now, overflow_horizon)
             elif self.degraded:
+                horizon = (
+                    MAX_AGE
+                    if self.degraded_reason == "outbox_overflow"
+                    else MAX_ACCEPTANCE_AGE
+                )
                 if self.degraded_at is None:
                     self.degraded_at = now.isoformat()
-                    self.degraded_until = (now + MAX_ACCEPTANCE_AGE).isoformat()
+                    self.degraded_until = (now + horizon).isoformat()
                 elif self.degraded_until is None:
                     self.degraded_until = (
-                        (timestamp(self.degraded_at) or now) + MAX_ACCEPTANCE_AGE
+                        (timestamp(self.degraded_at) or now) + horizon
                     ).isoformat()
                 until = timestamp(self.degraded_until)
                 if until is not None and now > until:
@@ -1096,7 +1158,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             degraded_delta = (
                 now - last_ts
                 if (
-                    self.last_degraded_poll is not None
+                    self.degraded_reason != "outbox_overflow"
+                    and self.last_degraded_poll is not None
                     and (last_ts := timestamp(self.last_degraded_poll)) is not None
                     and now > last_ts
                 )
@@ -1109,7 +1172,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             outbox = self._migrate_and_prune_outbox(
                 records, candidate_events, now, groups, degraded_delta=degraded_delta
             )
-            if self.degraded:
+            if self.degraded and self.degraded_reason != "outbox_overflow":
                 return await self._persist_degraded_poll(
                     records,
                     plans,
@@ -1133,21 +1196,32 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 records, plans, outbox, candidate_events, groups, now
             )
             if outbox_overflow:
-                self._latch_degraded("outbox_overflow", now)
-                return await self._persist_degraded_poll(
-                    records,
-                    dropped_plans,
-                    outbox,
-                    groups,
-                    events,
-                    candidate_events,
-                    now,
+                self._latch_degraded("outbox_overflow", now, now + MAX_AGE)
+                self._strip_withheld_actions(records, dropped_plans, groups, now)
+                self.last_degraded_poll = None
+                await self._save(records, outbox, list(self.outcomes))
+                if not already_delivered:
+                    attempts, failures = await self._deliver_outbox_batch(
+                        candidate_events, now
+                    )
+                self._sync_degraded_notification()
+                return self._degraded_health(
+                    events=events,
+                    candidate_events=candidate_events,
+                    records=records,
+                    now=now,
                     triggered_now=True,
                     recoverable_prior_conflict=recoverable_prior_conflict,
                     planned_count=len(plans) - len(dropped_plans),
+                    withheld_count=len(dropped_plans),
                     delivery_attempts=attempts,
                     delivery_failures=failures,
                 )
+            if self.degraded and self.degraded_reason == "outbox_overflow":
+                self.degraded = False
+                self.degraded_reason = None
+                self.degraded_at = None
+                self.degraded_until = None
             self.last_degraded_poll = None
             await self._save(records, outbox, list(self.outcomes))
             if not already_delivered:
@@ -1181,17 +1255,23 @@ async def async_setup_entry(hass, entry):
         raise ConfigEntryNotReady(f"Invalid situareness.json: {err}") from err
     prefix = f"{DOMAIN}.{entry.entry_id}"
     store = Store(hass, 1, prefix, private=True)
+    if hasattr(store, "_async_migrate_func"):
+
+        async def _reject_migrate(old_major, old_minor, old_data):
+            raise ValueError(f"Unsupported storage version {old_major}.{old_minor}")
+
+        store._async_migrate_func = _reject_migrate
     has_corrupt_backup = False
     try:
         persisted = await store.async_load()
-    except (json.JSONDecodeError, ValueError, TypeError, KeyError):
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError, NotImplementedError):
         persisted = ["unreadable"]
     except Exception as err:
         cause = getattr(err, "__cause__", None)
         if isinstance(err, OSError) or isinstance(cause, OSError):
             raise ConfigEntryNotReady(f"Could not read persisted store: {err}") from err
         if (
-            isinstance(cause, ValueError)
+            isinstance(cause, (ValueError, NotImplementedError))
             or type(err).__name__ == "UnsupportedStorageVersionError"
         ):
             persisted = ["unreadable"]

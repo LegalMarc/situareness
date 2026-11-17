@@ -1,5 +1,6 @@
 """Validate private administrator-owned configuration."""
 
+from datetime import datetime, timezone
 import math
 import re
 from .domain import timestamp
@@ -10,7 +11,7 @@ SERVICE = re.compile(r"^mobile_app_[a-z0-9_]+$")
 ENTITY = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
 
 
-def validate(raw):
+def validate(raw, now=None):
     if not isinstance(raw, dict):
         raise ValueError("configuration must be an object")
     states = raw.get("states", sorted(STATES))
@@ -103,11 +104,13 @@ def validate(raw):
             raise ValueError("live gates must be boolean")
     ack = raw.get("acknowledge_degraded_at")
     if ack is not None:
-        if not isinstance(ack, str) or timestamp(ack) is None:
+        ack_ts = timestamp(ack) if isinstance(ack, str) else None
+        cutoff = now if now is not None else datetime.now(timezone.utc)
+        if ack_ts is None or ack_ts > cutoff:
             raise ValueError(
-                "acknowledge_degraded_at must be a timezone-aware ISO-8601 timestamp"
+                "acknowledge_degraded_at must be a non-future timezone-aware ISO-8601 timestamp"
             )
-        ack = timestamp(ack).isoformat()
+        ack = ack_ts.isoformat()
     return {
         "states": list(dict.fromkeys(states)),
         "locations": locations,

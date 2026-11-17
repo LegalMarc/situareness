@@ -492,3 +492,70 @@ async def test_real_ha_corrupt_json_store_latches_malformed_store(hass, monkeypa
     await hass.async_block_till_done()
     assert "situareness_degraded" not in hass.data.get("persistent_notification", {})
     assert not list(storage_dir.glob(f"situareness.{entry.entry_id}.corrupt.*"))
+
+
+async def test_real_ha_storage_version_mismatch_latches_malformed_store(
+    hass, monkeypatch
+):
+    cfg = {
+        "states": ["NY"],
+        "locations": {"new_york_ny": {"name": "New York", "point": [0.5, 0.5]}},
+        "approved_rules": {"Tornado Warning": ["Take shelter immediately"]},
+        "phones": ["mobile_app_test"],
+        "live_enabled": True,
+        "commissioning_passed": True,
+    }
+    Path(hass.config.path("situareness.json")).write_text(json.dumps(cfg))
+    calls = []
+    hass.services.async_register(
+        "notify", "mobile_app_test", lambda call: calls.append(call.data)
+    )
+    await integration_module(hass, monkeypatch, [])
+    entry = MockConfigEntry(domain="situareness", title="Situareness", data={})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+    storage_file = Path(hass.config.path(".storage")) / (
+        "situareness." + entry.entry_id
+    )
+    for bad_envelope in (
+        {
+            "version": 0,
+            "minor_version": 1,
+            "key": "situareness." + entry.entry_id,
+            "data": {"records": {}},
+        },
+        {
+            "version": 2,
+            "minor_version": 1,
+            "key": "situareness." + entry.entry_id,
+            "data": {"records": {}},
+        },
+        {
+            "version": 1,
+            "minor_version": 2,
+            "key": "situareness." + entry.entry_id,
+            "data": {"records": {}},
+        },
+    ):
+        raw_text = json.dumps(bad_envelope)
+        storage_file.write_text(raw_text, encoding="utf-8")
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        state = hass.states.get("sensor.situareness_monitoring")
+        assert state is not None and state.state == "unknown"
+        assert state.attributes["evidence_degraded"] is True
+        assert state.attributes["output_blocked"] is True
+        assert state.attributes["degraded_reason"] == "malformed_store"
+        assert state.attributes["degraded_until"] is None
+        assert "situareness_degraded" in hass.data.get("persistent_notification", {})
+        assert storage_file.read_text(encoding="utf-8") == raw_text
+        assert calls == []
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert "situareness_degraded" not in hass.data.get("persistent_notification", {})

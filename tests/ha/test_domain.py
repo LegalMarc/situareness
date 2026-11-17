@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 PACKAGE = "situareness_test"
 pkg = types.ModuleType(PACKAGE)
@@ -778,7 +779,10 @@ class Policy(unittest.TestCase):
         self.assertFalse(defaults["live_enabled"])
         self.assertFalse(defaults["commissioning_passed"])
         self.assertIsNone(defaults["acknowledge_degraded_at"])
-        validated = c.validate({"acknowledge_degraded_at": "2026-11-17T10:00:00-05:00"})
+        validated = c.validate(
+            {"acknowledge_degraded_at": "2026-11-17T10:00:00-05:00"},
+            now=datetime(2026, 11, 17, 16, 0, tzinfo=timezone.utc),
+        )
         self.assertEqual(
             validated["acknowledge_degraded_at"], "2026-11-17T15:00:00+00:00"
         )
@@ -788,6 +792,11 @@ class Policy(unittest.TestCase):
             {"locations": {"x": {"point": [999, 0]}}},
             {"states": ["NY&bad=1"]},
             {"acknowledge_degraded_at": "2026-11-17T10:00:00"},
+            {
+                "acknowledge_degraded_at": (
+                    datetime.now(timezone.utc) + timedelta(minutes=1)
+                ).isoformat()
+            },
             {"acknowledge_degraded_at": 123},
         ):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
@@ -1049,11 +1058,13 @@ class Policy(unittest.TestCase):
             cap_event(f"scale-act-{i}", -2, message_type="Alert") for i in range(100)
         ]
         cfg = config()
-        start = time.perf_counter()
-        records, _ = d.reconcile(prior, current, cfg, NOW)
-        elapsed = time.perf_counter() - start
+        with patch.object(d, "deepcopy", wraps=d.deepcopy) as mock_deepcopy:
+            start = time.perf_counter()
+            records, _ = d.reconcile(prior, current, cfg, NOW)
+            elapsed = time.perf_counter() - start
+        mock_deepcopy.assert_called_once()
         self.assertLessEqual(len(records), 1000)
-        self.assertLess(elapsed, 0.5)
+        self.assertLess(elapsed, 5.0)
 
     def test_normalize_oversized_and_non_string_properties(self):
         oversized = feature()

@@ -39,10 +39,11 @@ def safe_url(value):
 class CancellationEvidenceOverflow(ValueError):
     """Cancellation evidence cannot fit safely in the durable journal."""
 
-    def __init__(self, message, records=None, dropped_horizon=None):
+    def __init__(self, message, records=None, dropped_horizon=None, plans=None):
         super().__init__(message)
         self.records = records
         self.dropped_horizon = dropped_horizon
+        self.plans = list(plans or ())
 
 
 class OversizedFeature(ValueError):
@@ -1005,7 +1006,9 @@ def _quarantined_record(
     return record
 
 
-def _bound_records(records, graph_events, groups, seen, planned_in_poll, now):
+def _bound_records(
+    records, graph_events, groups, seen, planned_in_poll, now, plans=None
+):
     """Enforce the 1,000-record cap, raising overflow if protected history exceeds it."""
     cancellation_groups = {
         groups.get(eid)
@@ -1055,6 +1058,7 @@ def _bound_records(records, graph_events, groups, seen, planned_in_poll, now):
             "current messages and cancellation evidence exceed journal limit",
             records=bounded,
             dropped_horizon=dropped_horizon,
+            plans=plans,
         )
     return dict(sorted(records.items(), key=sort_key, reverse=True)[:1000])
 
@@ -1575,5 +1579,7 @@ def reconcile(
             record.update(
                 state="ended_or_absent", inactive_since=since, updated=now.isoformat()
             )
-    records = _bound_records(records, graph_events, groups, seen, planned_in_poll, now)
+    records = _bound_records(
+        records, graph_events, groups, seen, planned_in_poll, now, plans=plans
+    )
     return records, plans

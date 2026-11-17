@@ -2,6 +2,20 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 eleventh Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `ad93ead` (`run_id`: `20261117T214931Z-ca8e85`, 318.6s standards and 291.6s specification) reported **0 Critical, 0 High, and 0 CAP/qualification/quarantine/lifecycle/browser/packaging/catalog findings**, leaving 7 unique Home Assistant, test, and doc findings (`SIT-R1`/`HA-OVF-01` Medium, `HA-STORE-01` Low–Medium, `SIT-R2` Low, `SIT-R3` Low, `HA-IO-01` Low, `SIT-R4` Nit, `SIT-R5` Nit).
+
+All 7 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor contract/doc/report updates:
+- **`SIT-R1` / `HA-OVF-01`**: Switched `outbox_overflow` to the 15-minute `MAX_AGE` horizon without advancing item age via `last_degraded_poll`, continued bounded `100`-target/poll queued delivery (`evidence_degraded: False`, `output_blocked: False`, accurate `deliverable_count`/`suspended_count`/`withheld_count`, active `active_count`), and auto-cleared `outbox_overflow` on the first poll where capacity fits.
+- **`HA-STORE-01`**: Rejected storage major/minor version mismatches via `_async_migrate_func` (`ValueError`) and caught `NotImplementedError` alongside `UnsupportedStorageVersionError` as `malformed_store` without altering on-disk files, verified by an additional real-HA test (`11 passed`).
+- **`SIT-R2` & `SIT-R4`**: Carried stripped `plans` on `CancellationEvidenceOverflow` to surface accurate `withheld_count`, and updated `situareness_degraded` notifications to distinguish `outbox_overflow`, `degraded_until` + `acknowledge_degraded_at` + reload recovery, and `.storage` manual repair for `malformed_store`.
+- **`SIT-R3`**: Enforced non-future `acknowledge_degraded_at` in `config.validate(raw, now=None)` and consumed non-matching/premature load-time acknowledgements (`self.acknowledged_degraded_at = ack`) so stale config entries cannot clear future degradations.
+- **`HA-IO-01`**: Batched expired-item pruning and post-delivery persistence in `_deliver_outbox_batch()` to save once per completed 10-target delivery group.
+- **`SIT-R5`**: Checked single-`deepcopy` behavior deterministically (`patch.object(d, "deepcopy")`) with a relaxed `<5.0s` wall-clock sanity bound in `tests/ha/test_domain.py`, and synchronized docs/READMEs.
+
+Next: run complete local gates (`43` Node, `87` stdlib HA, `7` skill, `21` Chromium, `11` actual HA = `169` total), deterministic packaging (`823de6d0...` extension, `3a3b1a7e...` HA), live anonymous smoke (`2026-11-17T22:12:43.675Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, and run Opus `axes` + fresh `adversarial` reviews. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 17 tenth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `221ed9b` (`run_id`: `20261117T203507Z-d741fd`, 316.3s standards and 287.4s specification) reported **0 Critical, 0 High, and 0 CAP/cancellation, browser/UI, packaging, catalog, or live/shadow gate findings**, leaving 8 unique Home Assistant, test, and doc findings (1 Medium, 5 Low, 2 Nit).
