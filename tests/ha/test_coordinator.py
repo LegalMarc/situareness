@@ -656,7 +656,12 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             {"records": {"id": {"inactive_since": 123}}},
             {"records": {"id": {"cancel_message": "yes"}}},
             {"records": {"id": {"cancellation_expired": "no"}}},
+            {"records": {"id": {"action_identity": ["unhashable"]}}},
+            {"records": {"id": {"fingerprint": 123}}},
+            {"records": {"id": {"prior_state": 123}}},
+            {"records": {"id": {"action_affected": [123]}}},
             {"acknowledged_degraded_at": "not-a-timestamp"},
+            {"last_degraded_poll": "not-a-timestamp"},
             {
                 "outbox": [
                     {
@@ -666,6 +671,10 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                         "kind": "phone",
                         "target": "t",
                         "created": "2026-11-17T00:00:00+00:00",
+                        "event": "Tornado Warning",
+                        "instruction": "Take shelter.",
+                        "source_url": "https://api.weather.gov/alerts/1",
+                        "affected_names": ["New York"],
                         "location": None,
                         "attempts": True,
                     }
@@ -680,6 +689,24 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                         "kind": "phone",
                         "target": "t",
                         "created": "2026-11-17T00:00:00+00:00",
+                        "event": "Tornado Warning",
+                        "instruction": "Take shelter.",
+                        "source_url": "https://api.weather.gov/alerts/1",
+                        "affected_names": ["New York"],
+                        "attempts": 0,
+                    }
+                ]
+            },
+            {
+                "outbox": [
+                    {
+                        "key": "k",
+                        "incident_id": "i",
+                        "fingerprint": "f",
+                        "kind": "phone",
+                        "target": "t",
+                        "created": "2026-11-17T00:00:00+00:00",
+                        "location": None,
                         "attempts": 0,
                     }
                 ]
@@ -693,6 +720,10 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                         "kind": "phone",
                         "target": "t",
                         "created": "not-an-iso-date",
+                        "event": "Tornado Warning",
+                        "instruction": "Take shelter.",
+                        "source_url": "https://api.weather.gov/alerts/1",
+                        "affected_names": ["New York"],
                         "location": None,
                         "attempts": 0,
                     }
@@ -712,6 +743,8 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(health["evidence_degraded"])
                 self.assertTrue(health["output_blocked"])
                 self.assertEqual(health["degraded_reason"], "malformed_store")
+                self.assertIsNotNone(health["degraded_at"])
+                self.assertIsNotNone(health["degraded_until"])
                 self.assertFalse(health["quarantine_ambiguous"])
                 self.assertFalse(health["cancellation_uncertain"])
                 self.assertFalse(health["partial"])
@@ -824,6 +857,9 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coordinator.outbox[0]["incident_id"], child["id"])
         self.assertNotIn(
             child["id"], [call[2]["data"].get("url") for call in services.calls]
+        )
+        self.assertIn(
+            sibling["id"], [call[2]["data"].get("url") for call in services.calls]
         )
 
     async def test_cancellation_evidence_loss_latches_before_delivery_and_survives_restart(
@@ -1326,6 +1362,240 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             h_diff = await c_inc_diff._async_update_data()
         self.assertTrue(h_diff["evidence_degraded"])
         self.assertEqual(h_diff["degraded_reason"], "conflicting_cancellation")
+
+    async def test_sibling_withheld_release_overflow_release_conflict_preserve_and_outbox_age(
+        self,
+    ):
+        import copy
+        from datetime import datetime, timedelta, timezone
+        from test_domain import collector
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+        now = datetime.now(timezone.utc)
+
+        def make_alert(name):
+            ev = d.normalize(feature())
+            ev["id"] = "https://api.weather.gov/alerts/" + name
+            for key, delta in [
+                ("sent", -2),
+                ("effective", -2),
+                ("onset", 0),
+                ("expires", 120),
+                ("ends", 120),
+            ]:
+                ev[key] = (now + timedelta(minutes=delta)).isoformat()
+            cohere(ev)
+            return ev
+
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+
+        # SR-H1: Two equivalent siblings S1, S2 qualify during degradation;
+        # after recovery (even if S1 leaves), S2 delivers.
+        root = make_alert("srh1-root")
+        s1 = make_alert("srh1-s1")
+        s2 = make_alert("srh1-s2")
+        cohere(s1, root)
+        cohere(s2, root)
+        services = Services()
+        store = Store()
+        coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services), cfg, store, {}
+        )
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents(
+                [s1, s2], 0, [], False, uncertain_cancellation=True
+            ),
+        ):
+            h_deg = await coord._async_update_data()
+        self.assertTrue(h_deg["evidence_degraded"])
+        self.assertEqual(store.saved[-1]["records"][s1["id"]]["actions"], {})
+        self.assertEqual(store.saved[-1]["records"][s2["id"]]["actions"], {})
+        recovered = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services),
+            {**cfg, "acknowledge_degraded_at": h_deg["degraded_at"]},
+            Store(),
+            store.saved[-1],
+        )
+        with patch.object(mod, "fetch", return_value=[s2]):
+            await recovered._async_update_data()
+        self.assertEqual(len(services.calls), 1)
+        self.assertEqual(services.calls[0][2]["data"]["url"], s2["id"])
+
+        # SIT-M1: Overflow strips newly planned action on bounded records.
+        overflow_records = {
+            f"old-cancel-{i}": {
+                "state": "cancelled",
+                "cancel_message": True,
+                "lineage": [],
+                "updated": now.isoformat(),
+            }
+            for i in range(1000)
+        }
+        ov_alert = make_alert("sit-m1-alert")
+        store_ov = Store()
+        c_ov = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=Services()),
+            cfg,
+            store_ov,
+            {
+                "initialized": True,
+                "was_live": True,
+                "records": overflow_records,
+                "outbox": [],
+            },
+        )
+        with patch.object(mod, "fetch", return_value=[ov_alert]):
+            h_ov = await c_ov._async_update_data()
+        self.assertEqual(h_ov["degraded_reason"], "cancellation_evidence_overflow")
+        self.assertEqual(store_ov.saved[-1]["records"][ov_alert["id"]]["actions"], {})
+
+        # SIT-H2 / SR-M1: Conflicting Cancel C' (refs=[t2]) preserves C -> t1 across ack,
+        # quarantines t2, and blocks t1 replay after recovery.
+        t1 = make_alert("sit-h2-t1")
+        t2 = make_alert("sit-h2-t2")
+        c_orig = make_alert("sit-h2-c")
+        c_orig["message_type"] = "Cancel"
+        cohere(c_orig, t1)
+        services_h2 = Services()
+        store_h2 = Store()
+        c_h2 = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services_h2), cfg, store_h2, {}
+        )
+        with patch.object(mod, "fetch", return_value=[t1, t2, c_orig]):
+            await c_h2._async_update_data()
+        self.assertEqual(len(services_h2.calls), 1)
+        self.assertEqual(services_h2.calls[0][2]["data"]["url"], t2["id"])
+
+        c_conf = copy.deepcopy(c_orig)
+        c_conf["references"] = [t2["id"]]
+        c_conf["reference_identities"] = [t2["cap_identity"]]
+        with patch.object(mod, "fetch", return_value=[c_conf, t2]):
+            h_conf1 = await c_h2._async_update_data()
+            h_conf2 = await c_h2._async_update_data()
+        self.assertEqual(h_conf1["degraded_reason"], "conflicting_cancellation")
+        self.assertEqual(h_conf2["degraded_reason"], "conflicting_cancellation")
+        self.assertEqual(store_h2.saved[-1]["records"][t1["id"]]["state"], "cancelled")
+        self.assertEqual(
+            store_h2.saved[-1]["records"][t2["id"]]["state"], "quarantined"
+        )
+
+        c_h2_rec = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=services_h2),
+            {**cfg, "acknowledge_degraded_at": h_conf2["degraded_at"]},
+            Store(),
+            store_h2.saved[-1],
+        )
+        with patch.object(mod, "fetch", return_value=[t1]):
+            h_replay = await c_h2_rec._async_update_data()
+        self.assertFalse(h_replay["evidence_degraded"])
+        self.assertEqual(len(services_h2.calls), 1)
+
+        # SIT-M2: Pre-degradation undelivered target survives >15m degradation
+        # without duplicating already-accepted target.
+        class Clock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        Clock.current = now
+
+        class PartialFailServices(Services):
+            fail_two = True
+
+            async def async_call(self, *args, **kwargs):
+                self.calls.append(args)
+                if self.fail_two and args[1] == "mobile_app_two":
+                    raise OSError("phone 2 offline")
+
+        cfg_two = {**cfg, "phones": ["mobile_app_one", "mobile_app_two"]}
+        m2_alert = make_alert("sit-m2-alert")
+        srv_m2 = PartialFailServices()
+        store_m2 = Store()
+        c_m2 = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=srv_m2), cfg_two, store_m2, {}
+        )
+        with patch.object(mod, "datetime", Clock):
+            with patch.object(mod, "fetch", return_value=[m2_alert]):
+                await c_m2._async_update_data()
+            self.assertEqual(len(srv_m2.calls), 2)
+            self.assertEqual(len(store_m2.saved[-1]["outbox"]), 1)
+
+            # T + 1m: enter degraded mode.
+            Clock.current = now + timedelta(minutes=1)
+            with patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents(
+                    [m2_alert], 0, [], False, uncertain_cancellation=True
+                ),
+            ):
+                h_m2_deg = await c_m2._async_update_data()
+            self.assertTrue(h_m2_deg["evidence_degraded"])
+
+            # T + 20m: still degraded, >15m since initial queue, and m2_alert is
+            # superseded by an equivalent update m2_update; retry migrates and survives.
+            Clock.current = now + timedelta(minutes=20)
+            m2_update = make_alert("sit-m2-update")
+            cohere(m2_update, m2_alert)
+            with patch.object(mod, "fetch", return_value=[m2_update]):
+                await c_m2._async_update_data()
+            self.assertEqual(len(store_m2.saved[-1]["outbox"]), 1)
+            self.assertEqual(
+                store_m2.saved[-1]["outbox"][0]["incident_id"], m2_update["id"]
+            )
+
+            # T + 21m: recover via ack; phone 2 delivers once for m2_update,
+            # and phone 1 is not duplicated.
+            Clock.current = now + timedelta(minutes=21)
+            srv_m2.fail_two = False
+            c_m2_rec = mod.SituarenessCoordinator(
+                types.SimpleNamespace(services=srv_m2),
+                {
+                    **cfg_two,
+                    "acknowledge_degraded_at": (now + timedelta(minutes=2)).isoformat(),
+                },
+                Store(),
+                store_m2.saved[-1],
+            )
+            with patch.object(mod, "fetch", return_value=[m2_update]):
+                h_m2_rec = await c_m2_rec._async_update_data()
+            self.assertFalse(h_m2_rec["evidence_degraded"])
+            self.assertEqual(len(srv_m2.calls), 3)
+            self.assertEqual(srv_m2.calls[-1][1], "mobile_app_two")
+            self.assertEqual(srv_m2.calls[-1][2]["data"]["url"], m2_update["id"])
+
+        # SR-M2: Conflicting duplicate Cancel in collector latches conflicting_cancellation.
+        c_dup_cancel = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=Services()), cfg, Store(), {}
+        )
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents(
+                [t1], 2, [], False, conflicting_cancellation=True
+            ),
+        ):
+            h_dup = await c_dup_cancel._async_update_data()
+        self.assertEqual(h_dup["degraded_reason"], "conflicting_cancellation")
 
     async def test_invalid_cap_cancel_quarantines_locally_and_independent_sibling_retries(
         self,

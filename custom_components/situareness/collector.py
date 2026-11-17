@@ -21,6 +21,7 @@ class CollectedEvents(list):
         source_count=None,
         all_events=None,
         uncertain_cancellation=False,
+        conflicting_cancellation=False,
     ):
         super().__init__(events)
         self.quarantined = quarantined
@@ -28,6 +29,7 @@ class CollectedEvents(list):
         self.quarantine_ambiguous = quarantine_ambiguous
         self.all_events = list(events) if all_events is None else all_events
         self.uncertain_cancellation = uncertain_cancellation
+        self.conflicting_cancellation = conflicting_cancellation
         self.source_count = (
             source_count if source_count is not None else len(events) + quarantined
         )
@@ -35,11 +37,13 @@ class CollectedEvents(list):
 
 async def fetch(session, states):
     events = {}
+    conflicting_ids = set()
     quarantined = 0
     quarantined_lineages = []
     quarantine_refs = 0
     quarantine_ambiguous = False
     uncertain_cancellation = False
+    conflicting_cancellation = False
     feature_count = 0
     url = "https://api.weather.gov/alerts/active?" + urlencode(
         {"area": ",".join(states)}
@@ -137,9 +141,33 @@ async def fetch(session, states):
                 else:
                     quarantine_ambiguous = True
                 continue
-            if event["id"] in events and events[event["id"]] != event:
-                raise ValueError("conflicting duplicate NWS message identity")
-            events[event["id"]] = event
+            eid = event["id"]
+            if eid in conflicting_ids:
+                quarantined += 1
+                if (
+                    event.get("status") == "Actual"
+                    and event.get("message_type") == "Cancel"
+                ):
+                    conflicting_cancellation = True
+                quarantined_lineages.append([eid, *event.get("references", [])])
+                continue
+            if eid in events and events[eid] != event:
+                existing = events.pop(eid)
+                conflicting_ids.add(eid)
+                quarantined += 2
+                if (
+                    existing.get("status") == "Actual"
+                    and existing.get("message_type") == "Cancel"
+                ) or (
+                    event.get("status") == "Actual"
+                    and event.get("message_type") == "Cancel"
+                ):
+                    conflicting_cancellation = True
+                quarantined_lineages.append(
+                    [eid, *existing.get("references", []), *event.get("references", [])]
+                )
+                continue
+            events[eid] = event
             if (
                 event.get("status") == "Actual"
                 and event.get("message_type") == "Cancel"
@@ -181,4 +209,5 @@ async def fetch(session, states):
         feature_count,
         all_events=list(events.values()),
         uncertain_cancellation=uncertain_cancellation,
+        conflicting_cancellation=conflicting_cancellation,
     )

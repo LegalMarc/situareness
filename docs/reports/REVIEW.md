@@ -16,8 +16,10 @@ The release gate is open until the current candidate has zero supported unresolv
 | `63da80f6660667a529a3c4e0d1a0b7bc368760b5` | Focused browser/package | OpenAI `gpt-6-astra`, ultra | One P2 finding (`BROWSE-01`); repaired in `5ec38ac` |
 | `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Standards | Claude Opus 5.5, medium effort | Seven findings (`run_id`: `20261117T164428Z-8b628a`, 260.4s); repaired in `e38a7fd` |
 | `fcc9072c9d221a353d2a0483f22d3a0c3e74f89a` | Specification | Claude Opus 5.5, medium effort | Twelve findings (`run_id`: `20261117T164428Z-8b628a`, 225.2s); repaired in `e38a7fd` |
-| `e38a7fdd88ff4877bf2969bad2658c5025ed583d` | Standards | Claude Opus 5.5, medium effort | Ten findings (`run_id`: `20261117T171412Z-dfb683`, 214.2s; zero browser/packaging defects); repaired for next candidate |
-| `e38a7fdd88ff4877bf2969bad2658c5025ed583d` | Specification | Claude Opus 5.5, medium effort | Eight findings (`run_id`: `20261117T171412Z-dfb683`, 204.1s; zero browser/packaging defects); repaired for next candidate |
+| `e38a7fdd88ff4877bf2969bad2658c5025ed583d` | Standards | Claude Opus 5.5, medium effort | Ten findings (`run_id`: `20261117T171412Z-dfb683`, 214.2s; zero browser/packaging defects); repaired in `83f328c` |
+| `e38a7fdd88ff4877bf2969bad2658c5025ed583d` | Specification | Claude Opus 5.5, medium effort | Eight findings (`run_id`: `20261117T171412Z-dfb683`, 204.1s; zero browser/packaging defects); repaired in `83f328c` |
+| `83f328c518f4f9c5b87903b5ef56317127a94ae8` | Standards | Claude Opus 5.5, medium effort | Six findings (`run_id`: `20261117T173308Z-a2a286`, 260.9s; zero browser/packaging defects); repaired for next candidate |
+| `83f328c518f4f9c5b87903b5ef56317127a94ae8` | Specification | Claude Opus 5.5, medium effort | Five findings (`run_id`: `20261117T173308Z-a2a286`, 267.0s; zero browser/packaging defects); repaired for next candidate |
 
 The exact model reported by completed CLI result metadata was `claude-opus-5-5`. The second standards/specification passes took 204.4 and 205.3 seconds respectively. They independently read an immutable full-source snapshot, complete change diff from the public root, documented contract/standards, and raw local test evidence. They executed no code or physical output.
 
@@ -144,4 +146,19 @@ Candidate `e38a7fdd88ff4877bf2969bad2658c5025ed583d` passed 141 local tests and 
 | Standards / Spec | SIT-N1 / SIT-R8 | Nit | Dead `_store_recovered` attribute. | Removed `_store_recovered`; re-review pending. |
 | Standards | SIT-N2 | Nit | Documented `degraded_until` missing from sensor attributes. | Exposed `degraded_until` on normal and degraded sensor health; re-review pending. |
 
-All findings from `fcc9072` and `e38a7fd` are repaired and pass 143 local automated tests, Ruff, deterministic packaging, and live anonymous smoke. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.
+### Candidate 83f328c Opus review findings
+
+Candidate `83f328c518f4f9c5b87903b5ef56317127a94ae8` passed 143 local tests and had zero supported defects in the browser room, UI, packaging, and catalog validator. Independent Claude Opus 5.5 medium-effort reviews (`run_id`: `20261117T173308Z-a2a286`; 260.9s standards, 267.0s specification) reported six standards and five specification findings in Home Assistant and HA documentation:
+
+| Axis | Code | Severity | Finding | Current disposition |
+| --- | --- | --- | --- | --- |
+| Standards | SIT-H1 | High | Suspended quarantined retry collides in `_outbox_signature` with an independent sibling in the same group. | Key quarantined outbox items separately by `incident_id` in `_outbox_signature`; re-review pending. |
+| Standards / Spec | SIT-H2 / SR-M1 | High / Medium | Conflicting `Cancel` overwrites prior `C -> T1` evidence, allowing `T1` replay after recovery. | Preserved prior `cap_identity`/`cap_references`/`cancel_message`/`lineage` on `conflicting_prior_cancel` while quarantining conflicting references; re-review pending. |
+| Standards / Spec | SIT-M1 / SR-H1 | Medium / High | Newly qualifying sibling alerts and `CancellationEvidenceOverflow` polls fail to clear withheld `actions`. | Pop `(group, fp)` from `records` on `now` across all siblings and before raising `CancellationEvidenceOverflow`; re-review pending. |
+| Standards | SIT-M2 | Medium | Undelivered pre-degradation outbox items expire past `MAX_AGE` during >15m degradation. | Preserved active retry budget across degradation via `last_degraded_poll` and `degraded_delta` migration without duplicating sent targets; re-review pending. |
+| Spec | SR-M2 | Medium | Conflicting duplicate feature in `collector.py` fails the entire poll via `ValueError`. | Quarantined conflicting duplicate features per feature/lineage (and set `conflicting_cancellation` for duplicate Cancels); re-review pending. |
+| Standards | SIT-L1 | Low | Docs overstate what `acknowledge_degraded_at` clears while an active trigger persists. | Clarified in `o3-mvp.md`, `cap-cancellation.md`, `docs/ha/README.md`, and `home-assistant/README.md` that ongoing triggers refresh `degraded_at`/`degraded_until`; re-review pending. |
+| Standards / Spec | SIT-L2 / SR-L1 | Low | Deep store validation misses unhashable `prior_state`/`action_identity`/`fingerprint`/`action_fingerprint`/`action_affected` and outbox payload fields. | Completed `_valid_persisted_store` validation across all record and outbox fields; re-review pending. |
+| Spec | SR-L2 | Low | `malformed_store` reports `degraded_at: null` and `degraded_until: null`. | Populated `degraded_at` and `degraded_until` from detection time while keeping `malformed_store` latched until store repair/replacement; re-review pending. |
+
+All findings from `fcc9072`, `e38a7fd`, and `83f328c` are repaired and pass 146 local automated tests, Ruff, deterministic packaging, and live anonymous smoke. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.

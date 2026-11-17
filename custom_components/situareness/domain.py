@@ -424,6 +424,32 @@ def cancellation_horizon(group_ids, records):
     return max(timestamps) + MAX_ACCEPTANCE_AGE if timestamps else None
 
 
+def conflicting_prior_cancel(event, old):
+    """Return True if an incoming event conflicts with persisted cancellation state."""
+    if old is None:
+        return False
+    event_refs = (
+        event.get("reference_identities") if event.get("cap_references_valid") else None
+    )
+    event_lineage = sorted({event["id"], *event.get("references", [])})
+    matches = (
+        event.get("status") == "Actual"
+        and event.get("message_type") == "Cancel"
+        and event.get("cap_identity") == old.get("cap_identity")
+        and event_refs == old.get("cap_references")
+        and (
+            event_refs is not None
+            or old.get("lineage") is None
+            or event_lineage == old.get("lineage")
+        )
+    )
+    if old.get("cancel_message") or old.get("cancellation_expired"):
+        return not matches
+    if "cancel_message" not in old:
+        return False
+    return event.get("status") == "Actual" and event.get("message_type") == "Cancel"
+
+
 def cancellation_evidence(records, events, groups, now=None):
     """Find explicit cancelled messages and directed, uncertain successors.
 
@@ -468,6 +494,9 @@ def cancellation_evidence(records, events, groups, now=None):
         is_cancel = (
             event.get("status") == "Actual" and event.get("message_type") == "Cancel"
         )
+        if eid in records and conflicting_prior_cancel(event, records[eid]):
+            ambiguous_groups.add(groups.get(eid))
+            continue
         identity = event.get("cap_identity")
         refs = event.get("reference_identities")
         valid = (
@@ -487,7 +516,8 @@ def cancellation_evidence(records, events, groups, now=None):
         node = (tuple(identity), [tuple(r) for r in refs], is_cancel)
         if eid in nodes and nodes[eid] != node:
             ambiguous_groups.add(groups.get(eid))
-        nodes[eid] = node
+        else:
+            nodes[eid] = node
         if is_cancel:
             cancellations.append(eid)
     identities = {}
@@ -585,6 +615,9 @@ def _invalid_graph_ids(prior, graph_events):
     }
     invalid_ids = set()
     for source in graph_events:
+        if conflicting_prior_cancel(source, prior.get(source["id"])):
+            invalid_ids.add(source["id"])
+            continue
         if not cap_event_valid(source):
             invalid_ids.add(source["id"])
             continue
@@ -802,6 +835,41 @@ def reconcile(
         blocked = eid in cancelled_ids
         uncertain = eid in uncertain_ids and not cancelled
         identity_uncertain = not cancelled and eid in invalid_ids
+        old_prior = prior.get(eid)
+        if conflicting_prior_cancel(event, old_prior):
+            if old_prior.get("cancel_message"):
+                records[eid] = {
+                    **old_prior,
+                    "state": "cancelled",
+                    "actions": {},
+                    "affected": [],
+                    "cancel_message": True,
+                    "cancellation_expired": False,
+                    "lineage": old_prior.get("lineage", [eid]),
+                    "reasons": ["conflicting cancellation evidence"],
+                    "updated": now.isoformat(),
+                }
+            else:
+                records[eid] = {
+                    **suspend_record(old_prior, "quarantined", now),
+                    "fingerprint": fp,
+                    "actions": action_history(old_prior),
+                    "action_identity": old_prior.get("action_identity"),
+                    "lineage": old_prior.get("lineage", [eid]),
+                    "reasons": ["conflicting cancellation evidence"],
+                    "cap_identity": old_prior.get("cap_identity"),
+                    "cap_references": old_prior.get("cap_references"),
+                    "cancel_message": old_prior.get("cancel_message", False),
+                    "cancellation_expired": old_prior.get(
+                        "cancellation_expired", False
+                    ),
+                    "sent": old_prior.get("sent"),
+                    "expires": old_prior.get("expires"),
+                    "ends": old_prior.get("ends"),
+                    "affected": [],
+                }
+            seen.add(eid)
+            continue
         if group in quarantine_groups or uncertain or identity_uncertain:
             old_record = records.get(eid, {})
             records[eid] = {
@@ -1064,6 +1132,13 @@ def reconcile(
                 reverse=True,
             )[:1000]
         )
+        for eid, rec in bounded.items():
+            if rec.get("updated") == now.isoformat():
+                rec_actions = rec.get("actions")
+                if isinstance(rec_actions, dict):
+                    for fp in list(rec_actions):
+                        if (groups.get(eid), fp) in planned_in_poll:
+                            rec_actions.pop(fp, None)
         raise CancellationEvidenceOverflow(
             "current messages and cancellation evidence exceed journal limit",
             records=bounded,

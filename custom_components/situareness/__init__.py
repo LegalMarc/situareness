@@ -19,6 +19,7 @@ from .domain import (
     CancellationEvidenceOverflow,
     MAX_ACCEPTANCE_AGE,
     action_history,
+    conflicting_prior_cancel,
     lineage_index,
     qualify,
     reconcile,
@@ -45,7 +46,12 @@ def _valid_persisted_store(persisted):
         return False
     if "degraded" in persisted and not isinstance(persisted["degraded"], bool):
         return False
-    for key in ("degraded_at", "degraded_until", "acknowledged_degraded_at"):
+    for key in (
+        "degraded_at",
+        "degraded_until",
+        "acknowledged_degraded_at",
+        "last_degraded_poll",
+    ):
         val = persisted.get(key)
         if val is not None and (not isinstance(val, str) or timestamp(val) is None):
             return False
@@ -61,14 +67,32 @@ def _valid_persisted_store(persisted):
         for eid, record in records.items():
             if not isinstance(eid, str) or not isinstance(record, dict):
                 return False
-            if "state" in record and not isinstance(record["state"], str):
-                return False
-            if "updated" in record and not isinstance(record["updated"], str):
-                return False
+            for req_str_key in ("state", "updated"):
+                if req_str_key in record and not isinstance(record[req_str_key], str):
+                    return False
+            for opt_str_key in (
+                "prior_state",
+                "fingerprint",
+                "action_identity",
+                "action_fingerprint",
+                "sent",
+                "expires",
+                "ends",
+                "inactive_since",
+            ):
+                if (
+                    opt_str_key in record
+                    and record[opt_str_key] is not None
+                    and not isinstance(record[opt_str_key], str)
+                ):
+                    return False
             if (
-                "inactive_since" in record
-                and record["inactive_since"] is not None
-                and not isinstance(record["inactive_since"], str)
+                "action_affected" in record
+                and record["action_affected"] is not None
+                and (
+                    not isinstance(record["action_affected"], list)
+                    or not all(isinstance(v, str) for v in record["action_affected"])
+                )
             ):
                 return False
             for bool_key in ("cancel_message", "cancellation_expired"):
@@ -120,9 +144,18 @@ def _valid_persisted_store(persisted):
                 "kind",
                 "target",
                 "created",
+                "event",
+                "instruction",
+                "source_url",
             ):
                 if not isinstance(item.get(str_key), str):
                     return False
+            if (
+                "affected_names" not in item
+                or not isinstance(item["affected_names"], list)
+                or not all(isinstance(n, str) for n in item["affected_names"])
+            ):
+                return False
             if timestamp(item.get("created")) is None:
                 return False
             if "location" not in item or not (
@@ -141,7 +174,19 @@ def _valid_persisted_store(persisted):
     return True
 
 
-def _outbox_signature(groups, item):
+def _outbox_signature(groups, item, records=None):
+    if (
+        records is not None
+        and records.get(item["incident_id"], {}).get("state") == "quarantined"
+    ):
+        return (
+            "quarantined",
+            item["incident_id"],
+            item["fingerprint"],
+            item["kind"],
+            item["target"],
+            item["location"],
+        )
     return (
         groups.get(item["incident_id"]),
         item["fingerprint"],
@@ -149,31 +194,6 @@ def _outbox_signature(groups, item):
         item["target"],
         item["location"],
     )
-
-
-def _is_conflicting_cancel(event, old):
-    if old is None:
-        return False
-    event_refs = (
-        event.get("reference_identities") if event.get("cap_references_valid") else None
-    )
-    event_lineage = sorted({event["id"], *event.get("references", [])})
-    matches = (
-        event.get("status") == "Actual"
-        and event.get("message_type") == "Cancel"
-        and event.get("cap_identity") == old.get("cap_identity")
-        and event_refs == old.get("cap_references")
-        and (
-            event_refs is not None
-            or old.get("lineage") is None
-            or event_lineage == old.get("lineage")
-        )
-    )
-    if old.get("cancel_message") or old.get("cancellation_expired"):
-        return not matches
-    if "cancel_message" not in old:
-        return False
-    return event.get("status") == "Actual" and event.get("message_type") == "Cancel"
 
 
 class SituarenessCoordinator(DataUpdateCoordinator):
@@ -184,6 +204,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.config = config
         self.store = store
         if not _valid_persisted_store(persisted):
+            detect_now = datetime.now(timezone.utc)
             self.records = {}
             self.outbox = []
             self.outcomes = []
@@ -191,9 +212,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.was_live = False
             self.degraded = True
             self.degraded_reason = "malformed_store"
-            self.degraded_at = None
-            self.degraded_until = None
+            self.degraded_at = detect_now.isoformat()
+            self.degraded_until = (detect_now + MAX_ACCEPTANCE_AGE).isoformat()
             self.acknowledged_degraded_at = None
+            self.last_degraded_poll = None
         else:
             persisted = persisted if isinstance(persisted, dict) else {}
             self.records = persisted.get("records", {})
@@ -217,6 +239,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 persisted.get("degraded_until") if self.degraded else None
             )
             self.acknowledged_degraded_at = persisted.get("acknowledged_degraded_at")
+            self.last_degraded_poll = (
+                persisted.get("last_degraded_poll") if self.degraded else None
+            )
         self._try_acknowledge(datetime.now(timezone.utc))
         self.session = async_get_clientsession(hass)
         self._refresh_lock = asyncio.Lock()
@@ -241,6 +266,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.degraded_reason = None
         self.degraded_at = None
         self.degraded_until = None
+        self.last_degraded_poll = None
         return True
 
     async def _save(self, records, outbox, outcomes):
@@ -256,6 +282,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 "degraded_at": self.degraded_at,
                 "degraded_until": self.degraded_until,
                 "acknowledged_degraded_at": self.acknowledged_degraded_at,
+                "last_degraded_poll": self.last_degraded_poll,
             }
         )
         self.records, self.outbox, self.outcomes, self.initialized = (
@@ -353,7 +380,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_failures": 0,
         }
 
-    def _migrate_and_prune_outbox(self, records, events, now, groups):
+    def _migrate_and_prune_outbox(
+        self, records, events, now, groups, degraded_delta=None
+    ):
         if not live(self.config):
             return []
         event_index = {}
@@ -365,6 +394,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     event_index.setdefault((groups[eid], fp), []).append(eid)
         for ids in event_index.values():
             ids.sort(key=lambda eid: (records[eid]["state"] != "active", eid))
+        check_time = now - degraded_delta if degraded_delta is not None else now
         candidates = []
         for item in self.outbox:
             if not isinstance(item, dict):
@@ -385,9 +415,22 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     "source_url": successor,
                 }
                 if pending_valid(
-                    candidate, records, self.config, now, allow_suspended=True
+                    candidate, records, self.config, check_time, allow_suspended=True
                 ):
                     item = candidate
+            if (
+                degraded_delta is not None
+                and records.get(item.get("incident_id"), {}).get("state") == "active"
+                and pending_valid(
+                    item, records, self.config, check_time, allow_suspended=True
+                )
+            ):
+                created_ts = timestamp(item.get("created"))
+                if created_ts is not None:
+                    item = {
+                        **item,
+                        "created": min(now, created_ts + degraded_delta).isoformat(),
+                    }
             candidates.append(item)
         outbox = [
             x
@@ -396,7 +439,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         ]
         unique = {}
         for item in outbox:
-            key = _outbox_signature(groups, item)
+            key = _outbox_signature(groups, item, records)
             if key in unique:
                 prior_item = unique[key]
                 # Keep the strictest retry bounds when lineages merge.
@@ -416,8 +459,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             events = await fetch(self.session, self.config["states"])
             source_events = getattr(events, "all_events", events)
             candidate_events = resolve_candidates(self.records, events, source_events)
-            conflicting_cancel = any(
-                _is_conflicting_cancel(event, self.records.get(event["id"]))
+            conflicting_cancel = bool(
+                getattr(events, "conflicting_cancellation", False)
+            ) or any(
+                conflicting_prior_cancel(event, self.records.get(event["id"]))
                 for event in source_events
             )
             malformed_cancel = bool(
@@ -475,18 +520,34 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         self.degraded_reason = None
                         self.degraded_at = None
                         self.degraded_until = None
+            degraded_delta = (
+                now - last_ts
+                if (
+                    self.last_degraded_poll is not None
+                    and (last_ts := timestamp(self.last_degraded_poll)) is not None
+                    and now > last_ts
+                )
+                else None
+            )
             # Carry an undelivered item through equivalent NWS update identifiers.
             # Reconciled records contain only trusted Alert/Update edges;
             # raw source references could reconnect a quarantined forgery.
             groups, _ = lineage_index(records, [])
             outbox = self._migrate_and_prune_outbox(
-                records, candidate_events, now, groups
+                records, candidate_events, now, groups, degraded_delta=degraded_delta
             )
             if self.degraded:
-                for plan in plans:
-                    records.get(plan["id"], {}).get("actions", {}).pop(
-                        plan["fingerprint"], None
-                    )
+                withheld_keys = {
+                    (groups.get(plan["id"]), plan["fingerprint"]) for plan in plans
+                }
+                for eid, record in records.items():
+                    if record.get("updated") == now.isoformat():
+                        rec_actions = record.get("actions")
+                        if isinstance(rec_actions, dict):
+                            for fp in list(rec_actions):
+                                if (groups.get(eid), fp) in withheld_keys:
+                                    rec_actions.pop(fp, None)
+                self.last_degraded_poll = now.isoformat()
                 try:
                     await self._save(records, outbox, list(self.outcomes))
                 except Exception as save_err:
@@ -499,13 +560,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     records=records,
                     now=now,
                 )
+            self.last_degraded_poll = None
             if live(self.config):
-                existing = {_outbox_signature(groups, item) for item in outbox}
+                existing = {_outbox_signature(groups, item, records) for item in outbox}
                 for plan in plans:
                     for item in targets(plan, self.config, now):
-                        if _outbox_signature(groups, item) not in existing:
+                        if _outbox_signature(groups, item, records) not in existing:
                             outbox.append(item)
-                            existing.add(_outbox_signature(groups, item))
+                            existing.add(_outbox_signature(groups, item, records))
             if len(outbox) > 5000:
                 raise ValueError("delivery outbox limit reached")
             await self._save(records, outbox, list(self.outcomes))

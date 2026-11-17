@@ -1373,6 +1373,76 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(records[second["id"]]["state"], "quarantined")
         self.assertEqual([p["id"] for p in plans], [first["id"]])
 
+    def test_conflicting_cancel_preserves_prior_cancellation_evidence(self):
+        t1 = cap_event("h2-t1", -10, message_type="Alert")
+        t2 = cap_event("h2-t2", -9, message_type="Alert")
+        c = cap_event("h2-c", -5, [t1], "Cancel")
+        records, _ = d.reconcile({}, [t1, t2, c], config(), NOW)
+        self.assertEqual(records[t1["id"]]["state"], "cancelled")
+        self.assertEqual(records[t2["id"]]["state"], "active")
+
+        c_conflict = copy.deepcopy(c)
+        c_conflict["references"] = [t2["id"]]
+        c_conflict["reference_identities"] = [t2["cap_identity"]]
+        updated, plans = d.reconcile(records, [c_conflict, t2], config(), NOW)
+        self.assertFalse(plans)
+        self.assertEqual(updated[c["id"]]["state"], "cancelled")
+        self.assertTrue(updated[c["id"]]["cancel_message"])
+        self.assertEqual(updated[c["id"]]["cap_references"], c["reference_identities"])
+        self.assertEqual(updated[t1["id"]]["state"], "cancelled")
+        self.assertEqual(updated[t2["id"]]["state"], "quarantined")
+
+        # Even if c_conflict leaves, t1 replay stays cancelled under preserved evidence.
+        replayed, replay_plans = d.reconcile(
+            updated, [t1], config(), NOW + timedelta(minutes=1)
+        )
+        self.assertFalse(replay_plans)
+        self.assertEqual(replayed[t1["id"]]["state"], "cancelled")
+
+    async def test_conflicting_duplicate_feature_quarantines_without_failing_poll(self):
+        first = feature()
+        dup = copy.deepcopy(first)
+        dup["properties"]["headline"] = "Different duplicate payload"
+        dup3 = copy.deepcopy(first)
+        dup3["properties"]["headline"] = "Third duplicate payload"
+        valid = feature()
+        valid["id"] += "-valid"
+        valid["properties"]["id"] += "-valid"
+        events = await collector.fetch(
+            Session(
+                Response(
+                    json.dumps(
+                        {
+                            "type": "FeatureCollection",
+                            "features": [first, dup, dup3, valid],
+                        }
+                    ).encode()
+                )
+            ),
+            ["NY"],
+        )
+        self.assertEqual([e["id"] for e in events], [valid["id"]])
+        self.assertEqual(events.quarantined, 3)
+        self.assertEqual(events.source_count, 4)
+        self.assertFalse(events.conflicting_cancellation)
+
+        c1 = feature()
+        c1["properties"]["messageType"] = "Cancel"
+        c2 = copy.deepcopy(c1)
+        c2["properties"]["headline"] = "Conflicting cancel copy"
+        events_cancel = await collector.fetch(
+            Session(
+                Response(
+                    json.dumps(
+                        {"type": "FeatureCollection", "features": [c1, c2, valid]}
+                    ).encode()
+                )
+            ),
+            ["NY"],
+        )
+        self.assertEqual([e["id"] for e in events_cancel], [valid["id"]])
+        self.assertTrue(events_cancel.conflicting_cancellation)
+
     async def test_malformed_actual_cancel_is_not_lost_as_a_simple_poll_error(self):
         bad = feature()
         bad["id"] = "not-a-valid-nws-id"
