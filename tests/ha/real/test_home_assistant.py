@@ -135,6 +135,43 @@ async def test_real_service_registry_and_shadow_gate(hass, monkeypatch):
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
+async def test_real_ha_quarantines_invalid_identity_without_blocking_independent_alert(
+    hass, monkeypatch
+):
+    config = {
+        "states": ["NY"],
+        "locations": {"new_york_ny": {"point": [0.5, 0.5]}},
+        "approved_rules": {"Tornado Warning": ["Take shelter immediately"]},
+        "phones": ["mobile_app_test"],
+        "live_enabled": True,
+        "commissioning_passed": True,
+    }
+    Path(hass.config.path("situareness.json")).write_text(json.dumps(config))
+    calls = []
+    hass.services.async_register(
+        "notify", "mobile_app_test", lambda call: calls.append(call.data)
+    )
+    invalid = alert()
+    invalid["cap_identity"][1] = "wrong-identifier"
+    independent = alert()
+    independent["id"] += "-independent"
+    independent["cap_identity"][1] += "-independent"
+    await integration_module(hass, monkeypatch, [invalid, independent])
+    entry = MockConfigEntry(domain="situareness", title="Situareness", data={})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+    assert calls[0]["data"]["url"] == independent["id"]
+    data = hass.data["situareness"][entry.entry_id].data
+    assert data["partial"] is True
+    assert {event["id"]: event["state"] for event in data["events"]} == {
+        invalid["id"]: "quarantined",
+        independent["id"]: "active",
+    }
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
 async def test_real_ha_shadow_blocks_service(hass, monkeypatch):
     config = {
         "states": ["NY"],

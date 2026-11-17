@@ -977,6 +977,85 @@ class Session:
 
 
 class Collector(unittest.IsolatedAsyncioTestCase):
+    async def test_conflicting_update_cannot_hide_or_connect_valid_alert(self):
+        good = feature()
+        forged = copy.deepcopy(good)
+        forged["id"] += "-forged"
+        forged["properties"].update(
+            id=good["properties"]["id"] + "-forged",
+            messageType="Update",
+            sent="2026-11-15T19:56:00Z",
+            references=[
+                {
+                    "@id": good["id"],
+                    "identifier": good["properties"]["id"],
+                    "sender": "other@example.test",
+                    "sent": good["properties"]["sent"],
+                }
+            ],
+        )
+        body = {"type": "FeatureCollection", "features": [good, forged]}
+        result = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertEqual({event["id"] for event in result}, {good["id"], forged["id"]})
+        records, plans = d.reconcile(
+            {}, result, config(), NOW, graph_events=result.all_events
+        )
+        self.assertEqual(records[good["id"]]["state"], "active")
+        self.assertEqual(records[forged["id"]]["state"], "quarantined")
+        self.assertEqual([plan["id"] for plan in plans], [good["id"]])
+        # The forged edge must not reappear through persisted lineage on restart.
+        restored = json.loads(json.dumps(records))
+        groups, _ = d.lineage_index(restored, [])
+        self.assertNotEqual(groups[good["id"]], groups[forged["id"]])
+        replay, plans = d.reconcile(
+            restored, result, config(), NOW, graph_events=result.all_events
+        )
+        self.assertEqual(replay[good["id"]]["state"], "active")
+        self.assertFalse(plans)
+
+    async def test_one_conflicting_reference_removes_all_supersession_authority(self):
+        first = feature()
+        second = copy.deepcopy(first)
+        second["id"] += "-second"
+        second["properties"]["id"] += "-second"
+        update = copy.deepcopy(first)
+        update["id"] += "-update"
+        update["properties"].update(
+            id=first["properties"]["id"] + "-update",
+            messageType="Update",
+            sent="2026-11-15T19:56:00Z",
+            references=[
+                {
+                    "@id": first["id"],
+                    "identifier": first["properties"]["id"],
+                    "sender": first["properties"]["sender"],
+                    "sent": first["properties"]["sent"],
+                },
+                {
+                    "@id": second["id"],
+                    "identifier": second["properties"]["id"],
+                    "sender": "other@example.test",
+                    "sent": second["properties"]["sent"],
+                },
+            ],
+        )
+        body = {"type": "FeatureCollection", "features": [first, second, update]}
+        events = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertEqual(
+            {event["id"] for event in events}, {first["id"], second["id"], update["id"]}
+        )
+        records, plans = d.reconcile(
+            {}, events, config(), NOW, graph_events=events.all_events
+        )
+        self.assertEqual(records[first["id"]]["state"], "active")
+        self.assertEqual(records[second["id"]]["state"], "active")
+        self.assertEqual(records[update["id"]]["state"], "quarantined")
+        self.assertEqual({plan["id"] for plan in plans}, {first["id"], second["id"]})
+
     async def test_superseded_messages_and_oversized_cancel_remain_evidence(self):
         predecessor = feature()
         successor = copy.deepcopy(predecessor)

@@ -595,13 +595,26 @@ def reconcile(
             )
         ):
             invalid_ids.add(source["id"])
+
+    def actual_cancel(source):
+        return (
+            source.get("status") == "Actual" and source.get("message_type") == "Cancel"
+        )
+
+    # Invalid Alert/Update references cannot establish a relationship. Invalid
+    # cancellation references are still uncertainty evidence and must not
+    # disappear from the cancellation analysis.
     grouping_events = [
-        {**source, "references": []} if source["id"] in invalid_ids else source
+        {**source, "references": []}
+        if source["id"] in invalid_ids and not actual_cancel(source)
+        else source
         for source in graph_events
     ]
     groups, members = lineage_index(prior, [*grouping_events, *quarantine_events])
     trusted_events = [
-        source for source in graph_events if source["id"] not in invalid_ids
+        source
+        for source in graph_events
+        if source["id"] not in invalid_ids or actual_cancel(source)
     ]
     cancelled_ids, uncertain_ids = cancellation_evidence(
         prior, trusted_events, groups, now
@@ -660,7 +673,7 @@ def reconcile(
     candidate_ids = {event["id"] for event in events}
     for source in graph_events:
         eid = source["id"]
-        if eid not in records and eid not in candidate_ids:
+        if eid not in records and eid not in candidate_ids and eid not in invalid_ids:
             records[eid] = {
                 "state": "superseded",
                 "actions": {},
@@ -698,7 +711,11 @@ def reconcile(
                 "fingerprint": fp,
                 "actions": action_history(old_record),
                 "action_identity": old_record.get("action_identity"),
-                "lineage": sorted({eid, *refs}),
+                "lineage": (
+                    old_record.get("lineage", [eid])
+                    if identity_uncertain
+                    else sorted({eid, *refs})
+                ),
                 "reasons": [
                     "invalid or incomplete CAP identity or references"
                     if identity_uncertain
@@ -706,10 +723,16 @@ def reconcile(
                     if uncertain
                     else "lineage quarantined"
                 ],
-                "cap_identity": event.get("cap_identity"),
-                "cap_references": event.get("reference_identities")
-                if event.get("cap_references_valid")
-                else None,
+                "cap_identity": old_record.get("cap_identity")
+                if identity_uncertain
+                else event.get("cap_identity"),
+                "cap_references": (
+                    old_record.get("cap_references")
+                    if identity_uncertain
+                    else event.get("reference_identities")
+                    if event.get("cap_references_valid")
+                    else None
+                ),
                 "cancel_message": cancelled or old_record.get("cancel_message", False),
                 "affected": [],
             }

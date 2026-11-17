@@ -17,6 +17,7 @@ from .const import DOMAIN
 from .delivery import deliver_one, live, pending_valid, targets
 from .domain import (
     CancellationEvidenceOverflow,
+    cap_event_valid,
     action_history,
     lineage_index,
     qualify,
@@ -161,11 +162,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 or any(
                     event.get("status") == "Actual"
                     and event.get("message_type") == "Cancel"
-                    and (
-                        not event.get("cap_identity")
-                        or not event.get("cap_references_valid")
-                        or not event.get("reference_identities")
-                    )
+                    and not cap_event_valid(event)
                     for event in source_events
                 )
             ):
@@ -188,7 +185,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 graph_events=getattr(events, "all_events", events),
             )
             # Carry an undelivered item through equivalent NWS update identifiers.
-            groups, _ = lineage_index(records, events)
+            # Reconciled records contain only trusted Alert/Update edges;
+            # raw source references could reconnect a quarantined forgery.
+            groups, _ = lineage_index(records, [])
             event_index = {}
             for event in events:
                 eid = event["id"]

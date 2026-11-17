@@ -170,10 +170,17 @@ async def _fetch(session, states, seen_cancel):
     for event in events.values():
         if not cap_event_valid(event):
             continue
-        for ref, identity in zip(event["references"], event["reference_identities"]):
-            existing = events.get(ref)
-            if existing is None or existing.get("cap_identity") == identity:
-                superseded.add(ref)
+        references = list(zip(event["references"], event["reference_identities"]))
+        if any(
+            (existing := events.get(ref)) is not None
+            and (
+                not cap_event_valid(existing)
+                or existing.get("cap_identity") != identity
+            )
+            for ref, identity in references
+        ):
+            continue
+        superseded.update(ref for ref, _ in references)
     return CollectedEvents(
         [event for eid, event in events.items() if eid not in superseded],
         quarantined,

@@ -507,6 +507,88 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((data["planned_count"], data["pending_count"]), (0, 0))
             self.assertEqual(len(services.calls), 1)
 
+    async def test_invalid_cap_suspends_retry_across_restart_and_allows_independent_alert(
+        self,
+    ):
+        import copy
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+        now = datetime.now(timezone.utc)
+        original = d.normalize(feature())
+        for field, minutes in [
+            ("sent", -2),
+            ("effective", -2),
+            ("onset", 0),
+            ("expires", 30),
+            ("ends", 30),
+        ]:
+            original[field] = (now + timedelta(minutes=minutes)).isoformat()
+        cohere(original)
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+
+        class Flaky(Services):
+            fail = True
+
+            async def async_call(self, *args, **kwargs):
+                self.calls.append(args)
+                if self.fail:
+                    raise OSError("offline")
+
+        events = [original]
+
+        async def fetch(*args):
+            return events
+
+        services, store = Flaky(), Store()
+        hass = types.SimpleNamespace(services=services)
+        coordinator = mod.SituarenessCoordinator(hass, cfg, store, {})
+        with patch.object(mod, "fetch", fetch):
+            first = await coordinator._async_update_data()
+        self.assertEqual((first["pending_count"], first["delivery_failures"]), (1, 1))
+
+        invalid = copy.deepcopy(original)
+        invalid["cap_identity"][1] = "conflicting-identifier"
+        independent = copy.deepcopy(original)
+        independent["id"] += "-independent"
+        cohere(independent)
+        events = [invalid, independent]
+        services.fail = False
+        restarted = mod.SituarenessCoordinator(hass, cfg, Store(), store.saved[-1])
+        with patch.object(mod, "fetch", fetch):
+            health = await restarted._async_update_data()
+        self.assertTrue(health["partial"])
+        self.assertEqual((health["pending_count"], health["suspended_count"]), (1, 1))
+        self.assertEqual(restarted.outbox[0]["incident_id"], original["id"])
+        self.assertEqual(len(services.calls), 2)
+        self.assertEqual(services.calls[-1][2]["data"]["url"], independent["id"])
+        self.assertEqual(restarted.records[invalid["id"]]["state"], "quarantined")
+        self.assertEqual(restarted.records[independent["id"]]["state"], "active")
+
+        # A second restart preserves the suspended target; no invalid call is made.
+        resumed = mod.SituarenessCoordinator(
+            hass, cfg, Store(), restarted.store.saved[-1]
+        )
+        with patch.object(mod, "fetch", fetch):
+            again = await resumed._async_update_data()
+        self.assertEqual((again["pending_count"], again["suspended_count"]), (1, 1))
+        self.assertEqual(len(services.calls), 2)
+
     async def test_legacy_journal_without_gate_marker_does_not_force_live_realert(self):
         from datetime import datetime, timedelta, timezone
 
