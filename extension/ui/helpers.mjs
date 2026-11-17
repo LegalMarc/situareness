@@ -225,7 +225,10 @@ export function isEventSourceUnavailable(
   return (
     !state ||
     sourceFreshness(
-      { ...state, interval_minutes: config?.interval_minutes },
+      {
+        ...state,
+        interval_minutes: config?.interval_minutes ?? state.interval_minutes,
+      },
       now,
     ) !== "ok"
   );

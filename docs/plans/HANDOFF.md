@@ -2,6 +2,23 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 fifth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `9308033` (`run_id`: `20261117T180834Z-0e141a`, 348.0s standards and 394.4s specification) reported **0 Critical and 0 High findings** and zero regressions in prior fixes, leaving 1 Medium + 4 Low + 2 Nit standards findings and 1 Medium + 2 Low + 3 Nit spec findings (11 unique findings total).
+
+All 11 findings were repaired via disjoint workers (`ha-repair` `775aa2e8` and `browser-repair` `50a99905`) plus supervisor spec/reference/report updates:
+- **`SIT-R1` & `SIT-R7`/`SIT-DOC-06`**: Scoped malformed/oversized/conflicting `Actual Cancel`s with recoverable non-empty NWS target references within the 5,000-ID cap per targeted lineage/descendants (`quarantined_cancel_lineages`), delineated Policy 4 vs Policy 6 across `cap-cancellation.md`/`o3-mvp.md`, removed the `cap-cancellation.md` line 3 self-contradiction, and added the `situareness_degraded` HA persistent notification on global degraded lockdown.
+- **`SIT-SPEC-01`**: Excluded `quarantine_events` from `lineage_index()`, stripped raw refs for all `invalid_ids` in `grouping_events`, and replaced group-level quarantine with per-ID `quarantined_event_ids`/`quarantined_record_ids` so malformed/conflicting siblings never taint independent root-sharing alerts.
+- **`SIT-R2`**: Tracked `_fetch_task`, cancelled in-flight `fetch()` inside `async_stop()`, and aborted cleanly on post-stop without writing saves.
+- **`SIT-R3`**: Excluded `degraded_at` and `degraded_until` alongside `events` and `last_success` in `SituarenessSensor._unrecorded_attributes`.
+- **`SIT-R4` & `SIT-SPEC-02`**: Required `bool` for `initialized` and `was_live` in `_valid_persisted_store`, reported `degraded_until: None` for `malformed_store`, and persisted stable `malformed_store_at` on the config entry until store repair.
+- **`SIT-SPEC-03` & `SIT-R6`/`SIT-DOC-04`**: Counted all identical earlier copies of conflicting duplicates (`[A, A, A_conflict]` -> `quarantined == 3`) and unified the 5,000-identifier cap across feature IDs, reference URLs, and conflicting duplicates via `add_quarantined_lineage`.
+- **`SIT-R5` & `SIT-UI-05`**: Routed worker `"Bundled configuration..."` action errors in `extension/room.js` through `showDisconnected()` and fell back to `state.interval_minutes` in `isEventSourceUnavailable()` when `sources` omits an entry.
+
+The complete local gates passed: 43 Node, 75 stdlib HA (`-W error`), 7 source-skill, 21 Chromium browser, and 8 actual-HA tests (154 total), plus static checks, Ruff lint/format, and two identical deterministic ZIP builds (`823de6d0...` extension, `27902908...` HA). Actual HA reports five known upstream deprecations without suppression. Live anonymous smoke (`node tools/live-browser-smoke.mjs`) passed at `2026-11-17T18:41:32.635Z` with HTTP 200 across NWS (0 alerts), USGS (9 items), BBC World (24 items), and BBC US & Canada (23 items).
+
+Next: run `audit_private.py`, commit and push to `wip/supervisor-handoff-20261117`, refresh verification logs on the clean `HEAD`, run independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews, and once clean run a fresh independent Opus `adversarial` review on that immutable candidate. Household outputs remain disabled and no commissioning occurred. `main` remains at `847d0e5`; once all release gates pass, fast-forward `main` and advance roadmap **S0** (public CI privacy/build gate) and **S1**.
+
 ## Continuation update: November 17 fourth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `64b6fa0` (`run_id`: `20261117T174809Z-251d8a`, 384.8s standards and 308.0s specification) reported zero High findings and zero packaging/catalog defects, leaving one Medium and three Low `spec` findings (`SPEC-01`–`SPEC-04`) plus one Medium and two Low `standards` findings (`SIT-REV-M1`, `SIT-REV-L1` [same as `SPEC-02`], `SIT-REV-L2` — 6 unique findings total).

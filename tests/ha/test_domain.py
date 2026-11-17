@@ -1219,7 +1219,10 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             {e["id"] for e in result.all_events}, {predecessor["id"], successor["id"]}
         )
-        self.assertTrue(result.uncertain_cancellation)
+        self.assertFalse(result.uncertain_cancellation)
+        self.assertEqual(
+            result.quarantined_cancel_lineages, [[cancel["id"], predecessor["id"]]]
+        )
 
     async def test_failed_pagination_and_cancelled_error_after_cancel_propagate(self):
         import asyncio
@@ -1297,9 +1300,13 @@ class Collector(unittest.IsolatedAsyncioTestCase):
             ),
             ["NY"],
         )
-        self.assertTrue(events_cancel.uncertain_cancellation)
+        self.assertFalse(events_cancel.uncertain_cancellation)
         self.assertFalse(events_cancel.quarantine_ambiguous)
         self.assertEqual((len(events_cancel), events_cancel.quarantined), (1, 1))
+        self.assertEqual(
+            events_cancel.quarantined_cancel_lineages,
+            [[oversized_cancel["id"], feature()["id"]]],
+        )
 
         empty_ref_cancel = feature()
         empty_ref_cancel["id"] += "-empty-ref-cancel"
@@ -1442,6 +1449,98 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([e["id"] for e in events_cancel], [valid["id"]])
         self.assertTrue(events_cancel.conflicting_cancellation)
+
+    async def test_conflicting_identical_triplicate_and_5000_id_cap(self):
+        # SIT-SPEC-03: [A, A, A_conflict] reports quarantined == 3.
+        a1 = feature()
+        a2 = copy.deepcopy(a1)
+        a_conflict = copy.deepcopy(a1)
+        a_conflict["properties"]["headline"] = "Conflicting third copy"
+        valid = feature()
+        valid["id"] += "-ok"
+        valid["properties"]["id"] += "-ok"
+        res = await collector.fetch(
+            Session(
+                Response(
+                    json.dumps(
+                        {
+                            "type": "FeatureCollection",
+                            "features": [a1, a2, a_conflict, valid],
+                        }
+                    ).encode()
+                )
+            ),
+            ["NY"],
+        )
+        self.assertEqual([e["id"] for e in res], [valid["id"]])
+        self.assertEqual(res.quarantined, 3)
+        self.assertEqual(res.source_count, 4)
+
+        # SIT-R6 / SIT-DOC-04: 5000-ID cap counts feature_id AND reference IDs across
+        # quarantined features including conflicting duplicates.
+        many_bad = []
+        # 50 features * 100 IDs (1 feature_id + 99 refs) = 5000 IDs (fits cleanly),
+        # plus 1 more feature pushing past 5000 -> quarantine_ambiguous = True.
+        for i in range(51):
+            bad = feature()
+            bad["id"] = f"https://api.weather.gov/alerts/q-{i}"
+            bad["properties"]["headline"] = 123
+            bad["properties"]["references"] = [
+                {"@id": f"https://api.weather.gov/alerts/r-{i}-{j}"} for j in range(99)
+            ]
+            many_bad.append(bad)
+        res_cap = await collector.fetch(
+            Session(
+                Response(
+                    json.dumps(
+                        {"type": "FeatureCollection", "features": many_bad}
+                    ).encode()
+                )
+            ),
+            ["NY"],
+        )
+        self.assertTrue(res_cap.quarantine_ambiguous)
+        total_retained = sum(len(lineage) for lineage in res_cap.quarantined_lineages)
+        self.assertEqual(total_retained, 5000)
+
+    def test_scoped_non_cancel_quarantine_and_scoped_cancel_quarantine(self):
+        # SIT-SPEC-01: Malformed/oversized non-Cancel X referencing root R does NOT taint
+        # independently valid sibling S referencing R.
+        root = cap_event("spec01-root", -10, message_type="Alert")
+        sibling = cap_event("spec01-sibling", -5, [root])
+        sibling["instruction"] = "Take shelter in a basement now."
+        records, _ = d.reconcile({}, [root], config(), NOW)
+        records, plans = d.reconcile(
+            records,
+            [sibling],
+            config(),
+            NOW,
+            partial=True,
+            quarantine_lineages=[["https://api.weather.gov/alerts/bad-x", root["id"]]],
+        )
+        self.assertEqual(records[sibling["id"]]["state"], "active")
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(records[root["id"]]["state"], "superseded")
+
+        # SIT-R1: Scoped Cancel quarantine (quarantine_cancel_lineages) quarantines
+        # target & its descendants while keeping unrelated/root sibling active.
+        target = cap_event("r1-target", -8, [root])
+        target_child = cap_event("r1-target-child", -6, [target])
+        recs2, _ = d.reconcile({}, [root, target, target_child], config(), NOW)
+        recs2, plans2 = d.reconcile(
+            recs2,
+            [target_child, sibling],
+            config(),
+            NOW,
+            partial=True,
+            quarantine_cancel_lineages=[
+                ["https://api.weather.gov/alerts/oversized-cancel", target["id"]]
+            ],
+        )
+        self.assertEqual(recs2[target["id"]]["state"], "quarantined")
+        self.assertEqual(recs2[target_child["id"]]["state"], "quarantined")
+        self.assertEqual(recs2[sibling["id"]]["state"], "active")
+        self.assertEqual([p["id"] for p in plans2], [sibling["id"]])
 
     def test_cancelled_record_without_cancel_retains_protection_and_overflow_horizon(
         self,

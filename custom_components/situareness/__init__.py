@@ -11,6 +11,11 @@ from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+try:
+    from homeassistant.components import persistent_notification
+except ImportError:
+    persistent_notification = None
 from .collector import fetch
 from .config import validate
 from .const import DOMAIN
@@ -44,8 +49,9 @@ def _valid_persisted_store(persisted):
         return True
     if not isinstance(persisted, dict):
         return False
-    if "degraded" in persisted and not isinstance(persisted["degraded"], bool):
-        return False
+    for bool_key in ("degraded", "initialized", "was_live"):
+        if bool_key in persisted and not isinstance(persisted[bool_key], bool):
+            return False
     for key in (
         "degraded_at",
         "degraded_until",
@@ -196,6 +202,16 @@ def _outbox_signature(groups, item, records=None):
     )
 
 
+def _unrecoverable_prior_cancel_conflict(event, old):
+    if not conflicting_prior_cancel(event, old):
+        return False
+    return not event.get("references") or (
+        old.get("cancel_message") is True
+        and not old.get("cap_references")
+        and len(old.get("lineage", [])) <= 1
+    )
+
+
 class SituarenessCoordinator(DataUpdateCoordinator):
     def __init__(self, hass, config, store, persisted, entry=None):
         super().__init__(
@@ -206,6 +222,22 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self._entry = entry
         if not _valid_persisted_store(persisted):
             detect_now = datetime.now(timezone.utc)
+            persisted_deg_at = (
+                persisted.get("degraded_at") if isinstance(persisted, dict) else None
+            )
+            entry_deg_at = (
+                self._entry.data.get("malformed_store_at")
+                if self._entry is not None
+                else None
+            )
+            stable_at = (
+                persisted_deg_at
+                if isinstance(persisted_deg_at, str)
+                and timestamp(persisted_deg_at) is not None
+                else entry_deg_at
+                if isinstance(entry_deg_at, str) and timestamp(entry_deg_at) is not None
+                else detect_now.isoformat()
+            )
             self.records = {}
             self.outbox = []
             self.outcomes = []
@@ -213,10 +245,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.was_live = False
             self.degraded = True
             self.degraded_reason = "malformed_store"
-            self.degraded_at = detect_now.isoformat()
-            self.degraded_until = (detect_now + MAX_ACCEPTANCE_AGE).isoformat()
+            self.degraded_at = stable_at
+            self.degraded_until = None
             self.acknowledged_degraded_at = None
             self.last_degraded_poll = None
+            if (
+                self._entry is not None
+                and self._entry.data.get("malformed_store_at") != stable_at
+            ):
+                self.hass.config_entries.async_update_entry(
+                    self._entry,
+                    data={**self._entry.data, "malformed_store_at": stable_at},
+                )
         elif (
             self._entry is not None
             and self._entry.data.get("journal_initialized") is True
@@ -265,7 +305,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self._try_acknowledge(datetime.now(timezone.utc))
         self.session = async_get_clientsession(hass)
         self._refresh_lock = asyncio.Lock()
+        self._fetch_task = None
         self._stopping = False
+        self._notified_degraded_state = None
+        self._checked_notification_clear = False
 
     def _try_acknowledge(self, current_now):
         if not self.degraded or self.degraded_reason == "malformed_store":
@@ -311,16 +354,50 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             True,
         )
         self.was_live = live(self.config)
-        if (
-            self._entry is not None
-            and self._entry.data.get("journal_initialized") is not True
+        if self._entry is not None and (
+            self._entry.data.get("journal_initialized") is not True
+            or "malformed_store_at" in self._entry.data
         ):
-            self.hass.config_entries.async_update_entry(
-                self._entry, data={**self._entry.data, "journal_initialized": True}
-            )
+            new_data = {
+                k: v for k, v in self._entry.data.items() if k != "malformed_store_at"
+            }
+            new_data["journal_initialized"] = True
+            self.hass.config_entries.async_update_entry(self._entry, data=new_data)
+
+    def _sync_degraded_notification(self):
+        if persistent_notification is None or not isinstance(
+            getattr(self.hass, "data", None), dict
+        ):
+            return
+        if self.degraded:
+            state = (self.degraded_reason, self.degraded_until)
+            if self._notified_degraded_state != state:
+                until_note = (
+                    f" Until: {self.degraded_until}."
+                    if self.degraded_until
+                    else " Manual store repair or replacement required."
+                )
+                persistent_notification.async_create(
+                    self.hass,
+                    f"Situareness output is blocked (reason: {self.degraded_reason})."
+                    f"{until_note} Continue using independent official alert channels.",
+                    title="Situareness monitoring degraded",
+                    notification_id="situareness_degraded",
+                )
+                self._notified_degraded_state = state
+                self._checked_notification_clear = False
+        elif (
+            self._notified_degraded_state is not None
+            or not self._checked_notification_clear
+        ):
+            persistent_notification.async_dismiss(self.hass, "situareness_degraded")
+            self._notified_degraded_state = None
+            self._checked_notification_clear = True
 
     async def async_stop(self):
         self._stopping = True
+        if self._fetch_task is not None and not self._fetch_task.done():
+            self._fetch_task.cancel()
         async with self._refresh_lock:
             pass
 
@@ -481,14 +558,36 @@ class SituarenessCoordinator(DataUpdateCoordinator):
     async def _update_once(self):
         try:
             if self.degraded and self.degraded_reason == "malformed_store":
+                self._sync_degraded_notification()
                 return self._degraded_health()
-            events = await fetch(self.session, self.config["states"])
+            self._fetch_task = asyncio.ensure_future(
+                fetch(self.session, self.config["states"])
+            )
+            try:
+                events = await self._fetch_task
+            except asyncio.CancelledError:
+                if self._stopping:
+                    return getattr(self, "data", None) or self._degraded_health()
+                raise
+            finally:
+                self._fetch_task = None
+            if self._stopping:
+                return getattr(self, "data", None) or self._degraded_health()
             source_events = getattr(events, "all_events", events)
             candidate_events = resolve_candidates(self.records, events, source_events)
             conflicting_cancel = bool(
                 getattr(events, "conflicting_cancellation", False)
             ) or any(
+                _unrecoverable_prior_cancel_conflict(
+                    event, self.records.get(event["id"])
+                )
+                for event in source_events
+            )
+            recoverable_prior_conflict = any(
                 conflicting_prior_cancel(event, self.records.get(event["id"]))
+                and not _unrecoverable_prior_cancel_conflict(
+                    event, self.records.get(event["id"])
+                )
                 for event in source_events
             )
             malformed_cancel = bool(
@@ -523,6 +622,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     quarantine_lineages=getattr(events, "quarantined_lineages", ()),
                     quarantine_all=getattr(events, "quarantine_ambiguous", False),
                     graph_events=source_events,
+                    quarantine_cancel_lineages=getattr(
+                        events, "quarantined_cancel_lineages", ()
+                    ),
                 )
             except CancellationEvidenceOverflow as err:
                 records = err.records if err.records is not None else self.records
@@ -592,6 +694,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     raise UpdateFailed(
                         "Could not persist cancellation evidence safety state"
                     ) from save_err
+                self._sync_degraded_notification()
                 return self._degraded_health(
                     events=events,
                     candidate_events=candidate_events,
@@ -686,15 +789,20 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         quarantine_count = getattr(events, "quarantined", 0) + sum(
             records[e["id"]]["state"] == "quarantined" for e in candidate_events
         )
-        cancellation_uncertain = any(
-            record.get("state") == "quarantined"
-            and "cancellation scope uncertain" in record.get("reasons", [])
-            for record in records.values()
+        cancellation_uncertain = (
+            bool(getattr(events, "quarantined_cancel_lineages", ()))
+            or recoverable_prior_conflict
+            or any(
+                record.get("state") == "quarantined"
+                and "cancellation scope uncertain" in record.get("reasons", [])
+                for record in records.values()
+            )
         )
         quarantine_ambiguous = bool(getattr(events, "quarantine_ambiguous", False))
         partial = (
             bool(quarantine_count) or cancellation_uncertain or quarantine_ambiguous
         )
+        self._sync_degraded_notification()
         return {
             "last_success": now.isoformat(),
             "event_count": len(candidate_events),

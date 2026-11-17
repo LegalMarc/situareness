@@ -562,3 +562,65 @@ test("non-expired NWS items with missing/unknown lifecycle become cached when un
     "expired",
   );
 });
+
+test("isEventSourceUnavailable and nwsAwarenessLifecycle fall back to state.interval_minutes when sources config is empty or null", () => {
+  const now = Date.now();
+  const threeMinutesAgo = new Date(now - 3 * 60_000).toISOString();
+  const stateWithInterval = [
+    {
+      id: "nws",
+      enabled: true,
+      status: "ok",
+      interval_minutes: 1,
+      last_success_at: threeMinutesAgo,
+    },
+    {
+      id: "usgs",
+      enabled: true,
+      status: "ok",
+      interval_minutes: 1,
+      last_success_at: threeMinutesAgo,
+    },
+  ];
+  const weatherEvent = {
+    source_id: "nws",
+    category: "weather",
+    official: true,
+    awareness_lifecycle: "current",
+  };
+  const usgsEvent = { source_id: "usgs", category: "earthquake" };
+
+  for (const omittedSources of [[], null]) {
+    assert.equal(
+      isEventSourceUnavailable(
+        weatherEvent,
+        now,
+        omittedSources,
+        stateWithInterval,
+      ),
+      true,
+    );
+    assert.equal(
+      isEventSourceUnavailable(
+        usgsEvent,
+        now,
+        omittedSources,
+        stateWithInterval,
+      ),
+      true,
+    );
+    assert.equal(
+      nwsAwarenessLifecycle(
+        weatherEvent,
+        now,
+        omittedSources,
+        stateWithInterval,
+      ),
+      "cached",
+    );
+    assert.equal(
+      nwsAwarenessLifecycle(usgsEvent, now, omittedSources, stateWithInterval),
+      "cached",
+    );
+  }
+});

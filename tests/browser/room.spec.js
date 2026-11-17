@@ -965,3 +965,39 @@ test("unavailable NWS items with not_in_latest_fetch or missing lifecycle render
   ).toHaveCount(0);
   await expect(expiredCard.locator(".presence-pill")).toHaveCount(1);
 });
+
+test("a worker bundled configuration failure on REFRESH disables controls and shows startup failure state", async () => {
+  await page.evaluate(() => {
+    const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+    Object.defineProperty(chrome.runtime, "sendMessage", {
+      configurable: true,
+      value: async (message) => {
+        if (message?.type === "REFRESH") {
+          return {
+            ok: false,
+            error: "Bundled configuration is unavailable or invalid.",
+          };
+        }
+        return original(message);
+      },
+    });
+  });
+
+  await page.getByRole("button", { name: "Refresh" }).click();
+  await expect(page.locator("#collector-label")).toHaveText(
+    "Room could not start",
+  );
+  await expect(page.locator("#notice")).toContainText(
+    "Bundled configuration is unavailable or invalid.",
+  );
+  await expect(page.locator("#notice")).not.toContainText(
+    "Showing cached data",
+  );
+  await expect(
+    page.getByRole("button", { name: "Open settings" }),
+  ).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Refresh" })).toBeDisabled();
+  await expect(
+    page.getByRole("button", { name: "Pause collection" }),
+  ).toBeDisabled();
+});

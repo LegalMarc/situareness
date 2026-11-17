@@ -660,6 +660,8 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             {"records": {"id": {"fingerprint": 123}}},
             {"records": {"id": {"prior_state": 123}}},
             {"records": {"id": {"action_affected": [123]}}},
+            {"initialized": 1},
+            {"was_live": "true"},
             {"acknowledged_degraded_at": "not-a-timestamp"},
             {"last_degraded_poll": "not-a-timestamp"},
             {
@@ -744,7 +746,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(health["output_blocked"])
                 self.assertEqual(health["degraded_reason"], "malformed_store")
                 self.assertIsNotNone(health["degraded_at"])
-                self.assertIsNotNone(health["degraded_until"])
+                self.assertIsNone(health["degraded_until"])
                 self.assertFalse(health["quarantine_ambiguous"])
                 self.assertFalse(health["cancellation_uncertain"])
                 self.assertFalse(health["partial"])
@@ -769,6 +771,28 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             health_ack = await malformed_with_ack._async_update_data()
         self.assertTrue(health_ack["evidence_degraded"])
         self.assertEqual(health_ack["degraded_reason"], "malformed_store")
+
+        # SIT-R4: malformed_store persists a stable malformed_store_at in entry.data
+        # across reloads when persisted store itself lacks degraded_at.
+        class FakeEntries:
+            def __init__(self, entry):
+                self.entry = entry
+
+            def async_update_entry(self, entry, *, data):
+                entry.data = data
+
+        bad_entry = types.SimpleNamespace(data={})
+        hass_bad = types.SimpleNamespace(
+            services=services, config_entries=FakeEntries(bad_entry)
+        )
+        c_bad1 = mod.SituarenessCoordinator(
+            hass_bad, cfg, Store(), ["corrupt"], entry=bad_entry
+        )
+        c_bad2 = mod.SituarenessCoordinator(
+            hass_bad, cfg, Store(), ["corrupt"], entry=bad_entry
+        )
+        self.assertEqual(c_bad1.degraded_at, c_bad2.degraded_at)
+        self.assertIsNone(c_bad1.degraded_until)
 
         fresh = mod.SituarenessCoordinator(
             types.SimpleNamespace(services=services), cfg, Store(), None
@@ -1377,8 +1401,22 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(mod, "fetch", return_value=[diff_cancel]):
             h_diff = await c_inc_diff._async_update_data()
-        self.assertTrue(h_diff["evidence_degraded"])
-        self.assertEqual(h_diff["degraded_reason"], "conflicting_cancellation")
+        # Recoverable lineage conflict surfaces cancellation_uncertain without global degradation;
+        # unrecoverable empty-reference conflict latches conflicting_cancellation.
+        self.assertFalse(h_diff["evidence_degraded"])
+        self.assertTrue(h_diff["cancellation_uncertain"])
+        self.assertTrue(h_diff["partial"])
+
+        diff_cancel_empty = copy.deepcopy(inc_cancel)
+        diff_cancel_empty["references"] = []
+        diff_cancel_empty["reference_identities"] = []
+        c_inc_unrec = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=Services()), cfg, Store(), inc_store
+        )
+        with patch.object(mod, "fetch", return_value=[diff_cancel_empty]):
+            h_unrec = await c_inc_unrec._async_update_data()
+        self.assertTrue(h_unrec["evidence_degraded"])
+        self.assertEqual(h_unrec["degraded_reason"], "conflicting_cancellation")
 
     async def test_sibling_withheld_release_overflow_release_conflict_preserve_and_outbox_age(
         self,
@@ -1483,10 +1521,13 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h_ov["degraded_reason"], "cancellation_evidence_overflow")
         self.assertEqual(store_ov.saved[-1]["records"][ov_alert["id"]]["actions"], {})
 
-        # SIT-H2 / SR-M1: Conflicting Cancel C' (refs=[t2]) preserves C -> t1 across ack,
-        # quarantines t2, and blocks t1 replay after recovery.
+        # SIT-H2 / SR-M1 + SIT-R1: Conflicting Cancel C' with recoverable target refs
+        # preserves C -> t1, quarantines t2, reports cancellation_uncertain without global
+        # degradation, and allows unrelated valid alerts to deliver; unrecoverable conflict
+        # (empty references) latches conflicting_cancellation while still protecting t1.
         t1 = make_alert("sit-h2-t1")
         t2 = make_alert("sit-h2-t2")
+        unrelated_r1 = make_alert("sit-r1-unrelated")
         c_orig = make_alert("sit-h2-c")
         c_orig["message_type"] = "Cancel"
         cohere(c_orig, t1)
@@ -1503,15 +1544,24 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         c_conf = copy.deepcopy(c_orig)
         c_conf["references"] = [t2["id"]]
         c_conf["reference_identities"] = [t2["cap_identity"]]
-        with patch.object(mod, "fetch", return_value=[c_conf, t2]):
+        with patch.object(mod, "fetch", return_value=[c_conf, t2, unrelated_r1]):
             h_conf1 = await c_h2._async_update_data()
-            h_conf2 = await c_h2._async_update_data()
-        self.assertEqual(h_conf1["degraded_reason"], "conflicting_cancellation")
-        self.assertEqual(h_conf2["degraded_reason"], "conflicting_cancellation")
+        self.assertFalse(h_conf1["evidence_degraded"])
+        self.assertTrue(h_conf1["cancellation_uncertain"])
+        self.assertTrue(h_conf1["partial"])
         self.assertEqual(store_h2.saved[-1]["records"][t1["id"]]["state"], "cancelled")
         self.assertEqual(
             store_h2.saved[-1]["records"][t2["id"]]["state"], "quarantined"
         )
+        self.assertEqual(len(services_h2.calls), 2)
+        self.assertEqual(services_h2.calls[-1][2]["data"]["url"], unrelated_r1["id"])
+
+        c_conf_unrec = copy.deepcopy(c_orig)
+        c_conf_unrec["references"] = []
+        c_conf_unrec["reference_identities"] = []
+        with patch.object(mod, "fetch", return_value=[c_conf_unrec]):
+            h_conf2 = await c_h2._async_update_data()
+        self.assertEqual(h_conf2["degraded_reason"], "conflicting_cancellation")
 
         c_h2_rec = mod.SituarenessCoordinator(
             types.SimpleNamespace(services=services_h2),
@@ -1522,7 +1572,56 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         with patch.object(mod, "fetch", return_value=[t1]):
             h_replay = await c_h2_rec._async_update_data()
         self.assertFalse(h_replay["evidence_degraded"])
-        self.assertEqual(len(services_h2.calls), 1)
+        self.assertEqual(len(services_h2.calls), 2)
+
+        # SIT-R1: Scoped oversized Actual Cancel (quarantined_cancel_lineages) quarantines
+        # target without global degradation while delivering unrelated valid alert.
+        target_r1 = make_alert("r1-scoped-target")
+        indep_r1 = make_alert("r1-scoped-indep")
+        srv_r1 = Services()
+        c_r1 = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=srv_r1), cfg, Store(), {}
+        )
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents(
+                [target_r1, indep_r1],
+                1,
+                [["https://api.weather.gov/alerts/big-cancel", target_r1["id"]]],
+                False,
+                uncertain_cancellation=False,
+                quarantined_cancel_lineages=[
+                    ["https://api.weather.gov/alerts/big-cancel", target_r1["id"]]
+                ],
+            ),
+        ):
+            h_r1 = await c_r1._async_update_data()
+        self.assertFalse(h_r1["evidence_degraded"])
+        self.assertTrue(h_r1["cancellation_uncertain"])
+        self.assertEqual(len(srv_r1.calls), 1)
+        self.assertEqual(srv_r1.calls[0][2]["data"]["url"], indep_r1["id"])
+
+        # SIT-R2: async_stop() cancels an in-flight slow fetch immediately without saving.
+        import asyncio
+
+        started, never = asyncio.Event(), asyncio.Event()
+
+        async def slow_fetch(*args):
+            started.set()
+            await never.wait()
+            return []
+
+        store_stop = Store()
+        c_stop = mod.SituarenessCoordinator(
+            types.SimpleNamespace(services=Services()), cfg, store_stop, {}
+        )
+        with patch.object(mod, "fetch", slow_fetch):
+            task = asyncio.create_task(c_stop._async_update_data())
+            await asyncio.wait_for(started.wait(), 2)
+            await asyncio.wait_for(c_stop.async_stop(), 2)
+            await asyncio.wait_for(task, 2)
+        self.assertEqual(store_stop.saved, [])
 
         # SIT-M2: Pre-degradation undelivered target survives >15m degradation
         # without duplicating already-accepted target.

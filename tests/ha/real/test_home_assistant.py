@@ -233,10 +233,18 @@ async def test_recorder_excludes_high_churn_attributes(
     assert rows
     attrs = [json.loads(row) for row in rows if row]
     assert attrs and all(
-        "events" not in row and "last_success" not in row for row in attrs
+        "events" not in row
+        and "last_success" not in row
+        and "degraded_at" not in row
+        and "degraded_until" not in row
+        for row in attrs
     )
     assert "events" in hass.states.get("sensor.situareness_monitoring").attributes
     assert "last_success" in hass.states.get("sensor.situareness_monitoring").attributes
+    assert "degraded_at" in hass.states.get("sensor.situareness_monitoring").attributes
+    assert (
+        "degraded_until" in hass.states.get("sensor.situareness_monitoring").attributes
+    )
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
@@ -301,6 +309,8 @@ async def test_real_ha_degraded_collection_withholds_output_and_recovers_on_ack(
     assert state.attributes["degraded_reason"] == "malformed_cancellation"
     assert state.attributes["event_count"] == 1
     assert calls == []
+    notifications = hass.data.get("persistent_notification", {})
+    assert "situareness_degraded" in notifications
 
     # Clean poll while degraded still collects without delivering.
     clean_events = CollectedEvents([ev], 0, [], False)
@@ -341,6 +351,7 @@ async def test_real_ha_degraded_collection_withholds_output_and_recovers_on_ack(
     assert state.attributes["evidence_degraded"] is False
     assert state.attributes["output_blocked"] is False
     assert state.attributes["degraded_reason"] is None
+    assert "situareness_degraded" not in hass.data.get("persistent_notification", {})
     assert len(calls) == 2
     assert calls[1]["data"]["url"] == fresh_ev["id"]
     assert await hass.config_entries.async_unload(entry.entry_id)

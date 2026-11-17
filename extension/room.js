@@ -612,7 +612,7 @@ async function runAction(message, success) {
     if (success) announce(success);
   } catch (error) {
     if (
-      !/^(Configuration|Invalid|Private|Source URL|Paused|Unknown request|Bundled configuration)/.test(
+      !/^(Configuration|Invalid|Private|Source URL|Paused|Unknown request)/.test(
         error.message,
       )
     ) {

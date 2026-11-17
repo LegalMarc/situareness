@@ -14,7 +14,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
 class SituarenessSensor(CoordinatorEntity, SensorEntity):
     _attr_name = "Situareness monitoring"
     _attr_icon = "mdi:weather-lightning-rainy"
-    _unrecorded_attributes = frozenset({"events", "last_success"})
+    _unrecorded_attributes = frozenset(
+        {"events", "last_success", "degraded_at", "degraded_until"}
+    )
 
     def __init__(self, coordinator, entry_id):
         super().__init__(coordinator)
