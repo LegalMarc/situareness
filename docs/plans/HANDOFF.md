@@ -2,6 +2,20 @@
 
 Snapshot: November 17, 2026 UTC (November 16 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 17 sixth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `120c3c4` (`run_id`: `20261117T184436Z-6d91c1`, 260.7s standards and 244.0s specification) reported **0 Critical, 0 High, and 0 browser/UI/packaging/catalog findings**, leaving 5 unique actionable findings (+1 non-blocking doc nit): `SIT-HA-01` (Medium), `SIT-SPEC-01`/`SIT-HA-02` (Low), `SIT-HA-03` (Nit), `SIT-DOC-03` (Low), `SIT-DOC-01`/`SIT-DOC-02` (Low), and non-blocking `SIT-DOC-02` (Nit).
+
+All findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor spec/reference/report updates:
+- **`SIT-HA-01`**: Isolated invalid `Actual Cancel` records by preserving prior `lineage` without raw incoming `refs`, persisting `uncertain_targets` (validated in `_valid_persisted_store` and cleaned on 7-day horizon expiry), and avoiding `ambiguous_groups` poisoning across Poll 1, Poll 2+, and sibling continuation.
+- **`SIT-SPEC-01` & `SIT-HA-02`**: Stabilized `journal_lost_at` on the config entry, persisted `journal_lost` to the store before the first fetch, synced `situareness_degraded` at init and pre-fetch, and dismissed it cleanly in `async_stop()`, `async_unload_entry()`, and `async_remove_entry()`.
+- **`SIT-HA-03`**: Added `_stopped_health()` so cancelling the first fetch during stop while healthy returns non-degraded empty health rather than `_degraded_health()`.
+- **`SIT-DOC-03`, `SIT-DOC-01`/`SIT-DOC-02`, and non-blocking `SIT-DOC-02`**: Documented concrete `malformed_store` recovery options (repair disk JSON + reload, delete/empty disk store + reload -> `journal_lost`, or remove and re-add config entry), updated `docs/ha/README.md:45` to `Nine tests passed` covering both `journal_lost` real-HA scenarios, and corrected `docs/ha/README.md:27` on historic uncertainty clearing vs 15-minute outbox expiry.
+
+The complete local gates passed: 43 Node, 78 stdlib HA (`-W error`), 7 source-skill, 21 Chromium browser, and 9 actual-HA tests (158 total), plus static checks, Ruff lint/format, and two identical deterministic ZIP builds (`823de6d0...` extension, `dc0e15c6...` HA). Actual HA reports five known upstream deprecations without suppression. Live anonymous smoke (`node tools/live-browser-smoke.mjs`) passed at `2026-11-17T18:59:17.394Z` with HTTP 200 across NWS (0 alerts), USGS (11 items), BBC World (24 items), and BBC US & Canada (23 items).
+
+Next: run `audit_private.py`, commit and push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, run independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews, and once both pass, run a fresh independent Opus `adversarial` review on that immutable candidate. Household outputs remain disabled and no commissioning occurred. `main` remains at `847d0e5`; once all release gates pass, fast-forward `main` and advance roadmap **S0** and **S1**.
+
 ## Continuation update: November 17 fifth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `9308033` (`run_id`: `20261117T180834Z-0e141a`, 348.0s standards and 394.4s specification) reported **0 Critical and 0 High findings** and zero regressions in prior fixes, leaving 1 Medium + 4 Low + 2 Nit standards findings and 1 Medium + 2 Low + 3 Nit spec findings (11 unique findings total).

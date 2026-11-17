@@ -502,7 +502,12 @@ def cancellation_evidence(
                 seeded_cancelled_identities[tuple(identity)] = groups.get(eid)
                 cancellations.append(eid)
         elif is_cancel:
-            ambiguous_groups.add(groups.get(eid))
+            targets = record.get("uncertain_targets")
+            if targets:
+                seeded_uncertain_ids.update([eid, *targets])
+                cancellations.extend([eid, *targets])
+            else:
+                ambiguous_groups.add(groups.get(eid))
         elif is_cancelled_record:
             seeded_cancelled_ids.add(eid)
             cancellations.append(eid)
@@ -559,23 +564,29 @@ def cancellation_evidence(
     for identity in identities:
         by_identifier.setdefault(identity[1], set()).add(identity)
     uncertain = set()
+    bad_cancel_eids = set()
     for eid, (identity, refs, is_cancel) in nodes.items():
         for ref in refs:
             if ref[2] >= identity[2]:
-                ambiguous_groups.add(groups.get(eid))
                 if is_cancel:
+                    bad_cancel_eids.add(eid)
                     seeded_uncertain_ids.add("https://api.weather.gov/alerts/" + ref[1])
+                else:
+                    ambiguous_groups.add(groups.get(eid))
             known = by_identifier.get(ref[1])
             if known and ref not in known:
-                ambiguous_groups.add(groups.get(eid))
                 if is_cancel:
+                    bad_cancel_eids.add(eid)
                     seeded_uncertain_ids.add("https://api.weather.gov/alerts/" + ref[1])
                     uncertain.update(known)
+                else:
+                    ambiguous_groups.add(groups.get(eid))
     valid_cancels = {
         identity
         for eid, (identity, refs, is_cancel) in nodes.items()
         if is_cancel
         and refs
+        and eid not in bad_cancel_eids
         and groups.get(eid) not in ambiguous_groups
         and (now is None or timestamp(identity[2]) <= now + timedelta(minutes=5))
     }
@@ -588,6 +599,7 @@ def cancellation_evidence(
         if is_cancel:
             if (
                 not refs
+                or eid in bad_cancel_eids
                 or any(ref[2] >= identity[2] for ref in refs)
                 or (
                     now is not None
@@ -789,6 +801,7 @@ def reconcile(
             continue
         if not any(
             prior[eid].get("cancel_message")
+            or bool(prior[eid].get("uncertain_targets"))
             or (
                 prior[eid].get("state") == "cancelled"
                 and not prior[eid].get("cancellation_expired")
@@ -799,10 +812,14 @@ def reconcile(
         horizon = cancellation_horizon(ids, prior)
         if horizon is None or now > horizon:
             for eid in ids:
-                if prior[eid].get("cancel_message"):
+                if prior[eid].get("cancel_message") or prior[eid].get(
+                    "uncertain_targets"
+                ):
                     prior[eid]["cancel_message"] = False
                     records[eid]["cancel_message"] = False
                     records[eid]["cancellation_expired"] = True
+                    prior[eid].pop("uncertain_targets", None)
+                    records[eid].pop("uncertain_targets", None)
                 if prior[eid].get("state") == "cancelled":
                     since = records[eid].get("inactive_since") or now.isoformat()
                     prior[eid]["state"] = "ended_or_absent"
@@ -937,6 +954,7 @@ def reconcile(
         blocked = eid in cancelled_ids
         uncertain = eid in uncertain_ids and not cancelled
         identity_uncertain = not cancelled and eid in invalid_ids
+        invalid_cancel = cancelled and eid in invalid_ids
         old_prior = prior.get(eid)
         if conflicting_prior_cancel(event, old_prior):
             if old_prior.get("cancel_message"):
@@ -974,14 +992,15 @@ def reconcile(
             continue
         if eid in quarantined_event_ids or uncertain or identity_uncertain:
             old_record = records.get(eid, {})
-            records[eid] = {
+            keep_prior_identity = identity_uncertain or invalid_cancel
+            quarantined_record = {
                 **suspend_record(old_record, "quarantined", now),
                 "fingerprint": fp,
                 "actions": action_history(old_record),
                 "action_identity": old_record.get("action_identity"),
                 "lineage": (
                     old_record.get("lineage", [eid])
-                    if identity_uncertain
+                    if keep_prior_identity
                     else sorted({eid, *refs})
                 ),
                 "reasons": [
@@ -992,11 +1011,11 @@ def reconcile(
                     else "lineage quarantined"
                 ],
                 "cap_identity": old_record.get("cap_identity")
-                if identity_uncertain
+                if keep_prior_identity
                 else event.get("cap_identity"),
                 "cap_references": (
                     old_record.get("cap_references")
-                    if identity_uncertain
+                    if keep_prior_identity
                     else event.get("reference_identities")
                     if event.get("cap_references_valid")
                     else None
@@ -1022,6 +1041,9 @@ def reconcile(
                 else old_record.get("ends"),
                 "affected": [],
             }
+            if invalid_cancel:
+                quarantined_record["uncertain_targets"] = list(refs)
+            records[eid] = quarantined_record
             seen.add(eid)
             continue
         actions = {}
@@ -1104,7 +1126,7 @@ def reconcile(
         elif decision["qualifies"]:
             actions = {fp: decision["affected"]}
         inactive_since = min(inactive_dates, default=now).isoformat()
-        records[eid] = {
+        record = {
             "state": "cancelled"
             if cancelled or blocked
             else "active"
@@ -1116,9 +1138,15 @@ def reconcile(
             "inactive_since": None
             if decision["qualifies"] and not blocked
             else inactive_since,
-            "lineage": sorted({eid, *refs}),
-            "cap_identity": event.get("cap_identity"),
-            "cap_references": event.get("reference_identities")
+            "lineage": (old_prior.get("lineage", [eid]) if old_prior else [eid])
+            if invalid_cancel
+            else sorted({eid, *refs}),
+            "cap_identity": (old_prior.get("cap_identity") if old_prior else None)
+            if invalid_cancel
+            else event.get("cap_identity"),
+            "cap_references": (old_prior.get("cap_references") if old_prior else None)
+            if invalid_cancel
+            else event.get("reference_identities")
             if event.get("cap_references_valid")
             else None,
             "cancel_message": cancelled,
@@ -1132,6 +1160,9 @@ def reconcile(
             "affected": decision["affected"] if not blocked else [],
             "updated": now.isoformat(),
         }
+        if invalid_cancel:
+            record["uncertain_targets"] = list(refs)
+        records[eid] = record
         seen.add(eid)
         if not (cancelled or blocked):
             referenced.update(ref for ref in refs if ref != eid)

@@ -22,8 +22,10 @@ The release gate is open until the current candidate has zero supported unresolv
 | `83f328c518f4f9c5b87903b5ef56317127a94ae8` | Specification | Claude Opus 5.5, medium effort | Five findings (`run_id`: `20261117T173308Z-a2a286`, 267.0s; zero browser/packaging defects); repaired in `64b6fa0` |
 | `64b6fa03ae148cd5964e23e7c1d1420c020175b2` | Standards | Claude Opus 5.5, medium effort | Three findings (0 High, 1 Medium, 2 Low; `run_id`: `20261117T174809Z-251d8a`, 384.8s; zero browser/packaging/catalog defects); repaired in `9308033` |
 | `64b6fa03ae148cd5964e23e7c1d1420c020175b2` | Specification | Claude Opus 5.5, medium effort | Four findings (0 High, 1 Medium, 3 Low; `run_id`: `20261117T174809Z-251d8a`, 308.0s; zero HA-01/packaging defects); repaired in `9308033` |
-| `930803369829a761cfd4593d4db3f153b8c13d64` | Standards | Claude Opus 5.5, medium effort | Seven findings (0 Critical, 0 High, 1 Medium, 4 Low, 2 Nit; `run_id`: `20261117T180834Z-0e141a`, 348.0s); repaired in next candidate |
-| `930803369829a761cfd4593d4db3f153b8c13d64` | Specification | Claude Opus 5.5, medium effort | Six findings (0 High, 1 Medium, 2 Low, 3 Nit; `run_id`: `20261117T180834Z-0e141a`, 394.4s); repaired in next candidate |
+| `930803369829a761cfd4593d4db3f153b8c13d64` | Standards | Claude Opus 5.5, medium effort | Seven findings (0 Critical, 0 High, 1 Medium, 4 Low, 2 Nit; `run_id`: `20261117T180834Z-0e141a`, 348.0s); repaired in `120c3c4` |
+| `930803369829a761cfd4593d4db3f153b8c13d64` | Specification | Claude Opus 5.5, medium effort | Six findings (0 High, 1 Medium, 2 Low, 3 Nit; `run_id`: `20261117T180834Z-0e141a`, 394.4s); repaired in `120c3c4` |
+| `120c3c4362ff529a62f3e43e59ff10a8b3c02ec2` | Standards | Claude Opus 5.5, medium effort | Four actionable findings + one non-blocking nit (0 Critical, 0 High, 1 Medium, 2 Low, 1+1 Nit; `run_id`: `20261117T184436Z-6d91c1`, 260.7s; zero browser/packaging/catalog defects); repaired in next candidate |
+| `120c3c4362ff529a62f3e43e59ff10a8b3c02ec2` | Specification | Claude Opus 5.5, medium effort | Three findings (0 High, 0 Medium, 3 Low; `run_id`: `20261117T184436Z-6d91c1`, 244.0s; zero browser/packaging/catalog defects); repaired in next candidate |
 
 The exact model reported by completed CLI result metadata was `claude-opus-5-5`. The second standards/specification passes took 204.4 and 205.3 seconds respectively. They independently read an immutable full-source snapshot, complete change diff from the public root, documented contract/standards, and raw local test evidence. They executed no code or physical output.
 
@@ -200,4 +202,19 @@ Candidate `930803369829a761cfd4593d4db3f153b8c13d64` passed 150 local tests, Ruf
 | Spec | SIT-UI-05 | Nit | `isEventSourceUnavailable` overwrites `state.interval_minutes` when `sources` omits the entry. | Fell back to `config?.interval_minutes ?? state.interval_minutes`; re-review pending. |
 | Standards / Spec | SIT-R7 / SIT-DOC-06 | Nit | `docs/reference/cap-cancellation.md` line 3 disclaimer contradicts line 19 assertions. | Reworded line 3 and Policy 6 so `cap-cancellation.md` clearly states required policy while test/review evidence verifies conformance separately; re-review pending. |
 
-All findings from candidate `9308033` (and earlier `fcc9072`, `e38a7fd`, `83f328c`, and `64b6fa0`) are repaired on `wip/supervisor-handoff-20261117`. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.
+All findings from candidate `9308033` (and earlier `fcc9072`, `e38a7fd`, `83f328c`, and `64b6fa0`) were verified fixed at `120c3c4`.
+
+### Candidate 120c3c4 Opus review findings
+
+Candidate `120c3c4362ff529a62f3e43e59ff10a8b3c02ec2` passed 154 local tests, Ruff, deterministic packaging, and live anonymous smoke, with **0 Critical, 0 High, and 0 browser/UI/packaging/catalog findings**. Independent Claude Opus 5.5 medium-effort reviews (`run_id`: `20261117T184436Z-6d91c1`; 244.0s specification, 260.7s standards) reported 3 Low specification findings and 1 Medium + 2 Low + 1+1 Nit standards findings (5 unique actionable findings + 1 non-blocking doc nit):
+
+| Axis | Code | Severity | Finding | Current disposition |
+| --- | --- | --- | --- | --- |
+| Standards | SIT-HA-01 | Medium | Invalid `Actual Cancel` persists raw `refs` in `lineage`, unioning root-sharing siblings on Poll 2 into `ambiguous_groups`. | Isolated invalid `Cancel` target references in `uncertain_targets` (validated in `_valid_persisted_store`) without persisting raw `lineage` edges and isolated `nodes` `is_cancel` checks; re-review pending. |
+| Spec / Standards | SIT-SPEC-01 / SIT-HA-02 | Low | `journal_lost` and persisted degraded states delay persistence/notification until after a successful fetch, and unload/remove leaves `situareness_degraded` active. | Stabilized `journal_lost_at` on config entry, persisted `journal_lost` before first fetch, synced `situareness_degraded` at init and pre-fetch, and dismissed it in `async_stop`/`async_unload_entry`/`async_remove_entry`; re-review pending. |
+| Standards | SIT-HA-03 | Nit | Stopping during the first fetch while healthy returns `_degraded_health()` (`evidence_degraded: True`). | Added `_stopped_health()` returning non-degraded empty health when `not self.degraded`; re-review pending. |
+| Spec | SIT-DOC-03 | Low | Docs lack concrete recovery steps for `malformed_store` when deleting the corrupt disk file triggers `journal_lost`. | Documented exact `malformed_store` repair/replacement options (repair disk JSON + reload, delete/empty disk store + reload -> `journal_lost`, or remove & re-add config entry) across `o3-mvp.md`, `cap-cancellation.md`, `docs/ha/README.md`, and `home-assistant/README.md`; re-review pending. |
+| Standards / Spec | SIT-DOC-01 / SIT-DOC-02 | Low | `docs/ha/README.md:45` states seven real-HA tests and omits `journal_lost` scenarios. | Updated `docs/ha/README.md:45` to report the exact passing real-HA test count and list both `journal_lost` scenarios; re-review pending. |
+| Standards (note) | SIT-DOC-02 | Nit | `docs/ha/README.md:27` overstates clearing condition for historic uncertainty (`and any suspended outbox retry expires`). | Clarified that `ended_or_absent` clears once absent while suspended outbox retries prune/expire separately under the 15-minute limit; re-review pending. |
+
+All findings from candidate `120c3c4` are repaired on `wip/supervisor-handoff-20261117`. Independent Claude Opus 5.5 (`standards`, `spec`, and fresh `adversarial`) reviews on the repaired immutable candidate remain required before release approval.

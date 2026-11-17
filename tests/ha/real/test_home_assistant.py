@@ -398,3 +398,53 @@ async def test_real_ha_missing_store_after_init_latches_journal_lost(hass, monke
     assert state.attributes["degraded_reason"] == "journal_lost"
     assert calls == []
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_real_ha_journal_lost_first_poll_failure_and_remove_dismisses_notification(
+    hass, monkeypatch
+):
+    cfg = {
+        "states": ["NY"],
+        "locations": {"new_york_ny": {"name": "New York", "point": [0.5, 0.5]}},
+        "approved_rules": {"Tornado Warning": ["Take shelter immediately"]},
+        "phones": ["mobile_app_test"],
+        "live_enabled": True,
+        "commissioning_passed": True,
+    }
+    Path(hass.config.path("situareness.json")).write_text(json.dumps(cfg))
+    hass.services.async_register("notify", "mobile_app_test", lambda call: None)
+    component = await integration_module(hass, monkeypatch, [])
+    entry = MockConfigEntry(domain="situareness", title="Situareness", data={})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.data.get("journal_initialized") is True
+
+    # Simulate missing store while the first reload poll fails due to NWS outage.
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    storage_file = Path(hass.config.path(".storage")) / (
+        "situareness." + entry.entry_id
+    )
+    storage_file.unlink()
+
+    async def failing_fetch(session, states):
+        raise ConnectionError("NWS unreachable")
+
+    monkeypatch.setattr(component, "fetch", failing_fetch)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.data.get("journal_lost_at") is not None
+    assert "situareness_degraded" in hass.data.get("persistent_notification", {})
+    # Give HA Store delayed write time or read flushed storage once entry is removed? Check store via Store.async_load!
+    from homeassistant.helpers.storage import Store
+
+    saved = await Store(hass, 1, "situareness." + entry.entry_id).async_load()
+    assert saved is not None
+    assert saved["degraded"] is True
+    assert saved["degraded_reason"] == "journal_lost"
+    assert saved["degraded_at"] == entry.data["journal_lost_at"]
+
+    # Removing the failed config entry dismisses the persistent notification cleanly.
+    assert await hass.config_entries.async_remove(entry.entry_id)
+    await hass.async_block_till_done()
+    assert "situareness_degraded" not in hass.data.get("persistent_notification", {})

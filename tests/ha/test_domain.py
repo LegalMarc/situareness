@@ -1570,6 +1570,55 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         expired, _ = d.reconcile(prior, [], config(), NOW + timedelta(days=8))
         self.assertEqual(expired[target["id"]]["state"], "ended_or_absent")
 
+    def test_invalid_cancel_with_references_isolates_target_and_expires_after_horizon(
+        self,
+    ):
+        root = cap_event("ha01-root", -20, message_type="Alert")
+        target = cap_event("ha01-target", -10, [root])
+        sibling = cap_event("ha01-sibling", -8, [root])
+        sibling["instruction"] = "Take shelter in an interior room."
+        bad_cancel = cap_event("ha01-bad-cancel", -5, [target], message_type="Cancel")
+        bad_cancel["cap_references_valid"] = False
+        bad_cancel["reference_identities"] = []
+
+        # Poll 1: invalid Cancel quarantines target and isolates lineage without poisoning sibling.
+        records, plans = d.reconcile(
+            {}, [root, target, sibling, bad_cancel], config(), NOW
+        )
+        self.assertEqual(records[target["id"]]["state"], "quarantined")
+        self.assertEqual(records[sibling["id"]]["state"], "active")
+        self.assertEqual([p["id"] for p in plans], [sibling["id"]])
+        self.assertEqual(records[bad_cancel["id"]]["lineage"], [bad_cancel["id"]])
+        self.assertEqual(records[bad_cancel["id"]]["uncertain_targets"], [target["id"]])
+        self.assertIsNone(records[bad_cancel["id"]]["cap_identity"])
+        self.assertIsNone(records[bad_cancel["id"]]["cap_references"])
+
+        # Poll 2: bad_cancel is only in prior records; target stays quarantined while sibling remains active.
+        records2, plans2 = d.reconcile(
+            records, [target, sibling], config(), NOW + timedelta(minutes=1)
+        )
+        self.assertEqual(records2[target["id"]]["state"], "quarantined")
+        self.assertEqual(records2[sibling["id"]]["state"], "active")
+        self.assertEqual(plans2, [])
+
+        # Poll 3 (>7 days later with bad_cancel and target absent): horizon expires uncertain_targets.
+        records3, _ = d.reconcile(records2, [], config(), NOW + timedelta(days=8))
+        self.assertEqual(records3[bad_cancel["id"]]["state"], "ended_or_absent")
+        self.assertFalse(records3[bad_cancel["id"]]["cancel_message"])
+        self.assertTrue(records3[bad_cancel["id"]]["cancellation_expired"])
+        self.assertNotIn("uncertain_targets", records3[bad_cancel["id"]])
+        self.assertEqual(records3[target["id"]]["state"], "ended_or_absent")
+
+        # Syntactically valid Cancel with inverted ref timestamp (ref[2] >= identity[2]) also
+        # isolates target instead of poisoning sibling's group.
+        inv_cancel = cap_event("ha01-inv-cancel", -15, [target], message_type="Cancel")
+        records_b, plans_b = d.reconcile(
+            {}, [root, target, sibling, inv_cancel], config(), NOW
+        )
+        self.assertEqual(records_b[target["id"]]["state"], "quarantined")
+        self.assertEqual(records_b[sibling["id"]]["state"], "active")
+        self.assertEqual([p["id"] for p in plans_b], [sibling["id"]])
+
         # Overflow prioritizes Cancel / state=="cancelled" over non-cancel protected records
         # and propagates dropped_horizon across evicted components.
         long_expiry = (NOW + timedelta(days=3)).isoformat()

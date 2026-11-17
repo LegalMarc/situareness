@@ -2167,3 +2167,157 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             result = await coordinator._async_update_data()
         self.assertEqual(len(services.calls), 10)
         self.assertEqual(result["pending_count"], 1)
+
+    async def test_stop_during_first_fetch_returns_non_degraded_health(self):
+        import asyncio
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        started = asyncio.Event()
+
+        async def blocking_fetch(*args):
+            started.set()
+            await asyncio.sleep(60)
+            return []
+
+        hass = types.SimpleNamespace(services=Services())
+        coordinator = mod.SituarenessCoordinator(hass, config(), Store(), {})
+        with patch.object(mod, "fetch", blocking_fetch):
+            task = asyncio.create_task(coordinator._async_update_data())
+            await asyncio.wait_for(started.wait(), 2)
+            await asyncio.wait_for(coordinator.async_stop(), 2)
+            result = await asyncio.wait_for(task, 2)
+        self.assertFalse(result["evidence_degraded"])
+        self.assertFalse(result["output_blocked"])
+        self.assertIsNone(result["degraded_reason"])
+        self.assertIsNone(result["active_count"])
+
+        # Stopping a degraded coordinator with no prior data still reports degraded health.
+        started2 = asyncio.Event()
+
+        async def blocking_fetch2(*args):
+            started2.set()
+            await asyncio.sleep(60)
+            return []
+
+        entry = types.SimpleNamespace(entry_id="e1", data={"journal_initialized": True})
+        hass2 = types.SimpleNamespace(
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+            ),
+        )
+        deg_coord = mod.SituarenessCoordinator(
+            hass2, config(), Store(), None, entry=entry
+        )
+        with patch.object(mod, "fetch", blocking_fetch2):
+            task2 = asyncio.create_task(deg_coord._async_update_data())
+            await asyncio.wait_for(started2.wait(), 2)
+            await asyncio.wait_for(deg_coord.async_stop(), 2)
+            result2 = await asyncio.wait_for(task2, 2)
+        self.assertTrue(result2["evidence_degraded"])
+        self.assertTrue(result2["output_blocked"])
+        self.assertEqual(result2["degraded_reason"], "journal_lost")
+
+    async def test_journal_lost_persists_before_first_fetch_and_stabilizes_horizon(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        entry = types.SimpleNamespace(
+            entry_id="lost-entry", data={"journal_initialized": True}
+        )
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+            ),
+        )
+        store = Store()
+        coordinator = mod.SituarenessCoordinator(
+            hass, config(), store, None, entry=entry
+        )
+        self.assertTrue(coordinator.degraded)
+        self.assertEqual(coordinator.degraded_reason, "journal_lost")
+        self.assertIn("situareness_degraded", notifications)
+        lost_at = entry.data.get("journal_lost_at")
+        self.assertIsNotNone(lost_at)
+        expected_until = coordinator.degraded_until
+
+        async def failing_fetch(*args):
+            raise RuntimeError("NWS outage")
+
+        with patch.object(mod, "fetch", failing_fetch):
+            with self.assertRaises(UpdateFailed):
+                await coordinator._async_update_data()
+        # Even though the first fetch failed, journal_lost was already persisted.
+        self.assertEqual(len(store.saved), 1)
+        self.assertTrue(store.saved[0]["degraded"])
+        self.assertEqual(store.saved[0]["degraded_reason"], "journal_lost")
+        self.assertEqual(store.saved[0]["degraded_at"], lost_at)
+
+        # Reload with missing persisted store preserves original journal_lost_at / degraded_until.
+        reloaded = mod.SituarenessCoordinator(
+            hass, config(), Store(), None, entry=entry
+        )
+        self.assertEqual(reloaded.degraded_at, lost_at)
+        self.assertEqual(reloaded.degraded_until, expected_until)
+
+        await reloaded.async_stop()
+        self.assertNotIn("situareness_degraded", notifications)
+
+        # Valid acknowledgement on reload clears degraded state and journal_lost_at.
+        ack_cfg = config()
+        ack_cfg["acknowledge_degraded_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=1)
+        ).isoformat()
+        with patch.object(mod, "datetime") as mock_dt:
+            mock_dt.now.return_value = datetime.now(timezone.utc) + timedelta(seconds=2)
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+            acked = mod.SituarenessCoordinator(
+                hass, ack_cfg, Store(), None, entry=entry
+            )
+        self.assertFalse(acked.degraded)
+        self.assertNotIn("journal_lost_at", entry.data)
+        self.assertNotIn("situareness_degraded", notifications)
