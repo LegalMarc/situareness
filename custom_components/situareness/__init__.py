@@ -915,6 +915,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self._fetch_task = None
         self._stopping = False
         self._last_quarantine_ambiguous = False
+        self._overflow_concurrent = False
         self._notified_degraded_state = None
         self._checked_notification_clear = False
         self._sync_degraded_notification()
@@ -1279,7 +1280,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             quarantine_ambiguous = bool(quarantine_ambiguous)
             self._last_quarantine_ambiguous = quarantine_ambiguous
         if overflow_concurrent is None:
-            overflow_concurrent = getattr(self, "_overflow_concurrent", False)
+            overflow_concurrent = self._overflow_concurrent
         else:
             overflow_concurrent = bool(overflow_concurrent)
             self._overflow_concurrent = overflow_concurrent
@@ -1327,15 +1328,17 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     title = "Situareness delivery outbox full"
                     lead = (
                         "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld while "
+                        "bounded delivery continues: "
                         if is_live
                         else (
                             "Situareness monitoring is degraded in shadow mode (live output disabled): "
                             "the outbox reached the 5,000-target limit and overflowing alert plans are withheld. When live output is enabled, "
+                            "bounded delivery attempts "
                         )
                     )
                     message = (
                         lead
-                        + f"bounded delivery attempts up to 100 queued targets per poll (30s deadline, {max_age_mins}-minute MAX_AGE), "
+                        + f"up to 100 queued targets per poll (30s deadline, {max_age_mins}-minute MAX_AGE), "
                         + f"so queued targets (including first attempts) beyond ~1,500 attempts per {max_age_mins}-minute window "
                         + "(or fewer under slow timeouts) can expire unsent (expired_unsent)."
                         + expired_note
@@ -1549,7 +1552,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         async with self._refresh_lock:
             if self._stopping:
-                raise UpdateFailed("integration is stopping")
+                return self._stopped_poll_result()
             return await self._update_once()
 
     def _stopped_poll_result(self):
@@ -1677,6 +1680,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_attempts": delivery_attempts,
             "delivery_failures": delivery_failures,
             "expired_unsent": expired_unsent,
+            "expired_unsent_at": self.expired_unsent_at,
+            "expired_unsent_until": self.expired_unsent_until,
         }
 
     def _stopped_health(self):
@@ -1719,6 +1724,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_attempts": 0,
             "delivery_failures": 0,
             "expired_unsent": self.expired_unsent,
+            "expired_unsent_at": self.expired_unsent_at,
+            "expired_unsent_until": self.expired_unsent_until,
         }
 
     def _compute_degraded_latch(self, reason, now, until=None, matched_reasons=None):
@@ -2193,6 +2200,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_attempts": attempts,
             "delivery_failures": failures,
             "expired_unsent": expired_unsent,
+            "expired_unsent_at": self.expired_unsent_at,
+            "expired_unsent_until": self.expired_unsent_until,
         }
 
     async def _update_once(self):

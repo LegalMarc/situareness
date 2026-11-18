@@ -15,7 +15,14 @@ class SituarenessSensor(CoordinatorEntity, SensorEntity):
     _attr_name = "Situareness monitoring"
     _attr_icon = "mdi:weather-lightning-rainy"
     _unrecorded_attributes = frozenset(
-        {"events", "last_success", "degraded_at", "degraded_until"}
+        {
+            "events",
+            "last_success",
+            "degraded_at",
+            "degraded_until",
+            "expired_unsent_at",
+            "expired_unsent_until",
+        }
     )
 
     def __init__(self, coordinator, entry_id):

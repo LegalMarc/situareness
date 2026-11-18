@@ -8065,8 +8065,22 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             return_value=(set(), planned_items, 5003, {}),
         ):
             out_q, ov_q, drop_q, _, _, _, _ = await coord_unc._queue_outbox_plans(
-                {}, [p_big, p_small], existing_outbox, [], {}, now_real
+                dict(coord_unc.records),
+                [p_big, p_small],
+                existing_outbox,
+                [],
+                {},
+                now_real,
             )
         self.assertTrue(ov_q)
         self.assertEqual(len(out_q), 5000)
         self.assertEqual(drop_q, [p_big])
+
+        # HA-01 & SPEC-L1: post-stop _async_update_data returns stopped health without raising UpdateFailed,
+        # and snapshots expose expired_unsent_at / expired_unsent_until.
+        coord_unc.data = None
+        await coord_unc.async_stop()
+        post_stop = await coord_unc._async_update_data()
+        self.assertIn("expired_unsent_at", post_stop)
+        self.assertIn("expired_unsent_until", post_stop)
+        self.assertTrue(post_stop["cancellation_uncertain"])
