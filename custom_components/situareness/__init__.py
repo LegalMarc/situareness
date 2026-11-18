@@ -505,6 +505,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.config = config
         self.store = store
         self._entry = entry
+        had_malformed_entry = (
+            self._entry is not None and "malformed_store_at" in self._entry.data
+        )
         if persisted_valid is None:
             persisted_valid = _valid_persisted_store(persisted)
         if not persisted_valid:
@@ -670,10 +673,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     self._entry,
                     data=new_data,
                 )
-        self._needs_corrupt_cleanup = bool(
-            has_corrupt_backup
-            or (self._entry is not None and "malformed_store_at" in self._entry.data)
-        )
+        self._needs_corrupt_cleanup = bool(has_corrupt_backup or had_malformed_entry)
         self._journal_lost_saved = not (
             self.degraded
             and self.degraded_reason == "journal_lost"
@@ -1021,7 +1021,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         message = (
                             prefix
                             + rej_note
-                            + "Manual store repair or replacement in .storage (or removing and re-adding the integration entry) is required."
+                            + "Manual store repair or replacement (deleting the store file and any .corrupt.* backups) in .storage (or removing and re-adding the integration entry) is required."
                             + expired_note
                             + " Continue using independent official alert channels."
                         )
@@ -1413,6 +1413,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         *,
         extra_outcomes=(),
         extra_expired=0,
+        attempted_keys=None,
     ):
         """Queue plans atomically up to 5,000 targets; drain pending deliverable work first if needed."""
         attempts = failures = pre_drain_expired = 0
@@ -1453,7 +1454,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 records, outbox, list(self.outcomes) + list(extra_outcomes)
             )
             attempts, failures, pre_drain_expired = await self._deliver_outbox_batch(
-                candidate_events, now
+                candidate_events, now, attempted_keys=attempted_keys
             )
             already_delivered = True
             records = pre_drain_records
@@ -1489,18 +1490,60 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             pre_drain_expired,
         )
 
-    async def _deliver_outbox_batch(self, candidate_events, now):
+    async def _finish_poll_delivery(
+        self,
+        candidate_events,
+        now,
+        already_delivered,
+        attempts,
+        failures,
+        plans,
+        exclude_keys,
+    ):
+        if not already_delivered:
+            deliver_attempts, deliver_failures, _ = await self._deliver_outbox_batch(
+                candidate_events, now
+            )
+            return deliver_attempts, deliver_failures
+        if attempts < 100 and plans:
+            rem_attempts, rem_failures, _ = await self._deliver_outbox_batch(
+                candidate_events,
+                now,
+                max_attempts=100 - attempts,
+                deadline=now + timedelta(seconds=30),
+                exclude_keys=exclude_keys,
+            )
+            return attempts + rem_attempts, failures + rem_failures
+        return attempts, failures
+
+    async def _deliver_outbox_batch(
+        self,
+        candidate_events,
+        now,
+        *,
+        max_attempts=100,
+        deadline=None,
+        attempted_keys=None,
+        exclude_keys=(),
+    ):
         """Deliver one bounded poll batch (max 100 targets, 30s deadline)."""
         attempts = failures = expired_unsent = 0
+        if max_attempts <= 0:
+            return attempts, failures, expired_unsent
         # Expired items and each completed 10-target delivery group are coalesced into one save;
         # a crash between service call and save may duplicate that group.
+        excluded = set(exclude_keys)
         deliverable_items = [
-            x for x in self.outbox if pending_valid(x, self.records, self.config, now)
+            x
+            for x in self.outbox
+            if x["key"] not in excluded
+            and pending_valid(x, self.records, self.config, now)
         ]
         deliverable_items.sort(key=lambda x: x.get("attempts", 0) > 0)
-        batch = deliverable_items[:100]
+        batch = deliverable_items[:max_attempts]
         by_id = {event["id"]: event for event in candidate_events}
-        deadline = now + timedelta(seconds=30)
+        if deadline is None:
+            deadline = now + timedelta(seconds=30)
         for offset in range(0, len(batch), 10):
             if self._stopping:
                 break
@@ -1558,6 +1601,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 attempts += 1
                 failures += not accepted
                 processed_keys.add(item["key"])
+                if attempted_keys is not None:
+                    attempted_keys.add(item["key"])
                 updated = {**item, "attempts": item["attempts"] + 1}
                 if not accepted and pending_valid(
                     updated, self.records, self.config, datetime.now(timezone.utc)
@@ -1846,6 +1891,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     expired_unsent=migrated_expired,
                     expired_outcomes=migrated_expired_outcomes,
                 )
+            pre_drain_attempted_keys = set()
             (
                 outbox,
                 outbox_overflow,
@@ -1864,6 +1910,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 now,
                 extra_outcomes=migrated_expired_outcomes,
                 extra_expired=migrated_expired,
+                attempted_keys=pre_drain_attempted_keys,
             )
             if outbox_overflow:
                 self._latch_degraded("outbox_overflow", now, now + MAX_AGE)
@@ -1879,12 +1926,15 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 if not already_delivered:
                     self._update_expired_unsent(migrated_expired, now)
                 await self._save(records, outbox, outcomes_to_save)
-                if not already_delivered:
-                    (
-                        attempts,
-                        failures,
-                        _,
-                    ) = await self._deliver_outbox_batch(candidate_events, now)
+                attempts, failures = await self._finish_poll_delivery(
+                    candidate_events,
+                    now,
+                    already_delivered,
+                    attempts,
+                    failures,
+                    plans,
+                    pre_drain_attempted_keys,
+                )
                 total_expired_unsent = self.expired_unsent
                 deliverable = await self.hass.async_add_executor_job(
                     _count_deliverable,
@@ -1922,10 +1972,15 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if not already_delivered:
                 self._update_expired_unsent(migrated_expired, now)
             await self._save(records, outbox, outcomes_to_save)
-            if not already_delivered:
-                attempts, failures, _ = await self._deliver_outbox_batch(
-                    candidate_events, now
-                )
+            attempts, failures = await self._finish_poll_delivery(
+                candidate_events,
+                now,
+                already_delivered,
+                attempts,
+                failures,
+                plans,
+                pre_drain_attempted_keys,
+            )
             total_expired_unsent = self.expired_unsent
             deliverable = await self.hass.async_add_executor_job(
                 _count_deliverable,
@@ -1984,11 +2039,11 @@ async def async_setup_entry(hass, entry):
         else:
             raise ConfigEntryNotReady(f"Could not load persisted store: {err}") from err
     persisted_valid = None
-    if persisted is None and await hass.async_add_executor_job(
+    if (persisted is None or persisted == {}) and await hass.async_add_executor_job(
         _has_corrupt_store_backup, hass.config.path(".storage"), prefix
     ):
         has_corrupt_backup = True
-        if (
+        if persisted is None and (
             store_file_existed
             or "malformed_store_at" in entry.data
             or entry.data.get("journal_initialized") is not True
@@ -2021,7 +2076,6 @@ async def async_unload_entry(hass, entry):
     if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         await hass.data[DOMAIN][entry.entry_id].async_stop()
         hass.data[DOMAIN].pop(entry.entry_id, None)
-        _dismiss_degraded_notification(hass)
         return True
     return False
 

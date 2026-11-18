@@ -5682,3 +5682,389 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(coord_max.degraded_reason, "journal_lost")
         self.assertEqual(coord_max.degraded_until, mod.MAX_TIMESTAMP.isoformat())
+
+    async def test_empty_store_replacement_clears_corrupt_backups_and_notification_mentions_corrupt_backups(
+        self,
+    ):
+        import asyncio
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        cfg = config()
+        mal_coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=Services()), cfg, Store(), ["bad"]
+        )
+        self.assertEqual(mal_coord.degraded_reason, "malformed_store")
+        self.assertIn(
+            ".corrupt.* backups",
+            notifications["situareness_degraded"]["message"],
+        )
+
+        async def run_exec(fn, *args):
+            return fn(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / ".storage"
+            storage_dir.mkdir()
+            (Path(tmp) / "situareness.json").write_text("{}", encoding="utf-8")
+
+            # Case A: "{}" replacement after malformed_store_at in entry.data deletes stale .corrupt.* on Poll 1.
+            backup_a = storage_dir / f"{mod.DOMAIN}.rep-entry-a.corrupt.1"
+            backup_a.write_text("{corrupt", encoding="utf-8")
+            entry_a = types.SimpleNamespace(
+                entry_id="rep-entry-a",
+                data={
+                    "journal_initialized": True,
+                    "malformed_store_at": "2026-11-17T10:00:00+00:00",
+                },
+            )
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                async_add_executor_job=run_exec,
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(
+                        ent, "data", data
+                    ),
+                    async_forward_entry_setups=lambda *a: asyncio.sleep(0),
+                ),
+            )
+            store_a = Store()
+            coord_a = mod.SituarenessCoordinator(hass, cfg, store_a, {}, entry=entry_a)
+            self.assertEqual(coord_a.degraded_reason, "journal_lost")
+            self.assertTrue(coord_a._needs_corrupt_cleanup)
+            with patch.object(mod, "fetch", return_value=[]):
+                await coord_a._async_update_data()
+            self.assertFalse(coord_a._needs_corrupt_cleanup)
+            self.assertFalse(backup_a.exists())
+            self.assertNotIn("malformed_store_at", entry_a.data)
+
+            # Case B: async_setup_entry with persisted == {} and .corrupt.* backup (without malformed_store_at)
+            # preserves journal_lost and deletes stale .corrupt.* backup on first refresh.
+            backup_b = storage_dir / f"{mod.DOMAIN}.rep-entry-b.corrupt.2"
+            backup_b.write_text("{corrupt", encoding="utf-8")
+            entry_b = types.SimpleNamespace(
+                entry_id="rep-entry-b",
+                data={"journal_initialized": True},
+            )
+
+            class EmptyDictStore(Store):
+                async def async_load(self):
+                    return {}
+
+            class CapturingCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    self.data = await self._update_once()
+
+            with (
+                patch.object(mod, "Store", EmptyDictStore),
+                patch.object(mod, "SituarenessCoordinator", CapturingCoordinator),
+                patch.object(mod, "fetch", return_value=[]),
+            ):
+                await mod.async_setup_entry(hass, entry_b)
+            coord_b = hass.data[mod.DOMAIN][entry_b.entry_id]
+            self.assertEqual(coord_b.degraded_reason, "journal_lost")
+            self.assertFalse(coord_b._needs_corrupt_cleanup)
+            self.assertFalse(backup_b.exists())
+
+    async def test_near_capacity_pre_drain_uses_remaining_budget_for_new_targets(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 17, 17, 0, tzinfo=timezone.utc)
+
+        class FixedClock:
+            @classmethod
+            def now(cls, tz):
+                return now
+
+        cfg = config()
+        cfg["locations"] = {
+            "new_york_ny": {"point": [0.5, 0.5], "speakers": []},
+            "washington_dc": {
+                "point": [3.0, 3.0],
+                "speakers": [f"media_player.dc_{i}" for i in range(4980)],
+            },
+            "retry_zone": {
+                "point": [2.5, 2.5],
+                "speakers": [f"media_player.retry_{i}" for i in range(10)],
+            },
+        }
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=[f"mobile_app_{i}" for i in range(10)],
+            tts_entity="tts.home",
+        )
+
+        def make_ev(name, geometry=None):
+            ev = d.normalize(feature())
+            ev["id"] = f"https://api.weather.gov/alerts/cap-{name}"
+            if geometry is not None:
+                ev["geometry"] = geometry
+            for key, delta in [
+                ("sent", -60),
+                ("effective", -60),
+                ("onset", 0),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                ev[key] = (now + timedelta(seconds=delta)).isoformat()
+            return cohere(ev)
+
+        dc_poly = {
+            "type": "Polygon",
+            "coordinates": [
+                [[2.9, 2.9], [3.1, 2.9], [3.1, 3.1], [2.9, 3.1], [2.9, 2.9]]
+            ],
+        }
+        retry_poly = {
+            "type": "Polygon",
+            "coordinates": [
+                [[2.2, 2.2], [2.8, 2.2], [2.8, 2.8], [2.2, 2.8], [2.2, 2.2]]
+            ],
+        }
+        susp_ev = make_ev("susp", geometry=dc_poly)
+        susp_fp = d.fingerprint(susp_ev, d.qualify(susp_ev, cfg, now))
+        retry_ev = make_ev("retry", geometry=retry_poly)
+        retry_fp = d.fingerprint(retry_ev, d.qualify(retry_ev, cfg, now))
+        new_ev = make_ev("new")
+
+        fresh = (now - timedelta(minutes=2)).isoformat()
+        suspended_items = [
+            {
+                "key": f"susp-{i}",
+                "incident_id": susp_ev["id"],
+                "fingerprint": susp_fp,
+                "kind": "speaker",
+                "target": f"media_player.dc_{i}",
+                "location": "washington_dc",
+                "affected_names": ["washington_dc"],
+                "event": "Tornado Warning",
+                "instruction": susp_ev["instruction"],
+                "source_url": susp_ev["id"],
+                "attempts": 0,
+                "created": fresh,
+            }
+            for i in range(4980)
+        ]
+        retry_items = [
+            {
+                "key": f"retry-p-{i}",
+                "incident_id": retry_ev["id"],
+                "fingerprint": retry_fp,
+                "kind": "phone",
+                "target": f"mobile_app_{i}",
+                "location": None,
+                "affected_names": ["retry_zone"],
+                "event": "Tornado Warning",
+                "instruction": retry_ev["instruction"],
+                "source_url": retry_ev["id"],
+                "attempts": 1,
+                "created": fresh,
+            }
+            for i in range(10)
+        ] + [
+            {
+                "key": f"retry-s-{i}",
+                "incident_id": retry_ev["id"],
+                "fingerprint": retry_fp,
+                "kind": "speaker",
+                "target": f"media_player.retry_{i}",
+                "location": "retry_zone",
+                "affected_names": ["retry_zone"],
+                "event": "Tornado Warning",
+                "instruction": retry_ev["instruction"],
+                "source_url": retry_ev["id"],
+                "attempts": 1,
+                "created": fresh,
+            }
+            for i in range(10)
+        ]
+        persisted = {
+            "records": {
+                susp_ev["id"]: {
+                    "state": "ended_or_absent",
+                    "prior_state": "active",
+                    "fingerprint": susp_fp,
+                    "actions": {susp_fp: ["washington_dc"]},
+                    "lineage": [susp_ev["id"]],
+                    "cap_identity": susp_ev["cap_identity"],
+                    "cap_references": [],
+                    "sent": susp_ev["sent"],
+                    "expires": susp_ev["expires"],
+                    "ends": susp_ev["ends"],
+                    "inactive_since": fresh,
+                    "updated": fresh,
+                },
+                retry_ev["id"]: {
+                    "state": "active",
+                    "fingerprint": retry_fp,
+                    "actions": {retry_fp: ["retry_zone"]},
+                    "lineage": [retry_ev["id"]],
+                    "cap_identity": retry_ev["cap_identity"],
+                    "cap_references": [],
+                    "sent": retry_ev["sent"],
+                    "expires": retry_ev["expires"],
+                    "ends": retry_ev["ends"],
+                    "updated": fresh,
+                },
+            },
+            "outbox": suspended_items + retry_items,
+            "initialized": True,
+            "was_live": True,
+        }
+        services = Services()
+        hass = types.SimpleNamespace(data={}, services=services)
+        store = Store()
+        coord = mod.SituarenessCoordinator(hass, cfg, store, persisted)
+        with (
+            patch.object(mod, "datetime", FixedClock),
+            patch.object(mod, "fetch", return_value=[retry_ev, new_ev]),
+        ):
+            health = await coord._async_update_data()
+
+        self.assertIsNone(health["degraded_reason"])
+        self.assertEqual(health["delivery_attempts"], 30)
+        self.assertEqual(health["delivery_failures"], 0)
+        self.assertEqual(len(coord.outbox), 4980)
+        self.assertEqual(len(services.calls), 30)
+        self.assertTrue(
+            any(
+                e["id"] == new_ev["id"] and e["state"] == "active"
+                for e in health["events"]
+            )
+        )
+
+        # Failed pre-drain retries are NOT re-attempted a second time in the same poll.
+        class FailRetryServices:
+            def __init__(self):
+                self.calls = []
+
+            async def async_call(self, *args, **kwargs):
+                self.calls.append(args)
+                data = args[2]
+                if data.get("data", {}).get("url") == retry_ev["id"] or data.get(
+                    "media_player_entity_id", ""
+                ).startswith("media_player.retry_"):
+                    raise OSError("retry channel offline")
+
+        fail_services = FailRetryServices()
+        fail_coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=fail_services),
+            cfg,
+            Store(),
+            persisted,
+        )
+        with (
+            patch.object(mod, "datetime", FixedClock),
+            patch.object(mod, "fetch", return_value=[retry_ev, new_ev]),
+        ):
+            fail_health = await fail_coord._async_update_data()
+        # Each of the 20 retry items is attempted ONCE (20 attempts, 20 failures -> attempts == 2),
+        # never retried a second time in the same poll even though attempts < 100 and plans was non-empty.
+        self.assertEqual(fail_health["degraded_reason"], "outbox_overflow")
+        self.assertEqual(fail_health["delivery_attempts"], 20)
+        self.assertEqual(fail_health["delivery_failures"], 20)
+        self.assertEqual(fail_health["withheld_count"], 1)
+        self.assertEqual(len(fail_services.calls), 20)
+        self.assertEqual(
+            [
+                item["attempts"]
+                for item in fail_coord.outbox
+                if item["incident_id"] == retry_ev["id"]
+            ],
+            [2] * 20,
+        )
+
+    async def test_async_unload_entry_dismisses_notification_once(self):
+        import asyncio
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        dismiss_calls = []
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda *args, **kwargs: None,
+            async_dismiss=lambda hass, notification_id: dismiss_calls.append(
+                notification_id
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        entry = types.SimpleNamespace(entry_id="unload-once", data={})
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_unload_platforms=lambda ent, platforms: asyncio.sleep(
+                    0, result=True
+                )
+            ),
+        )
+        coord = mod.SituarenessCoordinator(hass, config(), Store(), None, entry=entry)
+        hass.data[mod.DOMAIN] = {entry.entry_id: coord}
+        dismiss_calls.clear()
+
+        unloaded = await mod.async_unload_entry(hass, entry)
+        self.assertTrue(unloaded)
+        self.assertEqual(dismiss_calls, ["situareness_degraded"])
+        self.assertNotIn(entry.entry_id, hass.data[mod.DOMAIN])

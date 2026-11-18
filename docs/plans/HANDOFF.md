@@ -2,6 +2,17 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 twenty-second Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `039ea07` (`run_id`: `20261118T014754Z-e43694`, 272.7s standards and 182.6s specification) reported **0 Critical/High findings** and zero live-gate/CAP-quarantine/cancellation/ack-rejection/offload/room/packaging defects, leaving 6 unique items (`SPEC-HA-01`/`HA-DOC-PAGES` Medium, `DOC-HA-02`/`HA-DOC-RETRY` Low, `HA-CORRUPT-CLEANUP` Low, `HA-PREDRAIN-LATENCY` Low, `HA-NOTIFY-RECOVERY` Nit, `HA-DUP-DISMISS` Nit).
+
+All 6 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor review/refinements (`_finish_poll_delivery()` + `attempted_keys`/`exclude_keys` single-attempt-per-poll guard) and doc/report updates:
+- **`SPEC-HA-01` / `HA-DOC-PAGES` & `DOC-HA-02` / `HA-DOC-RETRY`**: Raised `collector.MAX_PAGES` from `10` to `50` with 12-page/51-page tests, and aligned `docs/ha/README.md`, `home-assistant/README.md`, and `docs/spec/o3-mvp.md` to state `"three total attempts (MAX_ATTEMPTS = 3: one initial call plus up to two retries)"`.
+- **`HA-CORRUPT-CLEANUP` & `HA-NOTIFY-RECOVERY`**: Captured `had_malformed_entry` before mutating `entry.data`, checked `_has_corrupt_store_backup` at startup when `persisted is None or persisted == {}` so `{}` replacement clears stale `.corrupt.*` backups on first save, and updated `malformed_store` notifications to instruct deleting any `.corrupt.*` backups alongside the store file.
+- **`HA-PREDRAIN-LATENCY` & `HA-DUP-DISMISS`**: Added `_finish_poll_delivery()` using remaining `100 - attempts` budget within the shared `30s` deadline (excluding `attempted_keys` already tried during pre-drain so no failed retry fires twice in one poll), disclosed full-pre-drain next-poll queueing across docs, and removed duplicate notification dismissal in `async_unload_entry()`.
+
+Verification on the repaired candidate: complete local gates (`43` Node, `109` stdlib `-W error` HA, `7` skill, `21` Chromium Playwright, `11` real HA = `191` total), Ruff lint/format, deterministic packaging (`823de6d0...` extension ZIP, `04e583f8...` HA ZIP), live anonymous smoke (`2026-11-18T01:59:56.086Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117`, refresh clean-HEAD logs, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 twenty-first Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `e13efc8` (`run_id`: `20261118T011756Z-942760`, 335.6s standards and 324.1s specification) reported **0 Critical findings** and zero live-gate/routing/privacy/CAP-quarantine/outbox-overflow/async-offload/room/packaging defects, leaving 9 unique findings (`HA-BOUND-01` Medium, `SPEC-HA-01` Medium, `HA-BOUND-02` Low, `HA-NOTE-01`/`SPEC-HA-02` Low, `SPEC-HA-03` Low, `HA-OUT-01` Low, `DOC-HA-01` Low, `HA-STORE-01` Low, `HA-JL-01` Nit).

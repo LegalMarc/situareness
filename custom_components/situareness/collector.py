@@ -10,7 +10,7 @@ from .domain import (
 )
 
 MAX_BYTES = 8 * 1024 * 1024
-MAX_PAGES = 10
+MAX_PAGES = 50
 
 
 class CollectedEvents(list):

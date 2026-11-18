@@ -1983,6 +1983,37 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await collector.fetch(Session(Response(json.dumps(data).encode())), ["NY"])
 
+    async def test_pagination_allows_50_pages_and_rejects_51(self):
+        import json
+
+        class PaginatedSession:
+            def __init__(self, total_pages):
+                self.total_pages = total_pages
+                self.urls = []
+
+            def get(self, url, **kwargs):
+                page = len(self.urls) + 1
+                self.urls.append(url)
+                ev = feature()
+                cap_id = f"urn:oid:page-{page:02d}"
+                ev["id"] = f"https://api.weather.gov/alerts/{cap_id}"
+                ev["properties"] = {**ev["properties"], "id": cap_id}
+                body = {"type": "FeatureCollection", "features": [ev]}
+                if page < self.total_pages:
+                    body["pagination"] = {
+                        "next": f"https://api.weather.gov/alerts?page={page + 1}"
+                    }
+                return Response(json.dumps(body).encode())
+
+        session_12 = PaginatedSession(12)
+        events_12 = await collector.fetch(session_12, ["NY"])
+        self.assertEqual(len(events_12), 12)
+        self.assertEqual(len(session_12.urls), 12)
+
+        session_51 = PaginatedSession(51)
+        with self.assertRaisesRegex(ValueError, "NWS pagination limit reached"):
+            await collector.fetch(session_51, ["NY"])
+
     def test_out_of_range_timestamps_and_horizon_overflow_resilience(self):
         self.assertIsNone(d.timestamp("9999-12-31T23:59:59Z"))
         self.assertIsNone(d.timestamp("0001-01-01T00:00:00Z"))
