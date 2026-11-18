@@ -25,6 +25,8 @@ def timestamp(value):
 
 
 def safe_url(value):
+    if not isinstance(value, str):
+        return None
     try:
         u = urlparse(value)
         return (

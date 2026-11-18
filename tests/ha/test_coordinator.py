@@ -7659,3 +7659,134 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             coord_iso.records["https://api.weather.gov/alerts/a1"]["actions"],
             original_actions,
         )
+        self.assertFalse(coord_iso.degraded)
+        self.assertIsNone(coord_iso.degraded_reason)
+        self.assertIsNone(coord_iso.degraded_at)
+        self.assertIsNone(coord_iso.degraded_until)
+
+    async def test_store_verification_stopped_overflow_and_tz_outbox_merge(self):
+        import json
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "situareness.test"
+            p.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "data": {"save_id": "abc123", "padding": "x" * 1024},
+                        "trailing": "y" * 1024,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mod._verify_store_save(p, "abc123")
+            with self.assertRaises(OSError):
+                mod._verify_store_save(p, "wrong")
+            p.write_text("{corrupt", encoding="utf-8")
+            with self.assertRaises(OSError):
+                mod._verify_store_save(p, "abc123")
+
+        now_dt = d.timestamp("2026-06-01T16:00:00+00:00")
+        cfg = config()
+        hass = types.SimpleNamespace(data={}, services=Services())
+        coord = mod.SituarenessCoordinator(
+            hass,
+            cfg,
+            Store(),
+            {
+                "degraded": True,
+                "degraded_reason": "outbox_overflow",
+                "degraded_at": "2026-06-01T15:00:00+00:00",
+                "degraded_until": "2026-06-01T15:15:00+00:00",
+                "outbox": [
+                    {
+                        "key": "k1",
+                        "incident_id": "https://api.weather.gov/alerts/a1",
+                        "event": "Tornado Warning",
+                        "fingerprint": "fp1",
+                        "target": "phone:p1",
+                        "kind": "phone",
+                        "location": None,
+                        "source_url": "https://api.weather.gov/alerts/a1",
+                        "created": "2026-06-01T15:00:00+00:00",
+                        "attempts": 0,
+                        "instruction": "Take shelter immediately",
+                        "affected_names": ["New York"],
+                    }
+                ],
+                "records": {
+                    "https://api.weather.gov/alerts/a1": {
+                        "state": "active",
+                        "actions": {"fp1": ["new_york_ny"]},
+                        "updated": "2026-06-01T15:00:00+00:00",
+                    }
+                },
+            },
+        )
+        with patch.object(
+            mod, "_count_deliverable", side_effect=AssertionError("must not scan")
+        ):
+            stopped = coord._stopped_health()
+        self.assertEqual(stopped["deliverable_count"], 0)
+        self.assertEqual(stopped["degraded_reason"], "outbox_overflow")
+
+        records = {
+            "https://api.weather.gov/alerts/a1": {
+                "state": "active",
+                "fingerprint": "fp1",
+                "lineage": ["https://api.weather.gov/alerts/a1"],
+                "actions": {"fp1": ["new_york_ny"]},
+                "updated": "2026-06-01T15:00:00+00:00",
+            }
+        }
+        item_edt = {
+            "key": "k-edt",
+            "incident_id": "https://api.weather.gov/alerts/a1",
+            "event": "Tornado Warning",
+            "fingerprint": "fp1",
+            "target": cfg["phones"][0],
+            "kind": "phone",
+            "location": None,
+            "source_url": "https://api.weather.gov/alerts/a1",
+            "created": "2026-06-01T11:56:00-04:00",
+            "attempts": 1,
+            "instruction": "Take shelter immediately",
+            "affected_names": ["New York"],
+        }
+        item_utc = {
+            **item_edt,
+            "key": "k-utc",
+            "created": "2026-06-01T15:55:00+00:00",
+            "attempts": 2,
+        }
+        candidate_events = [
+            {
+                "id": "https://api.weather.gov/alerts/a1",
+                "lineage": ["https://api.weather.gov/alerts/a1"],
+                "event": "Tornado Warning",
+                "instruction": "Take shelter immediately",
+                "fingerprint": "fp1",
+                "affected": ["new_york_ny"],
+                "affected_names": ["New York"],
+                "url": "https://api.weather.gov/alerts/a1",
+            }
+        ]
+        live_cfg = {**cfg, "live_enabled": True, "commissioning_passed": True}
+        _, merged, _, _ = mod._migrate_outbox_with_index(
+            [item_edt, item_utc], records, candidate_events, now_dt, live_cfg
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["created"], "2026-06-01T15:55:00+00:00")
+        self.assertEqual(merged[0]["attempts"], 2)

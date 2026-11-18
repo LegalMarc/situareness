@@ -2,6 +2,18 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 twenty-ninth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `27fb7a0` (`run_id`: `20261118T162534Z-c7cb5b`, 282.4s standards and 350.8s specification) reported **0 Critical findings**, 0 Standards findings above Low, and 7 unique findings (`F1` High, `F2`/`F3`/`SR-01`/`SR-02` Low, `SR-03`/`SR-04` Nit).
+
+All 7 findings were repaired cleanly in Round 29 (`custom_components/situareness/domain.py`, `custom_components/situareness/__init__.py`, `home-assistant/README.md`, `docs/ha/README.md`, `tests/ha/test_domain.py`, and `tests/ha/test_coordinator.py`):
+- **`F1`**: Guarded `safe_url(value)` against non-`str` inputs so non-string reference `@id` values cannot raise `AttributeError` in `urlparse()` and abort NWS polls, with regression coverage in `tests/ha/test_domain.py`.
+- **`F2`**: Made poll-time degraded state latching, expiry, `outbox_overflow` transitions, and `_ack_cleared_*` resets transactional via pure `degraded_state` computation committed inside `_save()` only after `Store.async_save` and `_verify_store_save` succeed, verified on `FailingStore` in `tests/ha/test_coordinator.py`.
+- **`SR-01` & `SR-02`**: Updated `_verify_store_save()` to parse the `Store.path` JSON envelope and check `data["save_id"] == save_id` independently of key ordering (documented in `docs/ha/README.md`), and passed `deliverable=0` from `_stopped_health()` to avoid synchronous `_count_deliverable` scans when stopped during `outbox_overflow`.
+- **`F3`, `SR-03`, & `SR-04`**: Corrected `home-assistant/README.md` `outbox_overflow` auto-clear/15-minute window wording, compared parsed UTC `timestamp()` values when merging outbox `created` times across timezone offsets, and removed the wall-clock `elapsed < 0.5` assertion from `tests/ha/test_domain.py`.
+
+Verification on the repaired candidate: `ruff check`/`ruff format --check` (12 files), `44` Node, `133` stdlib `-W error` HA, `7` skill, `21` Chromium Playwright, and `13` real HA = `218` total tests, deterministic packaging (`9ef4d967...` extension ZIP, `114a6d90...` HA ZIP), live anonymous smoke (`2026-11-18T17:58:14.319Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: run full clean `run_gates.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh clean-HEAD logs, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 twenty-eighth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `62337c2` (`run_id`: `20261118T160611Z-e864d7`, 313.6s standards and 346.7s specification) reported **0 Critical and 0 High findings**, with zero Specification findings above Low, leaving 6 unique findings (`HA-01` Medium, `HA-02` Low, `SPEC-L1` Low, `HA-03` Low/Nit, `DOC-01`/`DOC-N1` Low/Nit, `SPEC-N1` Nit).
