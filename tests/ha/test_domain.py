@@ -2210,6 +2210,49 @@ class Collector(unittest.IsolatedAsyncioTestCase):
             [spurious_alert["id"]],
         )
 
+    def test_ineligible_current_burst_does_not_crowd_out_protected_tombstones(self):
+        prior = {
+            f"https://api.weather.gov/alerts/tomb-{i}": {
+                "state": "cancelled",
+                "cancel_message": True,
+                "lineage": [f"https://api.weather.gov/alerts/tomb-{i}"],
+                "cap_identity": [
+                    "nws@example.test",
+                    f"tomb-{i}",
+                    NOW.isoformat(),
+                ],
+                "cap_references": [],
+                "sent": NOW.isoformat(),
+                "expires": NOW.isoformat(),
+                "ends": NOW.isoformat(),
+                "updated": NOW.isoformat(),
+            }
+            for i in range(100)
+        }
+        active_events = [
+            cap_event(f"burst-act-{i}", -2, message_type="Alert") for i in range(5)
+        ]
+        ineligible_events = []
+        for i in range(950):
+            ev = cap_event(f"burst-inelig-{i}", -1, message_type="Alert")
+            ev["instruction"] = "Stay tuned for routine updates."
+            ineligible_events.append(ev)
+
+        records, plans = d.reconcile(
+            prior, active_events + ineligible_events, config(), NOW
+        )
+        self.assertEqual(len(records), 1000)
+        self.assertEqual({p["id"] for p in plans}, {e["id"] for e in active_events})
+        self.assertTrue(
+            all(
+                f"https://api.weather.gov/alerts/tomb-{i}" in records
+                for i in range(100)
+            )
+        )
+        self.assertTrue(all(e["id"] in records for e in active_events))
+        kept_inelig = sum(1 for e in ineligible_events if e["id"] in records)
+        self.assertEqual(kept_inelig, 895)
+
 
 if __name__ == "__main__":
     unittest.main()

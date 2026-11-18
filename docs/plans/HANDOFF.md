@@ -2,6 +2,18 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 nineteenth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `6bd9bc9` (`run_id`: `20261118T002932Z-5e3623`, 361.5s standards and 230.3s specification) reported **0 Critical, 0 High, and 0 Medium standards findings**, and zero live-gate/routing/privacy/CAP/quarantine/store/ack/offload/room/packaging defects, leaving 5 items (`SPEC-HA-01` Medium, `SIT-PERF-01` Low, `SIT-AVAIL-01` Low, `SPEC-HA-02` Nit, `DOC-01` Nit).
+
+All 5 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor contract/README/report updates:
+- **`SPEC-HA-01`**: Added `expired_by_age()` in `delivery.py`; surfaced `expired_unsent` (`partial: True`), `"expired": True` outcomes, and `situareness_degraded` notifications when active queued targets (including first attempts) age past the 15-minute `MAX_AGE` window; synchronized `docs/spec/o3-mvp.md`, `docs/ha/README.md`, and `home-assistant/README.md`.
+- **`SIT-PERF-01`**: Coalesced expired-item pruning and post-delivery persistence in `_deliver_outbox_batch()` into at most one save per 10-target group and documented the per-item instruction serialization cost (~10KB/target, up to ~12 saves/poll under 5,000-target load).
+- **`SIT-AVAIL-01`**: Excluded pure `ineligible` non-cancellation items (without action history or cancellation evidence) from `protected` in `_bound_records()` so multi-state bursts do not crowd out retained tombstones or latch 7-day `cancellation_evidence_overflow`.
+- **`SPEC-HA-02` & `DOC-01`**: Documented automatic first-save cleanup of stale `.corrupt.*` backups after `malformed_store` recovery, and removed the `"non-Cancel"` qualifier from `quarantine_ambiguous` in `home-assistant/README.md`.
+
+Next: run complete local gates (`43` Node, `95` stdlib HA, `7` skill, `21` Chromium, `11` actual HA = `177` total), deterministic packaging (`823de6d0...` extension, `7c78b35a...` HA), live anonymous smoke (`2026-11-18T00:44:36.350Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, and run Opus `axes` + fresh `adversarial` reviews. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 eighteenth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `c132758` (`run_id`: `20261118T001451Z-588b6e`, 323.9s standards and 386.0s specification) reported **0 Critical, 0 High, and 0 Medium findings across both axes**, leaving only 6 small Low/Nit findings (`SR-DOC-01` Low, `SR-DOC-02` Low, `SPEC-01`/`SR-DOC-03` Low/Nit, `SR-MAINT-01`/`STD-01` Nit, `STD-02` Nit, `DOC-01` Nit).

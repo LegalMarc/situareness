@@ -17,7 +17,14 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .collector import fetch
 from .config import validate
 from .const import DOMAIN
-from .delivery import MAX_AGE, deliver_one, live, pending_valid, targets
+from .delivery import (
+    MAX_AGE,
+    deliver_one,
+    expired_by_age,
+    live,
+    pending_valid,
+    targets,
+)
 from .domain import (
     CancellationEvidenceOverflow,
     MAX_ACCEPTANCE_AGE,
@@ -293,7 +300,7 @@ def _migrate_outbox_with_index(
 ):
     groups, _ = lineage_index(records, [])
     if not live(config):
-        return groups, []
+        return groups, [], 0, []
     event_index = {}
     for event in events:
         eid = event["id"]
@@ -339,11 +346,16 @@ def _migrate_outbox_with_index(
                     "created": min(now, created_ts + degraded_delta).isoformat(),
                 }
         candidates.append(item)
-    migrated = [
-        x
-        for x in candidates
-        if pending_valid(x, records, config, now, allow_suspended=True)
-    ]
+    migrated = []
+    expired_unique = {}
+    for item in candidates:
+        if pending_valid(item, records, config, now, allow_suspended=True):
+            migrated.append(item)
+        elif expired_by_age(item, records, config, now):
+            key = _outbox_signature(groups, item, records)
+            prior_exp = expired_unique.get(key)
+            if prior_exp is None or item["attempts"] > prior_exp["attempts"]:
+                expired_unique[key] = item
     unique = {}
     for item in migrated:
         key = _outbox_signature(groups, item, records)
@@ -357,7 +369,18 @@ def _migrate_outbox_with_index(
             }
         else:
             unique[key] = item
-    return groups, list(unique.values())
+    expired_items = [item for key, item in expired_unique.items() if key not in unique]
+    expired_outcomes = [
+        {
+            "key": x["key"],
+            "accepted": False,
+            "expired": True,
+            "attempt": x["attempts"],
+            "at": now.isoformat(),
+        }
+        for x in expired_items
+    ]
+    return groups, list(unique.values()), len(expired_items), expired_outcomes
 
 
 def _build_planned_items(
@@ -752,10 +775,21 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
             self.hass.config_entries.async_update_entry(self._entry, data=new_data)
 
-    def _sync_degraded_notification(self, quarantine_ambiguous=False):
+    def _sync_degraded_notification(self, quarantine_ambiguous=False, expired_unsent=0):
+        expired_note = (
+            f" {expired_unsent} queued target(s) expired unsent past the 15-minute delivery window."
+            if expired_unsent > 0
+            else ""
+        )
+        expired_flag = expired_unsent > 0
         if self.degraded:
             is_live = live(self.config)
-            state = (self.degraded_reason, is_live, self.acknowledge_rejected)
+            state = (
+                self.degraded_reason,
+                is_live,
+                self.acknowledge_rejected,
+                expired_flag,
+            )
             if self._notified_degraded_state != state:
                 rej_note = (
                     "Configured acknowledge_degraded_at did not clear this state "
@@ -769,7 +803,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     if is_live:
                         message = (
                             "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld "
-                            "while already-queued targets continue bounded delivery. "
+                            "while bounded delivery attempts up to 100 queued targets per poll (30s deadline, 15-minute MAX_AGE), "
+                            "so queued targets (including first attempts) beyond ~1,500 attempts per 15-minute window "
+                            "(or fewer under slow timeouts) can expire unsent (expired_unsent)."
+                            + expired_note
+                            + " "
                             + rej_note
                             + "This clears automatically on any poll where current plans fit within the 5,000-target limit; "
                             "one-shot acknowledge_degraded_at in situareness.json "
@@ -781,6 +819,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         message = (
                             "Situareness monitoring is degraded in shadow mode (live output disabled): "
                             "the outbox reached the 5,000-target limit and overflowing alert plans are withheld. "
+                            "When live output is enabled, bounded delivery attempts up to 100 queued targets per poll "
+                            "(30s deadline, 15-minute MAX_AGE), so queued targets (including first attempts) beyond ~1,500 attempts "
+                            "per 15-minute window (or fewer under slow timeouts) can expire unsent (expired_unsent)."
+                            + expired_note
+                            + " "
                             + rej_note
                             + "This clears automatically on any poll where current plans fit within the 5,000-target limit; "
                             "one-shot acknowledge_degraded_at in situareness.json "
@@ -802,8 +845,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         message = (
                             prefix
                             + rej_note
-                            + "Manual store repair or replacement in .storage (or removing and re-adding the integration entry) is required. "
-                            + "Continue using independent official alert channels."
+                            + "Manual store repair or replacement in .storage (or removing and re-adding the integration entry) is required."
+                            + expired_note
+                            + " Continue using independent official alert channels."
                         )
                     else:
                         tail = (
@@ -816,7 +860,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                                 "the seven-day degraded_until horizon expires on a clean poll, "
                                 "or until one-shot acknowledge_degraded_at in situareness.json "
                                 "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
-                                "(acknowledging early discards missing historical tombstones). "
+                                "(acknowledging early discards missing historical tombstones)."
                             )
                         elif self.degraded_reason == "cancellation_evidence_overflow":
                             recovery_guidance = (
@@ -825,7 +869,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                                 "or until one-shot acknowledge_degraded_at in situareness.json "
                                 "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
                                 "once protected records no longer exceed 1,000 "
-                                "(otherwise the next poll re-latches with a new degraded_at; acknowledging early discards evicted tombstones). "
+                                "(otherwise the next poll re-latches with a new degraded_at; acknowledging early discards evicted tombstones)."
                             )
                         else:
                             recovery_guidance = (
@@ -833,14 +877,15 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                                 "or until one-shot acknowledge_degraded_at in situareness.json "
                                 "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
                                 "once the triggering feed condition has left the feed "
-                                "(otherwise the next poll re-latches with a new degraded_at). "
+                                "(otherwise the next poll re-latches with a new degraded_at)."
                             )
                         message = (
                             prefix
                             + rej_note
                             + tail
                             + recovery_guidance
-                            + "Continue using independent official alert channels."
+                            + expired_note
+                            + " Continue using independent official alert channels."
                         )
                 persistent_notification.async_create(
                     self.hass,
@@ -855,6 +900,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 "quarantine_ambiguous",
                 live(self.config),
                 self.acknowledge_rejected,
+                expired_flag,
             )
             if self._notified_degraded_state != state:
                 msg = (
@@ -866,6 +912,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         " Configured acknowledge_degraded_at in situareness.json was also rejected "
                         "(invalid, missing a timezone offset, over-length, or in the future; consumed if valid ISO-8601)."
                     )
+                msg += expired_note
                 persistent_notification.async_create(
                     self.hass,
                     msg,
@@ -875,14 +922,30 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self._notified_degraded_state = state
                 self._checked_notification_clear = False
         elif self.acknowledge_rejected:
-            state = ("acknowledge_rejected", live(self.config))
+            state = ("acknowledge_rejected", live(self.config), expired_flag)
+            if self._notified_degraded_state != state:
+                msg = (
+                    "Configured acknowledge_degraded_at in situareness.json was invalid, "
+                    "missing a timezone offset, over-length, or in the future, so it was rejected "
+                    "(and consumed if valid ISO-8601). Situareness monitoring remains online."
+                    + expired_note
+                )
+                persistent_notification.async_create(
+                    self.hass,
+                    msg,
+                    title="Situareness acknowledgement rejected",
+                    notification_id="situareness_degraded",
+                )
+                self._notified_degraded_state = state
+                self._checked_notification_clear = False
+        elif expired_unsent > 0:
+            state = ("expired_unsent", live(self.config))
             if self._notified_degraded_state != state:
                 persistent_notification.async_create(
                     self.hass,
-                    "Configured acknowledge_degraded_at in situareness.json was invalid, "
-                    "missing a timezone offset, over-length, or in the future, so it was rejected "
-                    "(and consumed if valid ISO-8601). Situareness monitoring remains online.",
-                    title="Situareness acknowledgement rejected",
+                    f"{expired_unsent} queued qualifying alert target(s) aged past the 15-minute delivery window "
+                    "before delivery completed. Continue using independent official alert channels.",
+                    title="Situareness alert targets expired unsent",
                     notification_id="situareness_degraded",
                 )
                 self._notified_degraded_state = state
@@ -929,6 +992,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         delivery_attempts=0,
         delivery_failures=0,
         deliverable=None,
+        expired_unsent=0,
     ):
         """Expose a redacted durable degraded state without delivering (except bounded queued delivery during outbox_overflow)."""
         previous = getattr(self, "data", None) or {}
@@ -1005,6 +1069,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 or quarantine_ambiguous
                 or cancellation_uncertain
                 or is_outbox_overflow
+                or bool(expired_unsent)
             ),
             "quarantined_count": quarantined_count,
             "quarantine_ambiguous": quarantine_ambiguous,
@@ -1024,6 +1089,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "suspended_count": suspended,
             "delivery_attempts": delivery_attempts,
             "delivery_failures": delivery_failures,
+            "expired_unsent": expired_unsent,
         }
 
     def _stopped_health(self):
@@ -1054,6 +1120,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "suspended_count": len(self.outbox),
             "delivery_attempts": 0,
             "delivery_failures": 0,
+            "expired_unsent": 0,
         }
 
     def _latch_degraded(self, reason, now, until=None):
@@ -1110,16 +1177,20 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         *,
         triggered_now=False,
         recoverable_prior_conflict=False,
+        expired_unsent=0,
+        expired_outcomes=(),
     ):
         self._strip_withheld_actions(records, plans, groups, now)
         self.last_degraded_poll = now.isoformat()
         try:
-            await self._save(records, outbox, list(self.outcomes))
+            await self._save(
+                records, outbox, list(self.outcomes) + list(expired_outcomes)
+            )
         except Exception as save_err:
             raise UpdateFailed(
                 "Could not persist cancellation evidence safety state"
             ) from save_err
-        self._sync_degraded_notification()
+        self._sync_degraded_notification(expired_unsent=expired_unsent)
         return self._degraded_health(
             events=events,
             candidate_events=candidate_events,
@@ -1131,15 +1202,33 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             withheld_count=len(plans),
             delivery_attempts=0,
             delivery_failures=0,
+            expired_unsent=expired_unsent,
         )
 
     async def _queue_outbox_plans(
-        self, records, plans, outbox, candidate_events, groups, now
+        self,
+        records,
+        plans,
+        outbox,
+        candidate_events,
+        groups,
+        now,
+        *,
+        extra_outcomes=(),
     ):
         """Queue plans atomically up to 5,000 targets; drain pending deliverable work first if needed."""
-        attempts = failures = 0
+        attempts = failures = pre_drain_expired = 0
         if not live(self.config) or not plans:
-            return outbox, False, [], records, attempts, failures, False
+            return (
+                outbox,
+                False,
+                [],
+                records,
+                attempts,
+                failures,
+                False,
+                pre_drain_expired,
+            )
 
         (
             existing,
@@ -1161,8 +1250,12 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         already_delivered = False
         if pre_drain_records is not None:
             self._strip_withheld_actions(records, plans, groups, now)
-            await self._save(records, outbox, list(self.outcomes))
-            attempts, failures = await self._deliver_outbox_batch(candidate_events, now)
+            await self._save(
+                records, outbox, list(self.outcomes) + list(extra_outcomes)
+            )
+            attempts, failures, pre_drain_expired = await self._deliver_outbox_batch(
+                candidate_events, now
+            )
             already_delivered = True
             records = pre_drain_records
             outbox = list(self.outbox)
@@ -1194,12 +1287,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             attempts,
             failures,
             already_delivered,
+            pre_drain_expired,
         )
 
     async def _deliver_outbox_batch(self, candidate_events, now):
         """Deliver one bounded poll batch (max 100 targets, 30s deadline)."""
-        attempts = failures = 0
-        # Expired items and each completed 10-target delivery group are persisted; a crash between service call and save may duplicate that group.
+        attempts = failures = expired_unsent = 0
+        # Expired items and each completed 10-target delivery group are coalesced into one save;
+        # a crash between service call and save may duplicate that group.
         deliverable_items = [
             x for x in self.outbox if pending_valid(x, self.records, self.config, now)
         ]
@@ -1215,6 +1310,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 break
             group = []
             expired_keys = set()
+            expired_outcomes = []
             qualified_by_id = {}
             for item in batch[offset : offset + 10]:
                 incident_id = item["incident_id"]
@@ -1232,10 +1328,23 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     item, self.records, self.config, current, allow_suspended=True
                 ):
                     expired_keys.add(item["key"])
-            if expired_keys:
-                remaining = [x for x in self.outbox if x["key"] not in expired_keys]
-                await self._save(self.records, remaining, self.outcomes)
+                    if expired_by_age(item, self.records, self.config, current):
+                        expired_unsent += 1
+                        expired_outcomes.append(
+                            {
+                                "key": item["key"],
+                                "accepted": False,
+                                "expired": True,
+                                "attempt": item["attempts"],
+                                "at": current.isoformat(),
+                            }
+                        )
             if not group:
+                if expired_keys or expired_outcomes:
+                    remaining = [x for x in self.outbox if x["key"] not in expired_keys]
+                    await self._save(
+                        self.records, remaining, self.outcomes + expired_outcomes
+                    )
                 continue
             results = await asyncio.gather(
                 *(deliver_one(self.hass.services, item, self.config) for item in group)
@@ -1262,12 +1371,17 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         "at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
-            if processed_keys or new_outcomes:
+            if processed_keys or expired_keys or new_outcomes or expired_outcomes:
+                removed_keys = processed_keys | expired_keys
                 remaining = [
-                    x for x in self.outbox if x["key"] not in processed_keys
+                    x for x in self.outbox if x["key"] not in removed_keys
                 ] + requeued
-                await self._save(self.records, remaining, self.outcomes + new_outcomes)
-        return attempts, failures
+                await self._save(
+                    self.records,
+                    remaining,
+                    self.outcomes + expired_outcomes + new_outcomes,
+                )
+        return attempts, failures, expired_unsent
 
     def _healthy_snapshot(
         self,
@@ -1281,6 +1395,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         recoverable_prior_conflict,
         *,
         deliverable=None,
+        expired_unsent=0,
     ):
         """Build the redacted healthy coordinator snapshot and sync notifications."""
         if deliverable is None:
@@ -1301,9 +1416,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
         quarantine_ambiguous = bool(getattr(events, "quarantine_ambiguous", False))
         partial = (
-            bool(quarantine_count) or cancellation_uncertain or quarantine_ambiguous
+            bool(quarantine_count)
+            or cancellation_uncertain
+            or quarantine_ambiguous
+            or bool(expired_unsent)
         )
-        self._sync_degraded_notification(quarantine_ambiguous=quarantine_ambiguous)
+        self._sync_degraded_notification(
+            quarantine_ambiguous=quarantine_ambiguous, expired_unsent=expired_unsent
+        )
         return {
             "last_success": now.isoformat(),
             "event_count": len(candidate_events),
@@ -1343,6 +1463,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "suspended_count": len(self.outbox) - deliverable,
             "delivery_attempts": attempts,
             "delivery_failures": failures,
+            "expired_unsent": expired_unsent,
         }
 
     async def _update_once(self):
@@ -1483,7 +1604,12 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             # Carry an undelivered item through equivalent NWS update identifiers.
             # Reconciled records contain only trusted Alert/Update edges;
             # raw source references could reconnect a quarantined forgery.
-            groups, outbox = await self.hass.async_add_executor_job(
+            (
+                groups,
+                outbox,
+                migrated_expired,
+                migrated_expired_outcomes,
+            ) = await self.hass.async_add_executor_job(
                 partial(
                     _migrate_outbox_with_index,
                     self.outbox,
@@ -1506,6 +1632,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     now,
                     triggered_now=(degraded_trigger is not None),
                     recoverable_prior_conflict=recoverable_prior_conflict,
+                    expired_unsent=migrated_expired,
+                    expired_outcomes=migrated_expired_outcomes,
                 )
             (
                 outbox,
@@ -1515,19 +1643,34 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 attempts,
                 failures,
                 already_delivered,
+                batch_expired,
             ) = await self._queue_outbox_plans(
-                records, plans, outbox, candidate_events, groups, now
+                records,
+                plans,
+                outbox,
+                candidate_events,
+                groups,
+                now,
+                extra_outcomes=migrated_expired_outcomes,
             )
             if outbox_overflow:
                 self._latch_degraded("outbox_overflow", now, now + MAX_AGE)
                 self._ack_cleared_on_load = False
                 self._strip_withheld_actions(records, dropped_plans, groups, now)
                 self.last_degraded_poll = None
-                await self._save(records, outbox, list(self.outcomes))
+                outcomes_to_save = (
+                    list(self.outcomes)
+                    if already_delivered
+                    else list(self.outcomes) + migrated_expired_outcomes
+                )
+                await self._save(records, outbox, outcomes_to_save)
                 if not already_delivered:
-                    attempts, failures = await self._deliver_outbox_batch(
-                        candidate_events, now
-                    )
+                    (
+                        attempts,
+                        failures,
+                        batch_expired,
+                    ) = await self._deliver_outbox_batch(candidate_events, now)
+                total_expired_unsent = migrated_expired + batch_expired
                 deliverable = await self.hass.async_add_executor_job(
                     _count_deliverable,
                     self.outbox,
@@ -1536,7 +1679,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     self.config,
                     datetime.now(timezone.utc),
                 )
-                self._sync_degraded_notification()
+                self._sync_degraded_notification(expired_unsent=total_expired_unsent)
                 return self._degraded_health(
                     events=events,
                     candidate_events=candidate_events,
@@ -1549,6 +1692,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     delivery_attempts=attempts,
                     delivery_failures=failures,
                     deliverable=deliverable,
+                    expired_unsent=total_expired_unsent,
                 )
             if self.degraded and self.degraded_reason == "outbox_overflow":
                 self.degraded = False
@@ -1558,11 +1702,17 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self.acknowledge_rejected = self._config_ack_rejected
             self._ack_cleared_on_load = False
             self.last_degraded_poll = None
-            await self._save(records, outbox, list(self.outcomes))
+            outcomes_to_save = (
+                list(self.outcomes)
+                if already_delivered
+                else list(self.outcomes) + migrated_expired_outcomes
+            )
+            await self._save(records, outbox, outcomes_to_save)
             if not already_delivered:
-                attempts, failures = await self._deliver_outbox_batch(
+                attempts, failures, batch_expired = await self._deliver_outbox_batch(
                     candidate_events, now
                 )
+            total_expired_unsent = migrated_expired + batch_expired
             deliverable = await self.hass.async_add_executor_job(
                 _count_deliverable,
                 self.outbox,
@@ -1587,6 +1737,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             failures,
             recoverable_prior_conflict,
             deliverable=deliverable,
+            expired_unsent=total_expired_unsent,
         )
 
 

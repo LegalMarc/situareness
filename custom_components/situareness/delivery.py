@@ -98,6 +98,31 @@ def pending_valid(item, records, config, now, *, allow_suspended=False):
         return False
 
 
+def expired_by_age(item, records, config, now):
+    """Return True when a valid active-alert item expired solely due to MAX_AGE."""
+    try:
+        created = datetime.fromisoformat(item["created"])
+        attempts = item["attempts"]
+        if (
+            created.tzinfo is None
+            or created > now
+            or now - created <= MAX_AGE
+            or isinstance(attempts, bool)
+            or not isinstance(attempts, int)
+            or not 0 <= attempts < MAX_ATTEMPTS
+        ):
+            return False
+        return pending_valid(
+            {**item, "created": now.isoformat()},
+            records,
+            config,
+            now,
+            allow_suspended=False,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def _phone_payload(item):
     """Bound serialized HA service data, leaving room for the provider envelope."""
     url = item["source_url"]

@@ -4039,11 +4039,12 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             },
         )
         with patch.object(mod, "qualify", wraps=d.qualify) as mock_qualify:
-            attempts, failures = await prio_coord._deliver_outbox_batch(
+            attempts, failures, expired = await prio_coord._deliver_outbox_batch(
                 [retry_ev, fresh_ev], now
             )
         self.assertEqual(attempts, 100)
         self.assertEqual(failures, 0)
+        self.assertEqual(expired, 0)
         self.assertEqual(prio_services.calls[0][2]["data"]["url"], fresh_ev["id"])
         # Remaining 99 slots go to FIFO retries; 1 retry remains queued.
         self.assertEqual(len(prio_coord.outbox), 1)
@@ -4444,3 +4445,274 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(merged_note["title"], "Situareness alert scope ambiguous")
         self.assertIn("acknowledge_degraded_at", merged_note["message"])
         self.assertIn("rejected", merged_note["message"])
+
+    async def test_expired_unsent_surfacing_and_coalesced_group_save(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        now = datetime.now(timezone.utc)
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=[f"mobile_app_{i}" for i in range(50)],
+            tts_entity=None,
+        )
+
+        def make_ev(name, offset_sec=-60):
+            ev = d.normalize(feature())
+            ev["id"] = f"https://api.weather.gov/alerts/exp-{name}"
+            for key, delta in [
+                ("sent", offset_sec),
+                ("effective", offset_sec),
+                ("onset", 0),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                ev[key] = (now + timedelta(seconds=delta)).isoformat()
+            return cohere(ev)
+
+        # Below outbox_overflow: active aged first-attempt item surfaces expired_unsent,
+        # partial=True, expired outcome, and notification; ended alert does not.
+        act_ev = make_ev("active-aged")
+        act_decision = d.qualify(act_ev, cfg, now)
+        act_fp = d.fingerprint(act_ev, act_decision)
+        ended_ev = make_ev("ended-aged")
+        ended_fp = d.fingerprint(ended_ev, d.qualify(ended_ev, cfg, now))
+        aged_created = (now - timedelta(minutes=16)).isoformat()
+        persisted_below = {
+            "records": {
+                act_ev["id"]: {
+                    "state": "active",
+                    "fingerprint": act_fp,
+                    "actions": {act_fp: ["new_york_ny"]},
+                    "lineage": [act_ev["id"]],
+                    "cap_identity": act_ev["cap_identity"],
+                    "cap_references": [],
+                    "sent": act_ev["sent"],
+                    "expires": act_ev["expires"],
+                    "ends": act_ev["ends"],
+                    "updated": now.isoformat(),
+                },
+                ended_ev["id"]: {
+                    "state": "active",
+                    "fingerprint": ended_fp,
+                    "actions": {ended_fp: ["new_york_ny"]},
+                    "lineage": [ended_ev["id"]],
+                    "cap_identity": ended_ev["cap_identity"],
+                    "cap_references": [],
+                    "sent": ended_ev["sent"],
+                    "expires": ended_ev["expires"],
+                    "ends": ended_ev["ends"],
+                    "updated": now.isoformat(),
+                },
+            },
+            "outbox": [
+                {
+                    "key": "exp-active-0",
+                    "incident_id": act_ev["id"],
+                    "fingerprint": act_fp,
+                    "kind": "phone",
+                    "target": "mobile_app_0",
+                    "location": None,
+                    "affected_names": ["New York"],
+                    "event": "Tornado Warning",
+                    "instruction": act_ev["instruction"],
+                    "source_url": act_ev["id"],
+                    "attempts": 0,
+                    "created": aged_created,
+                },
+                {
+                    "key": "exp-ended-0",
+                    "incident_id": ended_ev["id"],
+                    "fingerprint": ended_fp,
+                    "kind": "phone",
+                    "target": "mobile_app_0",
+                    "location": None,
+                    "affected_names": ["New York"],
+                    "event": "Tornado Warning",
+                    "instruction": ended_ev["instruction"],
+                    "source_url": ended_ev["id"],
+                    "attempts": 0,
+                    "created": aged_created,
+                },
+            ],
+            "initialized": True,
+            "was_live": True,
+        }
+        hass = types.SimpleNamespace(data={}, services=Services())
+        store_below = Store()
+        coord_below = mod.SituarenessCoordinator(
+            hass, cfg, store_below, persisted_below
+        )
+        with patch.object(mod, "fetch", return_value=[act_ev]):
+            h_below = await coord_below._async_update_data()
+        self.assertEqual(h_below["expired_unsent"], 1)
+        self.assertTrue(h_below["partial"])
+        self.assertFalse(h_below["evidence_degraded"])
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness alert targets expired unsent",
+        )
+        expired_outs = [
+            o for o in store_below.saved[-1]["outcomes"] if o.get("expired")
+        ]
+        self.assertEqual(len(expired_outs), 1)
+        self.assertEqual(expired_outs[0]["key"], "exp-active-0")
+        self.assertFalse(expired_outs[0]["accepted"])
+
+        # During outbox_overflow: aged target adds expired_unsent > 0 alongside capacity note.
+        notifications.clear()
+        ov_alerts = []
+        for i in range(101):
+            ev = make_ev(f"ov-{i}")
+            ev["instruction"] = f"Take shelter immediately overflow zone {i}."
+            ov_alerts.append(ev)
+        store_ov = Store()
+        coord_ov = mod.SituarenessCoordinator(
+            hass,
+            cfg,
+            store_ov,
+            {
+                **persisted_below,
+                "outbox": [persisted_below["outbox"][0]],
+            },
+        )
+        with patch.object(mod, "fetch", return_value=[act_ev, *ov_alerts]):
+            h_ov = await coord_ov._async_update_data()
+        self.assertEqual(h_ov["degraded_reason"], "outbox_overflow")
+        self.assertEqual(h_ov["expired_unsent"], 1)
+        self.assertTrue(h_ov["partial"])
+        ov_note = notifications["situareness_degraded"]["message"]
+        self.assertIn("~1,500 attempts", ov_note)
+        self.assertIn("1 queued target(s) expired unsent", ov_note)
+        self.assertTrue(
+            any(
+                o.get("key") == "exp-active-0" and o.get("expired")
+                for o in store_ov.saved[0]["outcomes"]
+            )
+        )
+
+        # Coalesced per-group save: a 10-target slice with 1 expired + 9 deliverable items
+        # issues ONE pre-batch save + ONE coalesced post-group save (2 total, not 3).
+        class PollExpiryClock:
+            calls = 0
+
+            @classmethod
+            def now(cls, tz):
+                cls.calls += 1
+                # First call is initial poll `now`; subsequent calls advance 20s (<30s deadline)
+                # so the 14m50s item crosses 15m MAX_AGE while the 5m items stay deliverable.
+                if cls.calls <= 1:
+                    return now
+                return now + timedelta(seconds=20)
+
+        batch_ev = make_ev("coalesce")
+        batch_fp = d.fingerprint(batch_ev, d.qualify(batch_ev, cfg, now))
+        fresh_created = (now - timedelta(minutes=5)).isoformat()
+        about_to_expire = (now - timedelta(minutes=14, seconds=50)).isoformat()
+        slice_outbox = [
+            {
+                "key": "slice-exp",
+                "incident_id": batch_ev["id"],
+                "fingerprint": batch_fp,
+                "kind": "phone",
+                "target": "mobile_app_0",
+                "location": None,
+                "affected_names": ["New York"],
+                "event": "Tornado Warning",
+                "instruction": batch_ev["instruction"],
+                "source_url": batch_ev["id"],
+                "attempts": 0,
+                "created": about_to_expire,
+            }
+        ] + [
+            {
+                "key": f"slice-ok-{i}",
+                "incident_id": batch_ev["id"],
+                "fingerprint": batch_fp,
+                "kind": "phone",
+                "target": f"mobile_app_{i}",
+                "location": None,
+                "affected_names": ["New York"],
+                "event": "Tornado Warning",
+                "instruction": batch_ev["instruction"],
+                "source_url": batch_ev["id"],
+                "attempts": 0,
+                "created": fresh_created,
+            }
+            for i in range(1, 10)
+        ]
+        batch_store = Store()
+        batch_services = Services()
+        batch_coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=batch_services),
+            {**cfg, "phones": [f"mobile_app_{i}" for i in range(10)]},
+            batch_store,
+            {
+                "records": {
+                    batch_ev["id"]: {
+                        "state": "active",
+                        "fingerprint": batch_fp,
+                        "actions": {batch_fp: ["new_york_ny"]},
+                        "lineage": [batch_ev["id"]],
+                        "cap_identity": batch_ev["cap_identity"],
+                        "cap_references": [],
+                        "sent": batch_ev["sent"],
+                        "expires": batch_ev["expires"],
+                        "ends": batch_ev["ends"],
+                        "updated": now.isoformat(),
+                    }
+                },
+                "outbox": slice_outbox,
+                "initialized": True,
+                "was_live": True,
+            },
+        )
+        PollExpiryClock.calls = 0
+        with (
+            patch.object(mod, "datetime", PollExpiryClock),
+            patch.object(mod, "fetch", return_value=[batch_ev]),
+        ):
+            h_coal = await batch_coord._async_update_data()
+        self.assertEqual(len(batch_store.saved), 2)
+        self.assertEqual(h_coal["delivery_attempts"], 9)
+        self.assertEqual(h_coal["expired_unsent"], 1)
+        self.assertTrue(h_coal["partial"])
+        self.assertEqual(len(batch_services.calls), 9)
+        self.assertEqual(batch_coord.outbox, [])
+        last_outcomes = batch_store.saved[-1]["outcomes"]
+        self.assertEqual(len(last_outcomes), 10)
+        self.assertTrue(
+            any(o["key"] == "slice-exp" and o.get("expired") for o in last_outcomes)
+        )

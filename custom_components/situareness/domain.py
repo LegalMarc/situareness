@@ -1041,20 +1041,35 @@ def _bound_records(
         for eid, record in records.items()
         if record.get("cancel_message") or record.get("state") == "cancelled"
     }
+    actionable_groups = {
+        groups.get(eid)
+        for eid, record in records.items()
+        if record.get("state") in ("active", "quarantined", "unconfirmed", "cancelled")
+        or record.get("cancel_message")
+        or record.get("actions")
+        or record.get("uncertain_targets")
+    }
     current_graph_ids = {event["id"] for event in graph_events}
-    protected = (
-        seen
-        | current_graph_ids
-        | {eid for eid in records if groups.get(eid) in cancellation_groups}
-    )
+    protected = {
+        eid
+        for eid, record in records.items()
+        if groups.get(eid) in cancellation_groups
+        or (
+            (eid in seen or eid in current_graph_ids)
+            and (
+                record.get("state") != "ineligible"
+                or groups.get(eid) in actionable_groups
+            )
+        )
+    }
 
     def sort_key(item):
         return (
+            item[0] in protected,
             item[0] in seen,
             item[0] in current_graph_ids,
             bool(item[1].get("cancel_message")),
             item[1].get("state") == "cancelled",
-            item[0] in protected,
             item[1].get("updated", ""),
         )
 
