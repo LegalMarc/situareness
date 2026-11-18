@@ -2,6 +2,19 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 twenty-fifth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `18342bc` (`run_id`: `20261118T025653Z-90db5a`, 240.5s standards and 276.3s specification) reported **0 Critical and 0 High findings**, and zero live-gate/routing/privacy/CAP-cancellation/bounds/store-schema/stop-cancellation/room/INDEX defects, leaving 8 unique findings (`HA-UNLOAD-01` Medium, `SR-01` Medium, `HA-SETUP-02`/`SR-03` Low, `HA-PERSIST-03` Low, `HA-RETRY-04` Low, `DOC-CTX-05`/`SR-02` Low, `SR-04` Nit, `TEST-NIT-06` Nit).
+
+All 8 findings were repaired via `ha-repair` (`775aa2e8`) and supervisor integration (`tests/ui/helpers.test.js`, `asyncio.to_thread` in `tests/ha/test_coordinator.py` `BaseCoordinator._exec`, and doc/report updates):
+- **`SR-01`**: Added tail `save_id` verification (`_verify_store_save` via `async_add_executor_job`, validated in `_valid_persisted_store`) after `Store.async_save` and proved against real HA 2026.11.1 `0o500` `.storage` that swallowed `WriteError` fails the poll (`UpdateFailed`) before notify service calls while preserving prior state.
+- **`HA-PERSIST-03`**: Replaced pre-save mutating expired updates with pure `_compute_expired_unsent()`, committing `records`, `outbox`, `outcomes`, `last_degraded_poll`, `expired_unsent*`, `acknowledge_rejected`, and `entry.data` only after `_save` and `_verify_store_save` succeed.
+- **`HA-UNLOAD-01` & `HA-SETUP-02` / `SR-03`**: Added `resume_after_failed_unload()` when `async_unload_platforms()` returns `False` or raises, and deduplicated `SETUP_RETRY` state listeners via `_SETUP_RETRY_UNSUBS` across repeated failed setup retries and entry removal.
+- **`HA-RETRY-04` & `SR-04`**: Added `"exhausted"` to `VALID_EXPIRY_REASONS` / `delivery.expiry_reason(..., check_exhausted=True)` so 3-attempt delivery failures (`attempts >= MAX_ATTEMPTS`) latch `expired_unsent` with cause attribution, and sorted `_merge_consumed_acks` chronologically so older `entry.data` entries cannot regress `acknowledged_degraded_at`.
+- **`DOC-CTX-05` / `SR-02` & `TEST-NIT-06`**: Qualified `docs/CONTEXT.md` on pre-delivery vs post-group save failures, updated `docs/spec/o3-mvp.md`, `docs/ha/README.md`, and `home-assistant/README.md` (`Thirteen tests` in real-HA docs), removed the inline drafting comment in `tests/ha/test_coordinator.py`, replaced the no-op `undefined ??` expression in `tests/ui/helpers.test.js`, and used `asyncio.to_thread` in `BaseCoordinator._exec` for zero slow-callback warnings.
+
+Verification on the repaired candidate: complete local gates (`44` Node, `126` stdlib `-W error` HA, `7` skill, `21` Chromium Playwright, `13` real HA = `211` total), Ruff lint/format, deterministic packaging (`5434a239...` extension ZIP, `9b7357f9...` HA ZIP), live anonymous smoke (`2026-11-18T03:11:38.600Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117`, refresh clean-HEAD logs, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 twenty-fourth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `bd617e2` (`run_id`: `20261118T022802Z-e54306`, 392.1s standards and 441.5s specification) reported **0 Critical, 0 High, and 0 Medium findings**, with zero live-gate/routing/privacy/CAP-cancellation/bounds/store-schema/ack/room-UI/catalog/index defects, leaving only 12 Low and Nit items (`SIT-L01`/`SPEC-01`, `SIT-L02`, `SIT-L03`, `SIT-L04`, `SIT-L05`, `SIT-L06`, `STD-01`, `SIT-N01`, `SIT-N02`, `SIT-N03`, `NIT-01`, `NIT-02`).

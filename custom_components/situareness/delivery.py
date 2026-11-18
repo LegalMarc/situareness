@@ -98,6 +98,18 @@ def pending_valid(item, records, config, now, *, allow_suspended=False):
         return False
 
 
+def _active_target_record(item, records):
+    record = records.get(item["incident_id"], {})
+    return (
+        record.get("state") == "active"
+        and record.get("fingerprint") == item["fingerprint"]
+    ) or (
+        record.get("state") in ("quarantined", "unconfirmed")
+        and record.get("prior_state") == "active"
+        and item["fingerprint"] in action_history(record)
+    )
+
+
 def expired_by_age(item, records, config, now):
     """Return True when an unexhausted queued target for an active or suspended-from-active alert is invalid or expired."""
     try:
@@ -110,21 +122,25 @@ def expired_by_age(item, records, config, now):
             or not 0 <= attempts < MAX_ATTEMPTS
         ):
             return False
-        record = records.get(item["incident_id"], {})
-        return (
-            record.get("state") == "active"
-            and record.get("fingerprint") == item["fingerprint"]
-        ) or (
-            record.get("state") in ("quarantined", "unconfirmed")
-            and record.get("prior_state") == "active"
-            and item["fingerprint"] in action_history(record)
-        )
+        return _active_target_record(item, records)
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
 
 
-def expiry_reason(item, records, config, now):
-    """Classify why an unexhausted active-alert target failed delivery."""
+def expiry_reason(item, records, config, now, *, check_exhausted=False):
+    """Classify why a queued active-alert target failed delivery."""
+    if check_exhausted:
+        try:
+            if _active_target_record(item, records):
+                attempts = item.get("attempts")
+                if (
+                    not isinstance(attempts, bool)
+                    and isinstance(attempts, int)
+                    and attempts >= MAX_ATTEMPTS
+                ):
+                    return "exhausted"
+        except (KeyError, TypeError):
+            return None
     if not expired_by_age(item, records, config, now):
         return None
     try:

@@ -24,8 +24,7 @@ class BaseCoordinator:
         if hass is not None and not hasattr(hass, "async_add_executor_job"):
 
             async def _exec(fn, *args):
-                await asyncio.sleep(0)
-                return fn(*args)
+                return await asyncio.to_thread(fn, *args)
 
             hass.async_add_executor_job = _exec
 
@@ -6318,7 +6317,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         for bad_payload in (
             {"records": {}, "expired_unsent_reasons": ["unknown"]},
             {"records": {}, "expired_unsent_reasons": "age"},
-            {"records": {}, "expired_unsent_reasons": ["age", "age", "age", "age"]},
+            {"records": {}, "expired_unsent_reasons": ["age"] * 5},
             {"records": {}, "outcomes": [{"key": "k", "reason": "bad_reason"}]},
         ):
             self.assertFalse(mod._valid_persisted_store(bad_payload))
@@ -6672,8 +6671,6 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             "instruction": queued_ev["instruction"],
         }
         queued_items = mod.targets(queued_plan, cfg, now)
-        # 4,995 + 6? wait: keep 4,995 suspended + 4 queued phones (retry/queued) -> 4,999,
-        # or 4,995 suspended + 6 queued items -> already 5,001 > 5,000, keep 4,994 + 6 = 5,000!
         outbox = susp_items[:4994] + queued_items
         records = {
             susp_ev["id"]: {
@@ -6840,3 +6837,422 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(dismiss_calls, ["situareness_degraded"])
             self.assertEqual(peer_calls, ["peer"])
             self.assertEqual(len(listeners), 1)
+
+    async def test_failed_platform_unload_resumes_coordinator_and_next_poll_succeeds(
+        self,
+    ):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, nid: notifications.pop(nid, None),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        unload_result = False
+
+        async def fake_unload(ent, platforms):
+            if isinstance(unload_result, Exception):
+                raise unload_result
+            return unload_result
+
+        entry = types.SimpleNamespace(entry_id="resume-unload", data={})
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_unload_platforms=fake_unload,
+                async_update_entry=lambda ent, data=None: setattr(ent, "data", data),
+            ),
+        )
+        coord = mod.SituarenessCoordinator(
+            hass,
+            config(),
+            Store(),
+            {
+                "records": {},
+                "outbox": [],
+                "initialized": True,
+                "was_live": True,
+                "degraded": True,
+                "degraded_reason": "journal_lost",
+                "degraded_at": "2026-11-17T10:00:00+00:00",
+                "degraded_until": "2026-11-24T10:00:00+00:00",
+            },
+            entry=entry,
+        )
+        hass.data[mod.DOMAIN] = {entry.entry_id: coord}
+        self.assertIn("situareness_degraded", notifications)
+
+        # Returning False from async_unload_platforms resumes coordinator and resyncs notification.
+        self.assertFalse(await mod.async_unload_entry(hass, entry))
+        self.assertFalse(coord._stopping)
+        self.assertIn("situareness_degraded", notifications)
+        self.assertIn(entry.entry_id, hass.data[mod.DOMAIN])
+
+        with patch.object(mod, "fetch", return_value=[]):
+            health = await coord._async_update_data()
+        self.assertEqual(health["degraded_reason"], "journal_lost")
+
+        # Raising from async_unload_platforms also resumes coordinator before re-raising.
+        unload_result = RuntimeError("platform unload error")
+        with self.assertRaises(RuntimeError):
+            await mod.async_unload_entry(hass, entry)
+        self.assertFalse(coord._stopping)
+        self.assertIn("situareness_degraded", notifications)
+
+    async def test_repeated_failed_setup_entry_deduplicates_retry_listener(self):
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        async def run_exec(fn, *args):
+            return fn(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "situareness.json").write_text("{}", encoding="utf-8")
+            listeners = []
+
+            class FakeEntry:
+                entry_id = "dedup-retry"
+                data = {}
+                state = "setup_retry"
+
+                def async_on_state_change(self, cb):
+                    listeners.append(cb)
+                    return lambda: listeners.remove(cb)
+
+            entry = FakeEntry()
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                async_add_executor_job=run_exec,
+            )
+
+            class EmptyStore(Store):
+                async def async_load(self):
+                    return None
+
+                async def async_remove(self):
+                    pass
+
+            class FailingCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    raise ConfigEntryNotReady("NWS down")
+
+            with (
+                patch.object(mod, "Store", EmptyStore),
+                patch.object(mod, "SituarenessCoordinator", FailingCoordinator),
+            ):
+                for _ in range(3):
+                    with self.assertRaises(ConfigEntryNotReady):
+                        await mod.async_setup_entry(hass, entry)
+                    self.assertEqual(len(listeners), 1)
+                await mod.async_remove_entry(hass, entry)
+            self.assertEqual(listeners, [])
+
+    async def test_failed_save_preserves_expired_unsent_and_last_degraded_poll(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 18, 1, 0, tzinfo=timezone.utc)
+
+        class Clock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        Clock.current = now
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_0"],
+            tts_entity=None,
+        )
+        ev = d.normalize(feature())
+        ev["id"] = "https://api.weather.gov/alerts/save-fail-1"
+        for key, delta in [
+            ("sent", -60),
+            ("effective", -60),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            ev[key] = (now + timedelta(seconds=delta)).isoformat()
+        ev = cohere(ev)
+        fp = d.fingerprint(ev, d.qualify(ev, cfg, now))
+
+        prev_poll = (now - timedelta(minutes=1)).isoformat()
+        persisted = {
+            "records": {
+                ev["id"]: {
+                    "state": "active",
+                    "fingerprint": fp,
+                    "actions": {fp: ["new_york_ny"]},
+                    "lineage": [ev["id"]],
+                    "cap_identity": ev["cap_identity"],
+                    "cap_references": [],
+                    "sent": ev["sent"],
+                    "expires": ev["expires"],
+                    "ends": ev["ends"],
+                    "updated": (now - timedelta(minutes=20)).isoformat(),
+                }
+            },
+            "outbox": [
+                {
+                    "key": "fail-save-item",
+                    "incident_id": ev["id"],
+                    "fingerprint": fp,
+                    "kind": "phone",
+                    "target": "mobile_app_0",
+                    "location": None,
+                    "affected_names": ["New York"],
+                    "event": "Tornado Warning",
+                    "instruction": ev["instruction"],
+                    "source_url": ev["id"],
+                    "attempts": 0,
+                    "created": (now - timedelta(minutes=17)).isoformat(),
+                }
+            ],
+            "initialized": True,
+            "was_live": True,
+            "degraded": True,
+            "degraded_reason": "journal_lost",
+            "degraded_at": (now - timedelta(hours=1)).isoformat(),
+            "degraded_until": (now + timedelta(days=7)).isoformat(),
+            "last_degraded_poll": prev_poll,
+        }
+        store = Store()
+        store.fail = True
+        coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=Services()), cfg, store, persisted
+        )
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=[ev]),
+        ):
+            with self.assertRaises(UpdateFailed):
+                await coord._async_update_data()
+        # Neither expired_unsent nor last_degraded_poll changed when _save failed.
+        self.assertEqual(coord.expired_unsent, 0)
+        self.assertEqual(coord.last_degraded_poll, prev_poll)
+
+        # Succeeding retry poll advances last_degraded_poll cleanly and counts item once.
+        store.fail = False
+        Clock.current = now + timedelta(minutes=1)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=[ev]),
+        ):
+            health = await coord._async_update_data()
+        self.assertEqual(health["expired_unsent"], 1)
+        self.assertEqual(coord.expired_unsent, 1)
+        self.assertEqual(coord.last_degraded_poll, Clock.current.isoformat())
+
+    async def test_third_failed_delivery_attempt_latches_exhausted_expired_unsent(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, nid: notifications.pop(nid, None),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 18, 2, 0, tzinfo=timezone.utc)
+
+        class FixedClock:
+            @classmethod
+            def now(cls, tz):
+                return now
+
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_0"],
+            tts_entity=None,
+        )
+        ev = d.normalize(feature())
+        ev["id"] = "https://api.weather.gov/alerts/exhaust-3"
+        for key, delta in [
+            ("sent", -60),
+            ("effective", -60),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            ev[key] = (now + timedelta(seconds=delta)).isoformat()
+        ev = cohere(ev)
+        fp = d.fingerprint(ev, d.qualify(ev, cfg, now))
+
+        class FailingServices:
+            async def async_call(self, *args, **kwargs):
+                raise OSError("channel down")
+
+        persisted = {
+            "records": {
+                ev["id"]: {
+                    "state": "active",
+                    "fingerprint": fp,
+                    "actions": {fp: ["new_york_ny"]},
+                    "lineage": [ev["id"]],
+                    "cap_identity": ev["cap_identity"],
+                    "cap_references": [],
+                    "sent": ev["sent"],
+                    "expires": ev["expires"],
+                    "ends": ev["ends"],
+                    "updated": now.isoformat(),
+                }
+            },
+            "outbox": [
+                {
+                    "key": "exhaust-item-1",
+                    "incident_id": ev["id"],
+                    "fingerprint": fp,
+                    "kind": "phone",
+                    "target": "mobile_app_0",
+                    "location": None,
+                    "affected_names": ["New York"],
+                    "event": "Tornado Warning",
+                    "instruction": ev["instruction"],
+                    "source_url": ev["id"],
+                    "attempts": 2,
+                    "created": (now - timedelta(minutes=2)).isoformat(),
+                }
+            ],
+            "initialized": True,
+            "was_live": True,
+        }
+        store = Store()
+        coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=FailingServices()),
+            cfg,
+            store,
+            persisted,
+        )
+        with (
+            patch.object(mod, "datetime", FixedClock),
+            patch.object(mod, "fetch", return_value=[ev]),
+        ):
+            health = await coord._async_update_data()
+
+        self.assertEqual(coord.outbox, [])
+        self.assertEqual(health["delivery_attempts"], 1)
+        self.assertEqual(health["delivery_failures"], 1)
+        self.assertEqual(health["expired_unsent"], 1)
+        self.assertTrue(health["partial"])
+        self.assertEqual(store.saved[-1]["expired_unsent_reasons"], ["exhausted"])
+        expired_outs = [o for o in store.saved[-1]["outcomes"] if o.get("expired")]
+        self.assertEqual(len(expired_outs), 1)
+        self.assertEqual(expired_outs[0]["reason"], "exhausted")
+        self.assertEqual(expired_outs[0]["attempt"], 3)
+        self.assertIn(
+            "exhausted all 3 delivery attempts (MAX_ATTEMPTS = 3)",
+            notifications["situareness_degraded"]["message"],
+        )
+
+    async def test_merge_consumed_acks_sorts_chronologically(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        t0 = "2026-11-17T08:00:00+00:00"
+        t1 = "2026-11-17T09:00:00+00:00"
+        t2 = "2026-11-17T10:00:00+00:00"
+        self.assertEqual(mod._merge_consumed_acks([t2, t1], [t0]), [t0, t1, t2])
+
+        entry = types.SimpleNamespace(
+            entry_id="ack-order",
+            data={"acknowledged_degraded_at": t0, "consumed_acknowledgements": [t0]},
+        )
+        coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+                ),
+            ),
+            config(),
+            Store(),
+            {"records": {}, "acknowledged_degraded_at": t2},
+            entry=entry,
+        )
+        self.assertEqual(coord.acknowledged_degraded_at, t2)
+        self.assertEqual(coord.consumed_acknowledgements, [t0, t2])

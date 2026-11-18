@@ -646,9 +646,14 @@ test("isEventSourceUnavailable and nwsAwarenessLifecycle fall back to state.inte
       last_success_at: threeMinutesAgo,
     },
   ];
+  const unconfigured = [].find((source) => source.id === "usgs");
   assert.equal(
     sourceFreshness(
-      { ...fiveMinuteState[0], interval_minutes: undefined ?? fiveMinuteState[0].interval_minutes },
+      {
+        ...fiveMinuteState[0],
+        interval_minutes:
+          unconfigured?.interval_minutes ?? fiveMinuteState[0].interval_minutes,
+      },
       now,
     ),
     "ok",

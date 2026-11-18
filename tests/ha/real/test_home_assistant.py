@@ -604,3 +604,48 @@ async def test_real_ha_abandoned_setup_retry_dismisses_degraded_notification(
     assert await hass.config_entries.async_unload(entry.entry_id)
     await hass.async_block_till_done()
     assert "situareness_degraded" not in hass.data.get("persistent_notification", {})
+
+
+async def test_real_ha_readonly_storage_detected_by_save_verification(
+    hass, monkeypatch
+):
+    cfg = {
+        "states": ["NY"],
+        "locations": {"new_york_ny": {"name": "New York", "point": [0.5, 0.5]}},
+        "approved_rules": {"Tornado Warning": ["Take shelter immediately"]},
+        "phones": ["mobile_app_test"],
+        "live_enabled": True,
+        "commissioning_passed": True,
+    }
+    Path(hass.config.path("situareness.json")).write_text(json.dumps(cfg))
+    calls = []
+    hass.services.async_register(
+        "notify", "mobile_app_test", lambda call: calls.append(call.data)
+    )
+    component = await integration_module(hass, monkeypatch, [])
+    entry = MockConfigEntry(domain="situareness", title="Situareness", data={})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = hass.data["situareness"][entry.entry_id]
+    prior_records = dict(coordinator.records)
+    prior_outbox = list(coordinator.outbox)
+    test_alert = alert()
+
+    async def next_fetch(session, states):
+        return [test_alert]
+
+    monkeypatch.setattr(component, "fetch", next_fetch)
+    storage_dir = Path(hass.config.path(".storage"))
+    storage_dir.chmod(0o500)
+    try:
+        await coordinator.async_request_refresh()
+        await hass.async_block_till_done()
+        state = hass.states.get("sensor.situareness_monitoring")
+        assert state is not None and state.state == "unavailable"
+        assert calls == []
+        assert coordinator.records == prior_records
+        assert coordinator.outbox == prior_outbox
+    finally:
+        storage_dir.chmod(0o700)

@@ -7,6 +7,7 @@ from functools import partial
 import json
 import logging
 from pathlib import Path
+import uuid
 
 from homeassistant.components import persistent_notification
 from homeassistant.const import Platform
@@ -57,13 +58,15 @@ VALID_RECORD_STATES = {
     "superseded",
     "cancelled",
 }
-VALID_EXPIRY_REASONS = ("age", "clock_rollback", "target_removed")
+VALID_EXPIRY_REASONS = ("age", "clock_rollback", "target_removed", "exhausted")
 _EVIDENCE_REASON_RANK = {
     "conflicting_cancellation": 4,
     "malformed_cancellation": 3,
     "journal_lost": 2,
     "cancellation_evidence_overflow": 1,
 }
+_UNSET = object()
+_SETUP_RETRY_UNSUBS = {}
 
 
 def _read_config(path):
@@ -270,11 +273,15 @@ def _valid_persisted_store(persisted):
             )
         ):
             return False
+    if "save_id" in persisted and persisted["save_id"] is not None:
+        save_id = persisted["save_id"]
+        if not isinstance(save_id, str) or len(save_id) > 64:
+            return False
     return True
 
 
 def _merge_consumed_acks(*sources):
-    ordered = []
+    by_val = {}
     for source in sources:
         items = (
             source
@@ -284,11 +291,17 @@ def _merge_consumed_acks(*sources):
             else ()
         )
         for val in items:
-            if isinstance(val, str) and len(val) <= 100 and timestamp(val) is not None:
-                if val in ordered:
-                    ordered.remove(val)
-                ordered.append(val)
-    return ordered[-100:]
+            if isinstance(val, str) and len(val) <= 100:
+                ts = timestamp(val)
+                if ts is not None:
+                    if val in by_val:
+                        del by_val[val]
+                    by_val[val] = ts
+    ranked = sorted(
+        ((ts, idx, val) for idx, (val, ts) in enumerate(by_val.items())),
+        key=lambda entry: (entry[0], entry[1]),
+    )
+    return [val for _, _, val in ranked[-100:]]
 
 
 def _outbox_signature(groups, item, records=None):
@@ -545,6 +558,26 @@ def _clear_corrupt_store_backups(storage_dir, prefix):
             )
             ok = False
     return ok
+
+
+def _verify_store_save(store_path, save_id):
+    path = Path(store_path)
+    with path.open("rb") as stream:
+        stream.seek(0, 2)
+        size = stream.tell()
+        stream.seek(max(0, size - 512))
+        tail = stream.read()
+    if save_id.encode("ascii") not in tail:
+        raise OSError("Store write was not committed")
+
+
+def _clear_retry_listener(hass, entry_id):
+    unsub = _SETUP_RETRY_UNSUBS.pop((id(hass), entry_id), None)
+    if unsub is not None:
+        try:
+            unsub()
+        except ValueError:
+            pass
 
 
 class SituarenessCoordinator(DataUpdateCoordinator):
@@ -904,34 +937,80 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         if ack_rejected is not None:
             self.acknowledge_rejected = ack_rejected
 
-    async def _save(self, records, outbox, outcomes, *, preserve_lost_at=False):
-        await self.store.async_save(
-            {
-                "records": records,
-                "outbox": outbox,
-                "outcomes": outcomes[-100:],
-                "initialized": True,
-                "was_live": live(self.config),
-                "degraded": self.degraded,
-                "degraded_reason": self.degraded_reason,
-                "degraded_at": self.degraded_at,
-                "degraded_until": self.degraded_until,
-                "acknowledged_degraded_at": self.acknowledged_degraded_at,
-                "consumed_acknowledgements": list(self.consumed_acknowledgements),
-                "last_degraded_poll": self.last_degraded_poll,
-                "expired_unsent": self.expired_unsent,
-                "expired_unsent_at": self.expired_unsent_at,
-                "expired_unsent_until": self.expired_unsent_until,
-                "expired_unsent_reasons": list(self.expired_unsent_reasons),
-            }
+    async def _save(
+        self,
+        records,
+        outbox,
+        outcomes,
+        *,
+        preserve_lost_at=False,
+        last_degraded_poll=_UNSET,
+        expired_state=None,
+    ):
+        target_last_poll = (
+            self.last_degraded_poll
+            if last_degraded_poll is _UNSET
+            else last_degraded_poll
         )
-        self.records, self.outbox, self.outcomes, self.initialized = (
+        if expired_state is None:
+            exp_count = self.expired_unsent
+            exp_at = self.expired_unsent_at
+            exp_until = self.expired_unsent_until
+            exp_reasons = list(self.expired_unsent_reasons)
+            exp_ack_rej = self.acknowledge_rejected
+        else:
+            exp_count, exp_at, exp_until, exp_reasons, exp_ack_rej = expired_state
+        save_id = uuid.uuid4().hex
+        payload = {
+            "records": records,
+            "outbox": outbox,
+            "outcomes": outcomes[-100:],
+            "initialized": True,
+            "was_live": live(self.config),
+            "degraded": self.degraded,
+            "degraded_reason": self.degraded_reason,
+            "degraded_at": self.degraded_at,
+            "degraded_until": self.degraded_until,
+            "acknowledged_degraded_at": self.acknowledged_degraded_at,
+            "consumed_acknowledgements": list(self.consumed_acknowledgements),
+            "last_degraded_poll": target_last_poll,
+            "expired_unsent": exp_count,
+            "expired_unsent_at": exp_at,
+            "expired_unsent_until": exp_until,
+            "expired_unsent_reasons": list(exp_reasons),
+            "save_id": save_id,
+        }
+        await self.store.async_save(payload)
+        store_path = getattr(self.store, "path", None)
+        if isinstance(store_path, (str, Path)):
+            await self.hass.async_add_executor_job(
+                _verify_store_save, store_path, save_id
+            )
+        (
+            self.records,
+            self.outbox,
+            self.outcomes,
+            self.initialized,
+            self.was_live,
+            self.last_degraded_poll,
+            self.expired_unsent,
+            self.expired_unsent_at,
+            self.expired_unsent_until,
+            self.expired_unsent_reasons,
+            self.acknowledge_rejected,
+        ) = (
             records,
             outbox,
             outcomes[-100:],
             True,
+            live(self.config),
+            target_last_poll,
+            exp_count,
+            exp_at,
+            exp_until,
+            list(exp_reasons),
+            exp_ack_rej,
         )
-        self.was_live = live(self.config)
         if self._needs_corrupt_cleanup:
             cleaned = True
             if self._entry is not None and hasattr(self.hass, "config"):
@@ -976,15 +1055,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
             self.hass.config_entries.async_update_entry(self._entry, data=new_data)
 
-    def _update_expired_unsent(self, poll_expired, now, outcomes=()):
+    def _compute_expired_unsent(self, poll_expired, now, outcomes=()):
         if poll_expired > 0:
-            if (
-                self.expired_unsent <= 0
-                or not isinstance(self.expired_unsent_at, str)
-                or timestamp(self.expired_unsent_at) is None
-            ):
-                self.expired_unsent_at = now.isoformat()
-            self.expired_unsent += poll_expired
+            new_at = (
+                now.isoformat()
+                if (
+                    self.expired_unsent <= 0
+                    or not isinstance(self.expired_unsent_at, str)
+                    or timestamp(self.expired_unsent_at) is None
+                )
+                else self.expired_unsent_at
+            )
+            new_count = self.expired_unsent + poll_expired
             new_reasons = [
                 o.get("reason")
                 for o in outcomes
@@ -993,9 +1075,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if not new_reasons:
                 new_reasons = ["age"]
             combined = set(self.expired_unsent_reasons) | set(new_reasons)
-            self.expired_unsent_reasons = [
-                r for r in VALID_EXPIRY_REASONS if r in combined
-            ]
+            ordered_reasons = [r for r in VALID_EXPIRY_REASONS if r in combined]
             try:
                 until = min(now + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP)
             except OverflowError:
@@ -1007,32 +1087,54 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             )
             if existing_until is not None:
                 until = min(max(until, existing_until), MAX_TIMESTAMP)
-            self.expired_unsent_until = until.isoformat()
-        elif self.expired_unsent > 0:
-            if (
-                not isinstance(self.expired_unsent_at, str)
-                or timestamp(self.expired_unsent_at) is None
-            ):
-                self.expired_unsent_at = now.isoformat()
+            return (
+                new_count,
+                new_at,
+                until.isoformat(),
+                ordered_reasons,
+                self.acknowledge_rejected,
+            )
+        if self.expired_unsent > 0:
+            new_at = (
+                now.isoformat()
+                if (
+                    not isinstance(self.expired_unsent_at, str)
+                    or timestamp(self.expired_unsent_at) is None
+                )
+                else self.expired_unsent_at
+            )
             until = (
                 timestamp(self.expired_unsent_until)
                 if isinstance(self.expired_unsent_until, str)
                 else None
             )
             if until is None:
-                base_at = timestamp(self.expired_unsent_at) or now
+                base_at = timestamp(new_at) or now
                 try:
                     until = min(base_at + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP)
                 except OverflowError:
                     until = MAX_TIMESTAMP
-                self.expired_unsent_until = until.isoformat()
             if now > until:
-                self.expired_unsent = 0
-                self.expired_unsent_at = None
-                self.expired_unsent_until = None
-                self.expired_unsent_reasons = []
-                if not self.degraded:
-                    self.acknowledge_rejected = self._config_ack_rejected
+                new_ack_rej = (
+                    self._config_ack_rejected
+                    if not self.degraded
+                    else self.acknowledge_rejected
+                )
+                return 0, None, None, [], new_ack_rej
+            return (
+                self.expired_unsent,
+                new_at,
+                until.isoformat(),
+                list(self.expired_unsent_reasons),
+                self.acknowledge_rejected,
+            )
+        return (
+            self.expired_unsent,
+            self.expired_unsent_at,
+            self.expired_unsent_until,
+            list(self.expired_unsent_reasons),
+            self.acknowledge_rejected,
+        )
 
     def _sync_degraded_notification(
         self, quarantine_ambiguous=False, expired_unsent=None
@@ -1045,6 +1147,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "age": "aged past the 15-minute delivery window",
             "clock_rollback": "invalidated by backward clock rollback (created > now)",
             "target_removed": "dropped after target removal from situareness.json",
+            "exhausted": "exhausted all 3 delivery attempts (MAX_ATTEMPTS = 3)",
         }
         cause_text = "; ".join(cause_labels[r] for r in reasons) if reasons else ""
         if expired_count > 0:
@@ -1270,6 +1373,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         _dismiss_degraded_notification(self.hass)
         self._notified_degraded_state = None
 
+    def resume_after_failed_unload(self):
+        self._stopping = False
+        self._sync_degraded_notification()
+
     async def _async_update_data(self):
         async with self._refresh_lock:
             if self._stopping:
@@ -1491,11 +1598,16 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
         if self._stopping:
             return self._stopped_poll_result()
-        self.last_degraded_poll = now.isoformat()
-        self._update_expired_unsent(expired_unsent, now, expired_outcomes)
+        expired_state = self._compute_expired_unsent(
+            expired_unsent, now, expired_outcomes
+        )
         try:
             await self._save(
-                records, outbox, list(self.outcomes) + list(expired_outcomes)
+                records,
+                outbox,
+                list(self.outcomes) + list(expired_outcomes),
+                last_degraded_poll=now.isoformat(),
+                expired_state=expired_state,
             )
         except Exception as save_err:
             raise UpdateFailed(
@@ -1566,9 +1678,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             await self.hass.async_add_executor_job(
                 _strip_withheld_actions, records, plans, groups, now
             )
-            self._update_expired_unsent(extra_expired, now, extra_outcomes)
+            expired_state = self._compute_expired_unsent(
+                extra_expired, now, extra_outcomes
+            )
             await self._save(
-                records, outbox, list(self.outcomes) + list(extra_outcomes)
+                records,
+                outbox,
+                list(self.outcomes) + list(extra_outcomes),
+                expired_state=expired_state,
             )
             attempts, failures = await self._deliver_outbox_batch(
                 candidate_events, now, attempted_keys=attempted_keys
@@ -1702,11 +1819,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if not group:
                 if expired_keys or expired_outcomes:
                     remaining = [x for x in self.outbox if x["key"] not in expired_keys]
-                    self._update_expired_unsent(
+                    expired_state = self._compute_expired_unsent(
                         len(expired_outcomes), current, expired_outcomes
                     )
                     await self._save(
-                        self.records, remaining, self.outcomes + expired_outcomes
+                        self.records,
+                        remaining,
+                        self.outcomes + expired_outcomes,
+                        expired_state=expired_state,
                     )
                 continue
             results = await asyncio.gather(
@@ -1724,30 +1844,58 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 if attempted_keys is not None:
                     attempted_keys.add(item["key"])
                 updated = {**item, "attempts": item["attempts"] + 1}
+                now_after = datetime.now(timezone.utc)
+                outcome = {
+                    "key": item["key"],
+                    "accepted": accepted,
+                    "attempt": updated["attempts"],
+                    "at": now_after.isoformat(),
+                }
                 if not accepted and pending_valid(
-                    updated, self.records, self.config, datetime.now(timezone.utc)
+                    updated, self.records, self.config, now_after
                 ):
                     requeued.append(updated)
-                new_outcomes.append(
-                    {
-                        "key": item["key"],
-                        "accepted": accepted,
-                        "attempt": updated["attempts"],
-                        "at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
+                elif not accepted:
+                    drop_reason = expiry_reason(
+                        updated,
+                        self.records,
+                        self.config,
+                        now_after,
+                        check_exhausted=True,
+                    )
+                    if drop_reason is None and not pending_valid(
+                        updated,
+                        self.records,
+                        self.config,
+                        now_after,
+                        allow_suspended=True,
+                    ):
+                        drop_reason = expiry_reason(
+                            {**item, "attempts": 0},
+                            self.records,
+                            self.config,
+                            now_after,
+                        )
+                    if drop_reason is not None:
+                        outcome["expired"] = True
+                        outcome["reason"] = drop_reason
+                new_outcomes.append(outcome)
             if processed_keys or expired_keys or new_outcomes or expired_outcomes:
                 removed_keys = processed_keys | expired_keys
                 remaining = [
                     x for x in self.outbox if x["key"] not in removed_keys
                 ] + requeued
-                self._update_expired_unsent(
-                    len(expired_outcomes), current, expired_outcomes
+                all_expired = expired_outcomes + [
+                    o for o in new_outcomes if o.get("expired")
+                ]
+                expired_state = self._compute_expired_unsent(
+                    len(all_expired), current, all_expired
                 )
                 await self._save(
                     self.records,
                     remaining,
                     self.outcomes + expired_outcomes + new_outcomes,
+                    expired_state=expired_state,
                 )
         return attempts, failures
 
@@ -2057,17 +2205,25 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
                 if self._stopping:
                     return self._stopped_poll_result()
-                self.last_degraded_poll = None
                 outcomes_to_save = (
                     list(self.outcomes)
                     if already_delivered
                     else list(self.outcomes) + migrated_expired_outcomes
                 )
-                if not already_delivered:
-                    self._update_expired_unsent(
+                expired_state = (
+                    self._compute_expired_unsent(
                         migrated_expired, now, migrated_expired_outcomes
                     )
-                await self._save(records, outbox, outcomes_to_save)
+                    if not already_delivered
+                    else None
+                )
+                await self._save(
+                    records,
+                    outbox,
+                    outcomes_to_save,
+                    last_degraded_poll=None,
+                    expired_state=expired_state,
+                )
                 attempts, failures = await self._finish_poll_delivery(
                     candidate_events,
                     now,
@@ -2107,17 +2263,25 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self._clear_degraded_state(ack_rejected=self._config_ack_rejected)
             self._ack_cleared_on_load = False
             self._ack_cleared_reason = None
-            self.last_degraded_poll = None
             outcomes_to_save = (
                 list(self.outcomes)
                 if already_delivered
                 else list(self.outcomes) + migrated_expired_outcomes
             )
-            if not already_delivered:
-                self._update_expired_unsent(
+            expired_state = (
+                self._compute_expired_unsent(
                     migrated_expired, now, migrated_expired_outcomes
                 )
-            await self._save(records, outbox, outcomes_to_save)
+                if not already_delivered
+                else None
+            )
+            await self._save(
+                records,
+                outbox,
+                outcomes_to_save,
+                last_degraded_poll=None,
+                expired_state=expired_state,
+            )
             attempts, failures = await self._finish_poll_delivery(
                 candidate_events,
                 now,
@@ -2157,6 +2321,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
 
 
 async def async_setup_entry(hass, entry):
+    _clear_retry_listener(hass, entry.entry_id)
     try:
         config = await hass.async_add_executor_job(
             _read_config, hass.config.path("situareness.json")
@@ -2214,8 +2379,10 @@ async def async_setup_entry(hass, entry):
         if callable(getattr(entry, "async_on_state_change", None)):
             unsub = None
             done = False
+            key = (id(hass), entry.entry_id)
 
             def _safe_unsub():
+                _SETUP_RETRY_UNSUBS.pop(key, None)
                 if unsub is not None:
                     try:
                         unsub()
@@ -2243,6 +2410,7 @@ async def async_setup_entry(hass, entry):
                         _safe_unsub()
 
             unsub = entry.async_on_state_change(_on_entry_state_change)
+            _SETUP_RETRY_UNSUBS[key] = unsub
         raise
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -2257,14 +2425,23 @@ async def async_unload_entry(hass, entry):
     coord = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if coord is not None:
         await coord.async_stop()
-    if await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+    try:
+        unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    except Exception:
+        if coord is not None:
+            coord.resume_after_failed_unload()
+        raise
+    if unloaded:
         hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
         return True
+    if coord is not None:
+        coord.resume_after_failed_unload()
     return False
 
 
 async def async_remove_entry(hass, entry):
     """Delete the private journal when the integration entry is removed."""
+    _clear_retry_listener(hass, entry.entry_id)
     _dismiss_degraded_notification(hass)
     prefix = f"{DOMAIN}.{entry.entry_id}"
     await Store(hass, 1, prefix, private=True).async_remove()
