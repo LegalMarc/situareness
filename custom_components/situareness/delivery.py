@@ -99,7 +99,7 @@ def pending_valid(item, records, config, now, *, allow_suspended=False):
 
 
 def expired_by_age(item, records, config, now):
-    """Return True when an unexhausted queued target for an active alert fails delivery."""
+    """Return True when an unexhausted queued target for an active or suspended-from-active alert is invalid or expired."""
     try:
         if pending_valid(item, records, config, now, allow_suspended=True):
             return False
@@ -121,6 +121,21 @@ def expired_by_age(item, records, config, now):
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
+
+
+def expiry_reason(item, records, config, now):
+    """Classify why an unexhausted active-alert target failed delivery."""
+    if not expired_by_age(item, records, config, now):
+        return None
+    try:
+        created = datetime.fromisoformat(item["created"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return "clock_rollback"
+    if created.tzinfo is None or created > now:
+        return "clock_rollback"
+    if now - created > MAX_AGE:
+        return "age"
+    return "target_removed"
 
 
 def _phone_payload(item):

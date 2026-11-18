@@ -623,4 +623,47 @@ test("isEventSourceUnavailable and nwsAwarenessLifecycle fall back to state.inte
       "cached",
     );
   }
+
+  // Also verify when sources lists other providers (no matching config) or omits interval_minutes.
+  const partialSources = [{ id: "nws" }, { id: "bbc_world", interval_minutes: 5 }];
+  assert.equal(
+    isEventSourceUnavailable(weatherEvent, now, partialSources, stateWithInterval),
+    true,
+  );
+  assert.equal(
+    isEventSourceUnavailable(usgsEvent, now, partialSources, stateWithInterval),
+    true,
+  );
+
+  // A longer state.interval_minutes (5m) remains ok at 3 minutes old when unconfigured,
+  // while an explicit config.interval_minutes overrides state.interval_minutes.
+  const fiveMinuteState = [
+    {
+      id: "usgs",
+      enabled: true,
+      status: "ok",
+      interval_minutes: 5,
+      last_success_at: threeMinutesAgo,
+    },
+  ];
+  assert.equal(
+    sourceFreshness(
+      { ...fiveMinuteState[0], interval_minutes: undefined ?? fiveMinuteState[0].interval_minutes },
+      now,
+    ),
+    "ok",
+  );
+  assert.equal(
+    isEventSourceUnavailable(usgsEvent, now, [], fiveMinuteState),
+    false,
+  );
+  assert.equal(
+    isEventSourceUnavailable(
+      usgsEvent,
+      now,
+      [{ id: "usgs", interval_minutes: 1 }],
+      fiveMinuteState,
+    ),
+    true,
+  );
 });

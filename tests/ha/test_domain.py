@@ -2053,6 +2053,65 @@ class Collector(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(TimeoutError):
                 await collector.fetch(SlowPageSession(), ["NY"])
 
+    async def test_fetch_offloads_page_parsing_via_asyncio_to_thread(self):
+        import asyncio
+        import json
+        from unittest.mock import patch
+
+        calls = []
+        orig_to_thread = asyncio.to_thread
+
+        async def recording_to_thread(func, *args, **kwargs):
+            calls.append(func)
+            return await orig_to_thread(func, *args, **kwargs)
+
+        body = {"type": "FeatureCollection", "features": [feature()]}
+        with patch.object(
+            collector.asyncio, "to_thread", side_effect=recording_to_thread
+        ):
+            events = await collector.fetch(
+                Session(Response(json.dumps(body).encode())), ["NY"]
+            )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(calls, [collector._parse_and_collect_page])
+
+    def test_expiry_reason_distinguishes_age_clock_rollback_and_target_removed(self):
+        cfg = config()
+        ev = d.normalize(feature())
+        ev["id"] = "https://api.weather.gov/alerts/exp-reason-1"
+        ev["sent"] = (NOW - timedelta(minutes=1)).isoformat()
+        ev["effective"] = (NOW - timedelta(minutes=1)).isoformat()
+        ev["onset"] = NOW.isoformat()
+        ev["expires"] = (NOW + timedelta(hours=1)).isoformat()
+        ev["ends"] = (NOW + timedelta(hours=1)).isoformat()
+        ev = cohere(ev)
+        records, plans = d.reconcile({}, [ev], cfg, NOW)
+        item = delivery.targets(plans[0], cfg, NOW)[0]
+
+        self.assertIsNone(delivery.expiry_reason(item, records, cfg, NOW))
+        self.assertEqual(
+            delivery.expiry_reason(
+                {**item, "created": (NOW + timedelta(minutes=2)).isoformat()},
+                records,
+                cfg,
+                NOW,
+            ),
+            "clock_rollback",
+        )
+        self.assertEqual(
+            delivery.expiry_reason(
+                {**item, "created": (NOW - timedelta(minutes=20)).isoformat()},
+                records,
+                cfg,
+                NOW,
+            ),
+            "age",
+        )
+        self.assertEqual(
+            delivery.expiry_reason(item, records, {**cfg, "phones": []}, NOW),
+            "target_removed",
+        )
+
     def test_out_of_range_timestamps_and_horizon_overflow_resilience(self):
         self.assertIsNone(d.timestamp("9999-12-31T23:59:59Z"))
         self.assertIsNone(d.timestamp("0001-01-01T00:00:00Z"))

@@ -94,11 +94,7 @@ async function initialize() {
     new Date(),
     restoredSources,
   );
-  const priorLoss =
-    stored?.collector?.last_storage_loss_at ||
-    (stored?.collector?.storage_truncated === true
-      ? stored.collector.last_run_at || new Date().toISOString()
-      : null);
+  const priorLoss = stored?.collector?.last_storage_loss_at || null;
   const priorLossMs = Date.parse(priorLoss || "");
   state = {
     schema_version: 1,

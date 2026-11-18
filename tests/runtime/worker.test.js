@@ -529,3 +529,50 @@ test("worker identifies invalid bundled defaults explicitly", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("legacy storage_truncated flag without last_storage_loss_at does not fabricate a loss timestamp on startup", async () => {
+  const now = Date.now();
+  const originalNow = Date.now;
+  Date.now = () => now;
+  globalThis.fetch = async (url) => {
+    if (url.startsWith("chrome-extension:"))
+      return new Response(JSON.stringify(defaults));
+    return new Response(
+      url.includes("bbci.co.uk")
+        ? "<rss></rss>"
+        : JSON.stringify({ features: [] }),
+    );
+  };
+  persisted.situareness_state_v1 = {
+    config: structuredClone(defaults),
+    sources: defaults.sources.map((source) => ({
+      ...source,
+      status: "ok",
+      last_attempt_at: new Date(now).toISOString(),
+      last_success_at: new Date(now).toISOString(),
+      last_alarm_tick: 10,
+    })),
+    events: [],
+    collector: {
+      paused: false,
+      last_run_at: new Date(now - 60_000).toISOString(),
+      storage_truncated: true,
+      alarm_tick: 10,
+      last_alarm_clock_at: now,
+    },
+  };
+  try {
+    await import("../../extension/background.js?legacy-storage-truncated");
+    listeners.startup();
+    const response = await send({ type: "GET_STATE" });
+    assert.equal(response.ok, true);
+    assert.equal(response.state.collector.last_storage_loss_at, null);
+    assert.equal(
+      persisted.situareness_state_v1.collector.last_storage_loss_at,
+      null,
+    );
+  } finally {
+    Date.now = originalNow;
+    globalThis.fetch = originalFetch;
+  }
+});

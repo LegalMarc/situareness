@@ -224,12 +224,16 @@ function renderSources(state) {
   els.sourceCount.textContent = String(sources.length);
   els.sources.replaceChildren();
   els.sourceEmpty.hidden = sources.length !== 0;
-  for (const source of sources) {
+  const freshnessFor = (source) => {
     const configured = configuredSources.find((item) => item.id === source.id);
-    const freshness = sourceFreshness({
+    return sourceFreshness({
       ...source,
-      interval_minutes: configured?.interval_minutes,
+      interval_minutes:
+        configured?.interval_minutes ?? source.interval_minutes,
     });
+  };
+  for (const source of sources) {
+    const freshness = freshnessFor(source);
     const row = element("div", "source-row");
     row.append(
       element("span", `source-status ${freshness}`),
@@ -276,13 +280,7 @@ function renderSources(state) {
   }
   const stale = sources.filter(
     (source) =>
-      source.enabled !== false &&
-      sourceFreshness({
-        ...source,
-        interval_minutes: configuredSources.find(
-          (item) => item.id === source.id,
-        )?.interval_minutes,
-      }) === "stale",
+      source.enabled !== false && freshnessFor(source) === "stale",
   );
   const errors = sources.filter(
     (source) => source.enabled !== false && source.status === "error",

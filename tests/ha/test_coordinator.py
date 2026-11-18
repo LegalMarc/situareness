@@ -4041,12 +4041,11 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             },
         )
         with patch.object(mod, "qualify", wraps=d.qualify) as mock_qualify:
-            attempts, failures, expired = await prio_coord._deliver_outbox_batch(
+            attempts, failures = await prio_coord._deliver_outbox_batch(
                 [retry_ev, fresh_ev], now
             )
         self.assertEqual(attempts, 100)
         self.assertEqual(failures, 0)
-        self.assertEqual(expired, 0)
         self.assertEqual(prio_services.calls[0][2]["data"]["url"], fresh_ev["id"])
         # Remaining 99 slots go to FIFO retries; 1 retry remains queued.
         self.assertEqual(len(prio_coord.outbox), 1)
@@ -5511,17 +5510,27 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(health["expired_unsent"], 2)
         self.assertTrue(health["partial"])
-        expired_keys = {
-            o["key"] for o in store.saved[-1]["outcomes"] if o.get("expired")
-        }
-        self.assertEqual(expired_keys, {"future-created-key", "removed-target-key"})
+        self.assertEqual(
+            store.saved[-1]["expired_unsent_reasons"],
+            ["clock_rollback", "target_removed"],
+        )
+        expired_outcomes = [o for o in store.saved[-1]["outcomes"] if o.get("expired")]
+        self.assertEqual(
+            {o["key"]: o["reason"] for o in expired_outcomes},
+            {
+                "future-created-key": "clock_rollback",
+                "removed-target-key": "target_removed",
+            },
+        )
         self.assertEqual(
             notifications["situareness_degraded"]["title"],
             "Situareness alert targets expired unsent",
         )
+        msg = notifications["situareness_degraded"]["message"]
+        self.assertIn("2 queued qualifying alert target(s)", msg)
         self.assertIn(
-            "2 queued qualifying alert target(s)",
-            notifications["situareness_degraded"]["message"],
+            "invalidated by backward clock rollback (created > now); dropped after target removal from situareness.json",
+            msg,
         )
 
     async def test_corrupt_backup_cleanup_retries_and_missing_store_enters_journal_lost(
@@ -6293,3 +6302,541 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(coord.degraded_reason)
         self.assertFalse(coord.acknowledge_rejected)
         self.assertEqual(coord.expired_unsent, 2)
+
+    async def test_valid_persisted_store_rejects_invalid_expiry_reasons(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        for bad_payload in (
+            {"records": {}, "expired_unsent_reasons": ["unknown"]},
+            {"records": {}, "expired_unsent_reasons": "age"},
+            {"records": {}, "expired_unsent_reasons": ["age", "age", "age", "age"]},
+            {"records": {}, "outcomes": [{"key": "k", "reason": "bad_reason"}]},
+        ):
+            self.assertFalse(mod._valid_persisted_store(bad_payload))
+
+        self.assertTrue(
+            mod._valid_persisted_store(
+                {
+                    "records": {},
+                    "expired_unsent": 2,
+                    "expired_unsent_reasons": ["clock_rollback", "target_removed"],
+                    "outcomes": [{"key": "k", "reason": "clock_rollback"}],
+                }
+            )
+        )
+
+    async def test_stopping_skips_post_fetch_saves_and_unload_stops_before_platform_unload(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 17, 20, 0, tzinfo=timezone.utc)
+        cfg = config()
+        ev = d.normalize(feature())
+        ev["id"] = "https://api.weather.gov/alerts/stop-ev"
+        for key, delta in [
+            ("sent", -60),
+            ("effective", -60),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            ev[key] = (now + timedelta(seconds=delta)).isoformat()
+        ev = cohere(ev)
+
+        # 1) _stopping=True at start of _update_once skips journal_lost pre-fetch save and fetch.
+        store_start = Store()
+        coord_start = mod.SituarenessCoordinator(
+            types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+                ),
+            ),
+            cfg,
+            store_start,
+            None,
+            entry=types.SimpleNamespace(
+                entry_id="stop-start", data={"journal_initialized": True}
+            ),
+        )
+        coord_start._stopping = True
+        with patch.object(mod, "fetch") as mock_fetch:
+            res_start = await coord_start._update_once()
+        mock_fetch.assert_not_called()
+        self.assertEqual(store_start.saved, [])
+        self.assertIsNone(res_start["last_success"])
+
+        # 2) _stopping set during _migrate_outbox_with_index skips post-fetch saves.
+        store_mig = Store()
+        coord_mig = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=Services()), cfg, store_mig, None
+        )
+        orig_mig = mod._migrate_outbox_with_index
+
+        def stop_during_migrate(*args, **kwargs):
+            coord_mig._stopping = True
+            return orig_mig(*args, **kwargs)
+
+        with (
+            patch.object(mod, "fetch", return_value=[ev]),
+            patch.object(
+                mod, "_migrate_outbox_with_index", side_effect=stop_during_migrate
+            ),
+        ):
+            await coord_mig._update_once()
+        self.assertEqual(store_mig.saved, [])
+
+        # 3) _stopping set right before pre-drain save inside _queue_outbox_plans skips save.
+        class FixedClock:
+            @classmethod
+            def now(cls, tz):
+                return now
+
+        live_cfg = {**cfg, "live_enabled": True, "commissioning_passed": True}
+        store_pre = Store()
+        coord_pre = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=Services()),
+            live_cfg,
+            store_pre,
+            {
+                "records": {},
+                "outbox": [],
+                "initialized": True,
+                "was_live": True,
+            },
+        )
+        orig_build = mod._build_planned_items
+
+        def stop_during_build(*args, **kwargs):
+            if kwargs.get("prepare_pre_drain"):
+                coord_pre._stopping = True
+            return orig_build(*args, **kwargs)
+
+        with (
+            patch.object(mod, "datetime", FixedClock),
+            patch.object(mod, "fetch", return_value=[ev]),
+            patch.object(mod, "_build_planned_items", side_effect=stop_during_build),
+        ):
+            await coord_pre._update_once()
+        self.assertEqual(store_pre.saved, [])
+
+        # 4) _stopping set right before post-queue _save skips save.
+        store_post = Store()
+        coord_post = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=Services()), cfg, store_post, None
+        )
+
+        async def stop_before_post_save(*args, **kwargs):
+            coord_post._stopping = True
+            return [], False, [], {}, 0, 0, False
+
+        with (
+            patch.object(mod, "fetch", return_value=[ev]),
+            patch.object(
+                coord_post, "_queue_outbox_plans", side_effect=stop_before_post_save
+            ),
+        ):
+            await coord_post._update_once()
+        self.assertEqual(store_post.saved, [])
+
+        # 5) async_unload_entry calls async_stop() before async_unload_platforms().
+        order = []
+
+        async def fake_unload_platforms(ent, platforms):
+            order.append("unload_platforms")
+            return True
+
+        entry = types.SimpleNamespace(entry_id="unload-order", data={})
+        hass_unload = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_unload_platforms=fake_unload_platforms
+            ),
+        )
+        coord_unload = mod.SituarenessCoordinator(
+            hass_unload, cfg, Store(), None, entry=entry
+        )
+
+        async def tracked_stop():
+            order.append("async_stop")
+            coord_unload._stopping = True
+
+        coord_unload.async_stop = tracked_stop
+        hass_unload.data[mod.DOMAIN] = {entry.entry_id: coord_unload}
+        self.assertTrue(await mod.async_unload_entry(hass_unload, entry))
+        self.assertEqual(order, ["async_stop", "unload_platforms"])
+
+    async def test_intermittent_malformed_cancellation_with_persistent_overflow_does_not_flip_flop(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        create_calls = []
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                create_calls.append({"title": title, "message": msg})
+            ),
+            async_dismiss=lambda *args, **kwargs: None,
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        t0 = datetime(2026, 11, 17, 21, 0, tzinfo=timezone.utc)
+
+        class Clock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        Clock.current = t0
+        cfg = config()
+        cfg.update(live_enabled=False, commissioning_passed=False, tts_entity=None)
+        hass = types.SimpleNamespace(data={}, services=Services())
+
+        mal_cancel = d.normalize(feature())
+        mal_cancel["id"] = "https://api.weather.gov/alerts/flip-mal-cancel"
+        mal_cancel["message_type"] = "Cancel"
+        mal_cancel["references"] = []
+        mal_cancel["reference_identities"] = []
+        mal_cancel["sent"] = (t0 - timedelta(seconds=10)).isoformat()
+        mal_cancel["effective"] = (t0 - timedelta(seconds=10)).isoformat()
+        mal_cancel["onset"] = (t0 - timedelta(seconds=10)).isoformat()
+        mal_cancel["expires"] = (t0 + timedelta(seconds=1800)).isoformat()
+        mal_cancel["ends"] = (t0 + timedelta(seconds=1800)).isoformat()
+
+        ov_err = d.CancellationEvidenceOverflow(
+            "persistent overflow",
+            dropped_horizon=t0 + timedelta(days=9),
+            records={},
+            plans=[],
+        )
+        coord = mod.SituarenessCoordinator(hass, cfg, Store(), None)
+
+        # Poll 1: overflow only.
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=[]),
+            patch.object(mod, "reconcile", side_effect=ov_err),
+        ):
+            h1 = await coord._async_update_data()
+        self.assertEqual(h1["degraded_reason"], "cancellation_evidence_overflow")
+        self.assertEqual(h1["degraded_at"], t0.isoformat())
+        self.assertEqual(len(create_calls), 1)
+
+        # Poll 2: intermittent malformed_cancellation + overflow escalates without resetting degraded_at.
+        Clock.current = t0 + timedelta(minutes=5)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=[mal_cancel]),
+            patch.object(mod, "reconcile", side_effect=ov_err),
+        ):
+            h2 = await coord._async_update_data()
+        self.assertEqual(h2["degraded_reason"], "malformed_cancellation")
+        self.assertEqual(h2["degraded_at"], t0.isoformat())
+        self.assertEqual(len(create_calls), 2)
+
+        # Poll 3: overflow-only again does NOT flip-flop back or re-create notification.
+        Clock.current = t0 + timedelta(minutes=10)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=[]),
+            patch.object(mod, "reconcile", side_effect=ov_err),
+        ):
+            h3 = await coord._async_update_data()
+        self.assertEqual(h3["degraded_reason"], "malformed_cancellation")
+        self.assertEqual(h3["degraded_at"], t0.isoformat())
+        self.assertEqual(len(create_calls), 2)
+
+    async def test_outbox_overflow_preserves_already_queued_empty_new_items_plans(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 17, 22, 0, tzinfo=timezone.utc)
+
+        class FixedClock:
+            @classmethod
+            def now(cls, tz):
+                return now
+
+        cfg = config()
+        cfg["locations"] = {
+            "new_york_ny": {"point": [0.5, 0.5], "speakers": []},
+            "washington_dc": {
+                "point": [3.0, 3.0],
+                "speakers": [f"media_player.dc_{i}" for i in range(4995)],
+            },
+        }
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=[f"mobile_app_{i}" for i in range(6)],
+            tts_entity="tts.home",
+        )
+
+        def make_ev(name):
+            ev = d.normalize(feature())
+            ev["id"] = f"https://api.weather.gov/alerts/empty-new-{name}"
+            for key, delta in [
+                ("sent", -60),
+                ("effective", -60),
+                ("onset", 0),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                ev[key] = (now + timedelta(seconds=delta)).isoformat()
+            return cohere(ev)
+
+        susp_ev = make_ev("susp")
+        susp_fp = d.fingerprint(susp_ev, d.qualify(susp_ev, cfg, now))
+        queued_ev = make_ev("queued")
+        queued_fp = d.fingerprint(queued_ev, d.qualify(queued_ev, cfg, now))
+        overflow_ev = make_ev("overflow")
+        overflow_ev["instruction"] = "Take shelter immediately second alert."
+
+        fresh = (now - timedelta(minutes=1)).isoformat()
+        susp_items = [
+            {
+                "key": f"susp-{i}",
+                "incident_id": susp_ev["id"],
+                "fingerprint": susp_fp,
+                "kind": "speaker",
+                "target": f"media_player.dc_{i}",
+                "location": "washington_dc",
+                "affected_names": ["washington_dc"],
+                "event": "Tornado Warning",
+                "instruction": susp_ev["instruction"],
+                "source_url": susp_ev["id"],
+                "attempts": 0,
+                "created": fresh,
+            }
+            for i in range(4995)
+        ]
+        queued_plan = {
+            "id": queued_ev["id"],
+            "fingerprint": queued_fp,
+            "affected": ["new_york_ny"],
+            "phones": list(cfg["phones"]),
+            "event": "Tornado Warning",
+            "instruction": queued_ev["instruction"],
+        }
+        queued_items = mod.targets(queued_plan, cfg, now)
+        # 4,995 + 6? wait: keep 4,995 suspended + 4 queued phones (retry/queued) -> 4,999,
+        # or 4,995 suspended + 6 queued items -> already 5,001 > 5,000, keep 4,994 + 6 = 5,000!
+        outbox = susp_items[:4994] + queued_items
+        records = {
+            susp_ev["id"]: {
+                "state": "ended_or_absent",
+                "prior_state": "active",
+                "fingerprint": susp_fp,
+                "actions": {susp_fp: ["washington_dc"]},
+                "lineage": [susp_ev["id"]],
+                "cap_identity": susp_ev["cap_identity"],
+                "cap_references": [],
+                "sent": susp_ev["sent"],
+                "expires": susp_ev["expires"],
+                "ends": susp_ev["ends"],
+                "inactive_since": fresh,
+                "updated": fresh,
+            },
+            queued_ev["id"]: {
+                "state": "active",
+                "fingerprint": queued_fp,
+                "actions": {queued_fp: ["new_york_ny"]},
+                "lineage": [queued_ev["id"]],
+                "cap_identity": queued_ev["cap_identity"],
+                "cap_references": [],
+                "sent": queued_ev["sent"],
+                "expires": queued_ev["expires"],
+                "ends": queued_ev["ends"],
+                "updated": now.isoformat(),
+            },
+            overflow_ev["id"]: {
+                "state": "active",
+                "fingerprint": "fp-overflow",
+                "actions": {"fp-overflow": ["new_york_ny"]},
+                "lineage": [overflow_ev["id"]],
+                "cap_identity": overflow_ev["cap_identity"],
+                "cap_references": [],
+                "sent": overflow_ev["sent"],
+                "expires": overflow_ev["expires"],
+                "ends": overflow_ev["ends"],
+                "updated": now.isoformat(),
+            },
+        }
+        overflow_plan = {
+            "id": overflow_ev["id"],
+            "fingerprint": "fp-overflow",
+            "affected": ["new_york_ny"],
+            "phones": list(cfg["phones"]),
+            "event": "Tornado Warning",
+            "instruction": overflow_ev["instruction"],
+        }
+        coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=Services()), cfg, Store(), None
+        )
+        coord.records = records
+        coord.outbox = outbox
+        groups, _ = d.lineage_index(records, [])
+        # Simulate pre-drain failing to shrink below overflow (already_delivered=False path or pre-drain skipped):
+        with patch.object(mod, "_build_planned_items") as mock_build:
+            mock_build.return_value = (
+                set(),
+                [(queued_plan, []), (overflow_plan, [("item", "sig")] * 6)],
+                5006,
+                None,
+            )
+            (
+                _,
+                overflowed,
+                dropped,
+                _,
+                _,
+                _,
+                _,
+            ) = await coord._queue_outbox_plans(
+                records,
+                [queued_plan, overflow_plan],
+                list(outbox),
+                [queued_ev, overflow_ev],
+                groups,
+                now,
+            )
+        self.assertTrue(overflowed)
+        self.assertEqual(dropped, [overflow_plan])
+        await coord.hass.async_add_executor_job(
+            mod._strip_withheld_actions, records, dropped, groups, now
+        )
+        self.assertIn(queued_fp, records[queued_ev["id"]]["actions"])
+        self.assertNotIn("fp-overflow", records[overflow_ev["id"]]["actions"])
+
+    async def test_abandoned_setup_retry_listener_dismisses_degraded_notification(self):
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        dismiss_calls = []
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda *args, **kwargs: None,
+            async_dismiss=lambda hass, nid: dismiss_calls.append(nid),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        async def run_exec(fn, *args):
+            return fn(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "situareness.json").write_text("{}", encoding="utf-8")
+            listeners = []
+
+            class FakeEntry:
+                entry_id = "retry-abandon"
+                data = {}
+                state = "setup_retry"
+
+                def async_on_state_change(self, cb):
+                    listeners.append(cb)
+                    return lambda: listeners.remove(cb)
+
+            entry = FakeEntry()
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                async_add_executor_job=run_exec,
+            )
+
+            class EmptyStore(Store):
+                async def async_load(self):
+                    return None
+
+            class FailingCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    raise ConfigEntryNotReady("NWS down")
+
+            with (
+                patch.object(mod, "Store", EmptyStore),
+                patch.object(mod, "SituarenessCoordinator", FailingCoordinator),
+            ):
+                with self.assertRaises(ConfigEntryNotReady):
+                    await mod.async_setup_entry(hass, entry)
+            peer_calls = []
+            listeners.append(lambda: peer_calls.append("peer"))
+            self.assertEqual(len(listeners), 2)
+            dismiss_calls.clear()
+            entry.state = "not_loaded"
+            for cb in listeners:
+                cb()
+            await asyncio.sleep(0)
+            self.assertEqual(dismiss_calls, ["situareness_degraded"])
+            self.assertEqual(peer_calls, ["peer"])
+            self.assertEqual(len(listeners), 1)
