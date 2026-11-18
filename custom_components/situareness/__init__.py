@@ -1501,7 +1501,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
                 if not reasons or reasons == ("age",):
                     msg = (
-                        f"{expired_count} queued qualifying alert target(s) aged past the 15-minute delivery window "
+                        f"{expired_count} queued qualifying alert target(s) aged past the {max_age_mins}-minute delivery window "
                         "before delivery completed. Partial/expired_unsent remains elevated until acknowledged on reload "
                         "(acknowledge_degraded_at in situareness.json, expired_unsent_at <= acknowledge_degraded_at <= reload time) "
                         "or seven days pass without new expirations."

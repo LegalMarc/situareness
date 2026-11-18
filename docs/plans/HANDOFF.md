@@ -2,6 +2,17 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 thirty-second Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `14b5b04` (`run_id`: `20261118T183557Z-2cfe8f`, 202.9s standards) reported **0 Critical, 0 High, and 0 code defects**, leaving 4 doc/notice findings (`DOC-01` Medium, `DOC-02` Low, `DOC-03` Low, `NOTE-01` Nit).
+
+All 4 findings were resolved cleanly in Round 32 (`custom_components/situareness/__init__.py`, `docs/ha/README.md`, and `home-assistant/README.md`):
+- **`DOC-01` & `DOC-02`**: Removed the stale duplicate bullets in `docs/ha/README.md` (describing `Store.path` tail-first, chunked binary `save_id` verification accurately) and `home-assistant/README.md` (documenting `outbox_overflow` clearing on the first poll whose new plans fit, without any 15-minute post-overflow hold).
+- **`DOC-03`**: Restored self-contained retry bounds (`MAX_ATTEMPTS = 3`, 15-minute `MAX_AGE`, `100` attempts/poll, `30`-second deadline, saved per 10-target group) and the official cancellation-latency caveat (`Official cancellation is learned only on a later poll`) in the shipped `home-assistant/README.md` bundle guide.
+- **`NOTE-01`**: Interpolated `max_age_mins` (`MAX_AGE`) into the remaining `"age"` `expired_unsent` notification literal in `_sync_degraded_notification()`.
+
+Verification on the repaired candidate: `run_gates.py` (`220` total tests: `44` Node + `134` stdlib `-W error` HA + `7` skill + `22` Chromium Playwright + `13` real HA, plus Ruff lint/format), deterministic packaging, live anonymous smoke, and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117` and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 thirty-first Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `aab5fb1` (`run_id`: `20261118T182230Z-b16dc5`, 381.8s standards and 297.0s specification) reported **0 Critical and 0 High findings**, leaving 6 unique findings (`SIT-M1` Medium, `SIT-R01` Medium contract availability note, `SIT-R02` Low, `SIT-R03` Low, `SIT-N1` Low, `SIT-R04` Nit).
