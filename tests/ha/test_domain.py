@@ -1383,7 +1383,13 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         result = await collector.fetch(
             Session(Response(json.dumps(body).encode())), ["NY"]
         )
-        self.assertEqual([e["id"] for e in result], [successor["id"]])
+        self.assertEqual(
+            {e["id"] for e in result}, {predecessor["id"], successor["id"]}
+        )
+        self.assertEqual(
+            [e["id"] for e in d.resolve_candidates({}, result, result.all_events)],
+            [successor["id"]],
+        )
         self.assertEqual(
             {e["id"] for e in result.all_events}, {predecessor["id"], successor["id"]}
         )
@@ -1515,7 +1521,7 @@ class Collector(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         )
-        # Collector sees [first, second] cleanly and hides `first`.
+        # Collector returns [first, second]; clean candidate resolution hides `first`.
         events = await collector.fetch(
             Session(
                 Response(
@@ -1526,7 +1532,11 @@ class Collector(unittest.IsolatedAsyncioTestCase):
             ),
             ["NY"],
         )
-        self.assertEqual([e["id"] for e in events], [second["id"]])
+        self.assertEqual({e["id"] for e in events}, {first["id"], second["id"]})
+        self.assertEqual(
+            [e["id"] for e in d.resolve_candidates({}, events, events.all_events)],
+            [second["id"]],
+        )
         # Prior state had a conflicting identity for `second`, so `second` is invalid in reconcile.
         prior = {
             second["id"]: {

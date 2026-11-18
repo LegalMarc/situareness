@@ -811,17 +811,36 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                             if is_live
                             else "Monitoring remains degraded in shadow mode until "
                         )
+                        if self.degraded_reason == "journal_lost":
+                            recovery_guidance = (
+                                "the seven-day degraded_until horizon expires on a clean poll, "
+                                "or until one-shot acknowledge_degraded_at in situareness.json "
+                                "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                                "(acknowledging early discards missing historical tombstones). "
+                            )
+                        elif self.degraded_reason == "cancellation_evidence_overflow":
+                            recovery_guidance = (
+                                "protected history fits within 1,000 records and degraded_until "
+                                "(at least seven days or the latest evicted component horizon) expires, "
+                                "or until one-shot acknowledge_degraded_at in situareness.json "
+                                "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                                "once protected records no longer exceed 1,000 "
+                                "(otherwise the next poll re-latches with a new degraded_at; acknowledging early discards evicted tombstones). "
+                            )
+                        else:
+                            recovery_guidance = (
+                                "the triggering condition clears and degraded_until (at least seven days) expires, "
+                                "or until one-shot acknowledge_degraded_at in situareness.json "
+                                "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                                "once the triggering feed condition has left the feed "
+                                "(otherwise the next poll re-latches with a new degraded_at). "
+                            )
                         message = (
                             prefix
                             + rej_note
                             + tail
-                            + "the triggering condition clears and degraded_until "
-                            "(at least seven days or the latest evicted component horizon) expires, "
-                            "or until one-shot acknowledge_degraded_at in situareness.json "
-                            "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
-                            "once the triggering feed condition has left the feed "
-                            "(otherwise the next poll re-latches with a new degraded_at). "
-                            "Continue using independent official alert channels."
+                            + recovery_guidance
+                            + "Continue using independent official alert channels."
                         )
                 persistent_notification.async_create(
                     self.hass,
@@ -1037,19 +1056,6 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_failures": 0,
         }
 
-    def _migrate_and_prune_outbox(
-        self, records, events, now, groups, degraded_delta=None
-    ):
-        _, migrated = _migrate_outbox_with_index(
-            self.outbox,
-            records,
-            events,
-            now,
-            self.config,
-            degraded_delta=degraded_delta,
-        )
-        return migrated
-
     def _latch_degraded(self, reason, now, until=None):
         default_window = MAX_AGE if reason == "outbox_overflow" else MAX_ACCEPTANCE_AGE
         try:
@@ -1104,9 +1110,6 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         *,
         triggered_now=False,
         recoverable_prior_conflict=False,
-        planned_count=0,
-        delivery_attempts=0,
-        delivery_failures=0,
     ):
         self._strip_withheld_actions(records, plans, groups, now)
         self.last_degraded_poll = now.isoformat()
@@ -1124,10 +1127,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             now=now,
             triggered_now=triggered_now,
             recoverable_prior_conflict=recoverable_prior_conflict,
-            planned_count=planned_count,
+            planned_count=0,
             withheld_count=len(plans),
-            delivery_attempts=delivery_attempts,
-            delivery_failures=delivery_failures,
+            delivery_attempts=0,
+            delivery_failures=0,
         )
 
     async def _queue_outbox_plans(

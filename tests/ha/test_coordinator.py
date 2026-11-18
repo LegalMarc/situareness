@@ -3453,7 +3453,28 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("output is blocked", legacy_msg.lower())
         self.assertIn("degraded_until", legacy_msg)
         self.assertIn("acknowledge_degraded_at", legacy_msg)
+        self.assertIn("1,000", legacy_msg)
+        self.assertIn("evicted tombstones", legacy_msg)
         self.assertNotIn(".storage", legacy_msg)
+
+        # journal_lost guidance omits feed-trigger phrasing and warns about missing tombstones.
+        lost_entry = types.SimpleNamespace(
+            entry_id="lost-note", data={"journal_initialized": True}
+        )
+        lost_hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+            ),
+        )
+        mod.SituarenessCoordinator(
+            lost_hass, shadow_cfg, Store(), None, entry=lost_entry
+        )
+        lost_msg = notifications["situareness_degraded"]["message"]
+        self.assertNotIn("triggering feed condition", lost_msg)
+        self.assertIn("missing historical tombstones", lost_msg)
+        self.assertIn("acknowledge_degraded_at", lost_msg)
 
         # Shadow-mode outbox_overflow and malformed_store also qualify shadow mode truthfully.
         mod.SituarenessCoordinator(

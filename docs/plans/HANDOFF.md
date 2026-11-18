@@ -2,6 +2,18 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 eighteenth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `c132758` (`run_id`: `20261118T001451Z-588b6e`, 323.9s standards and 386.0s specification) reported **0 Critical, 0 High, and 0 Medium findings across both axes**, leaving only 6 small Low/Nit findings (`SR-DOC-01` Low, `SR-DOC-02` Low, `SPEC-01`/`SR-DOC-03` Low/Nit, `SR-MAINT-01`/`STD-01` Nit, `STD-02` Nit, `DOC-01` Nit).
+
+All 6 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor contract/context/README/report updates:
+- **`SR-DOC-01` & `DOC-01`**: Clarified in `docs/CONTEXT.md` that evidence/storage degradations block **all** output while `outbox_overflow` withholds only overflowing plans, and changed bare `"acknowledgement"` to `"recipient alert acknowledgement"` in `docs/ha/README.md` and `home-assistant/README.md`.
+- **`SR-DOC-02`**: Differentiated `_sync_degraded_notification()` recovery copy by `degraded_reason` (`journal_lost`, `cancellation_evidence_overflow`, and feed-triggered `malformed_cancellation`/`conflicting_cancellation`) and synchronized `docs/spec/o3-mvp.md`.
+- **`SPEC-01` / `SR-DOC-03` & `STD-02`**: Removed `resolve_candidates()` and the unreachable `len(events) > 1000` check from `collector.py` `fetch()` so `fetch()` runs only async HTTP pagination and JSON/feature normalization while candidate resolution runs solely off-loop in `_resolve_and_scan_candidates()`.
+- **`SR-MAINT-01` / `STD-01`**: Removed dead `SituarenessCoordinator._migrate_and_prune_outbox` and unused keyword parameters (`planned_count`, `delivery_attempts`, `delivery_failures`) on `_persist_degraded_poll`.
+
+Next: run complete local gates (`43` Node, `93` stdlib HA, `7` skill, `21` Chromium, `11` actual HA = `175` total), deterministic packaging (`823de6d0...` extension, `546c8cb7...` HA), live anonymous smoke (`2026-11-18T00:25:07.117Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh verification logs on clean `HEAD`, and run Opus `axes` + fresh `adversarial` reviews. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 seventeenth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `05a979e` (`run_id`: `20261117T234711Z-2fcb85`, 408.5s standards and 339.1s specification) reported **0 Critical, 0 High, 0 Medium specification findings, and zero live-gate/store-roundtrip/journal/lifecycle/recorder/packaging/room/index defects**, leaving 7 findings (`SR-01` / `SR-02` Medium, `SR-03` / `SR-04` / `SR-ACK-01` / `SR-ACK-02` Low, and `SR-CFG-01` Nit).

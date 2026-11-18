@@ -6,7 +6,6 @@ from urllib.parse import urlencode, urlparse
 from .domain import (
     OversizedFeature,
     normalize,
-    resolve_candidates,
     safe_url,
 )
 
@@ -231,8 +230,6 @@ async def fetch(session, states):
             events[eid] = event
             if is_cancel and not event.get("references"):
                 uncertain_cancellation = True
-            if len(events) > 1000:
-                raise ValueError("NWS event limit reached")
         pagination = payload.get("pagination") or {}
         if not isinstance(pagination, dict):
             raise ValueError("invalid NWS pagination")
@@ -244,9 +241,8 @@ async def fetch(session, states):
     else:
         raise ValueError("NWS pagination limit reached")
     all_events = list(events.values())
-    candidates = resolve_candidates({}, all_events, all_events)
     return CollectedEvents(
-        candidates,
+        all_events,
         quarantined,
         quarantined_lineages,
         quarantine_ambiguous,
