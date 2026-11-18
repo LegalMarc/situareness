@@ -2,6 +2,18 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 thirty-fifth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `b7fa712` (`run_id`: `20261118T190958Z-1d0ee5`, 321.2s standards and 308.5s specification) reported **0 Critical and 0 High findings**, leaving 6 findings (`HA-01` Medium, `HA-02` Low, `SIT-L1` Low, `SIT-L2` Low, `SIT-N1` Nit, `SIT-N2` Nit).
+
+All 6 findings were resolved cleanly in Round 35 (`custom_components/situareness/__init__.py`, `custom_components/situareness/collector.py`, `docs/spec/o3-mvp.md`, `docs/ha/README.md`, `home-assistant/README.md`, `tests/ha/test_coordinator.py`, and `tests/ha/test_domain.py`):
+- **`HA-01`**: Prevented `last_degraded_poll` on load from falling back to `degraded_at` when `degraded_reason == "outbox_overflow"` so restarts during `outbox_overflow` never freeze queued target age past `MAX_AGE` (verified by unit test).
+- **`HA-02`**: Exposed `expired_unsent_reasons` across `_degraded_health`, `_stopped_health`, and `_healthy_snapshot`, and updated `docs/spec/o3-mvp.md`, `docs/ha/README.md`, and `home-assistant/README.md`.
+- **`SIT-L1` & `SIT-L2`**: Added an aggregate `MAX_TOTAL_FEATURES = 25000` fetch cap in `collector.py` (with unit test), clarified `_refresh_lock` unload latency in `docs/spec/o3-mvp.md`, and stated plainly in `docs/ha/README.md` and `home-assistant/README.md` that non-`outbox_overflow` degraded holds pause retry aging across both degraded polls and Home Assistant downtime.
+- **`SIT-N1` & `SIT-N2`**: Extracted `_clamp_add(base, delta)` to eliminate duplicated `OverflowError` timestamp clamping blocks in `__init__.py`, and added focused single-scenario tests for `outbox_overflow` reload and `MAX_TOTAL_FEATURES`.
+
+Verification on the repaired candidate: `run_gates.py` (`221` total tests: `44` Node + `135` stdlib `-W error` HA + `7` skill + `22` Chromium Playwright + `13` real HA, plus Ruff lint/format), deterministic packaging (`685368a8...` extension ZIP, `2374ac44...` HA ZIP), live anonymous smoke, and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117` and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 thirty-fourth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `32a368a` (`run_id`: `20261118T185741Z-3fd414`, 318.8s specification) reported **0 Critical, 0 High, and 0 Medium findings**, leaving 5 Low/Nit findings (`SIT-SPEC-01` Low, `SIT-EVID-01` Low, `SR-01` Low, `SR-02` Low, `SR-03` Nit).

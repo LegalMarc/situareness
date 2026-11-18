@@ -1106,6 +1106,28 @@ class Policy(unittest.TestCase):
             ["https://api.weather.gov/alerts/ok"],
         )
 
+    def test_collector_rejects_excessive_total_features(self):
+        state = {
+            "events": {},
+            "conflicting_ids": set(),
+            "id_counts": {},
+            "cancel_seen_for_id": set(),
+            "unrecoverable_cancel_for_id": set(),
+            "quarantined": 0,
+            "quarantined_lineages": [],
+            "quarantined_cancel_lineages": [],
+            "seen_quarantine_ids": set(),
+            "quarantine_ambiguous": False,
+            "uncertain_cancellation": False,
+            "conflicting_cancellation": False,
+            "feature_count": collector.MAX_TOTAL_FEATURES,
+        }
+        payload = json.dumps(
+            {"type": "FeatureCollection", "features": [feature()]}
+        ).encode()
+        with self.assertRaises(ValueError):
+            collector._parse_and_collect_page(payload, state)
+
 
 class Services:
     def __init__(self):

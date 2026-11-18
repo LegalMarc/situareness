@@ -12,6 +12,7 @@ from .domain import (
 MAX_BYTES = 8 * 1024 * 1024
 MAX_PAGES = 50
 MAX_FETCH_SECONDS = 50
+MAX_TOTAL_FEATURES = 25000
 
 
 class CollectedEvents(list):
@@ -84,6 +85,8 @@ def _parse_and_collect_page(raw_bytes, state):
         raise ValueError("invalid NWS response")
     for feature in payload["features"]:
         state["feature_count"] += 1
+        if state["feature_count"] > MAX_TOTAL_FEATURES:
+            raise ValueError("too many NWS alert features")
         try:
             event = normalize(feature)
         except OversizedFeature:

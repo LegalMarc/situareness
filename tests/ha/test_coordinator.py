@@ -8094,3 +8094,84 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("journal_lost", notes_r30["situareness_degraded"])
         self.assertIn("tombstones", notes_r30["situareness_degraded"])
+
+    async def test_outbox_overflow_reload_does_not_freeze_age_and_exposes_reasons(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now_real = datetime.now(timezone.utc)
+        live_cfg = {**config(), "live_enabled": True, "commissioning_passed": True}
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        ev_raw = feature()
+        ev_raw["properties"]["sent"] = (now_real - timedelta(minutes=25)).isoformat()
+        ev_raw["properties"]["effective"] = (
+            now_real - timedelta(minutes=25)
+        ).isoformat()
+        ev_raw["properties"]["expires"] = (now_real + timedelta(hours=1)).isoformat()
+        ev_raw["properties"]["ends"] = (now_real + timedelta(hours=1)).isoformat()
+        ev = d.normalize(ev_raw)
+        fp = d.fingerprint(ev, d.qualify(ev, live_cfg, now_real))
+        coord = mod.SituarenessCoordinator(
+            hass,
+            live_cfg,
+            Store(),
+            {
+                "initialized": True,
+                "was_live": True,
+                "degraded": True,
+                "degraded_reason": "outbox_overflow",
+                "degraded_at": (now_real - timedelta(minutes=20)).isoformat(),
+                "degraded_until": (now_real - timedelta(minutes=5)).isoformat(),
+                "last_degraded_poll": None,
+                "records": {
+                    ev["id"]: {
+                        "state": "active",
+                        "fingerprint": fp,
+                        "lineage": [ev["id"]],
+                        "actions": {fp: ["new_york_ny"]},
+                        "updated": (now_real - timedelta(minutes=20)).isoformat(),
+                    }
+                },
+                "outbox": [
+                    {
+                        "key": "k-old",
+                        "incident_id": ev["id"],
+                        "event": "Tornado Warning",
+                        "fingerprint": fp,
+                        "target": live_cfg["phones"][0],
+                        "kind": "phone",
+                        "location": None,
+                        "source_url": ev["id"],
+                        "created": (now_real - timedelta(minutes=21)).isoformat(),
+                        "attempts": 0,
+                        "instruction": "Take shelter immediately",
+                        "affected_names": ["New York"],
+                    }
+                ],
+            },
+        )
+        self.assertIsNone(coord.last_degraded_poll)
+        self.assertIn("expired_unsent_reasons", coord._stopped_health())
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents([ev], 1, set(), False),
+        ):
+            health = await coord._async_update_data()
+        self.assertEqual(health["expired_unsent"], 1)
+        self.assertEqual(health["expired_unsent_reasons"], ["age"])
+        self.assertEqual(health["delivery_attempts"], 0)

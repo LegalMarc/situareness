@@ -66,6 +66,15 @@ VALID_EXPIRY_REASONS = (
     "exhausted",
     "cancelled",
 )
+
+
+def _clamp_add(base, delta):
+    try:
+        return min(base + delta, MAX_TIMESTAMP)
+    except OverflowError:
+        return MAX_TIMESTAMP
+
+
 _EVIDENCE_REASON_RANK = {
     "conflicting_cancellation": 4,
     "malformed_cancellation": 3,
@@ -762,12 +771,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             else:
                 stable_lost_at = detect_now.isoformat()
                 lost_ts = detect_now
-            try:
-                lost_until = min(
-                    max(lost_ts, detect_now) + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP
-                )
-            except OverflowError:
-                lost_until = MAX_TIMESTAMP
+            lost_until = _clamp_add(max(lost_ts, detect_now), MAX_ACCEPTANCE_AGE)
             self.records = {}
             self.outbox = []
             self.outcomes = []
@@ -822,7 +826,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.acknowledged_degraded_at = persisted.get("acknowledged_degraded_at")
             self.last_degraded_poll = (
                 (persisted.get("last_degraded_poll") or self.degraded_at)
-                if self.degraded
+                if (self.degraded and self.degraded_reason != "outbox_overflow")
                 else None
             )
             load_expired = persisted.get("expired_unsent", 0)
@@ -1187,12 +1191,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 and existing_until is None
                 and existing_at is not None
             ):
-                try:
-                    existing_until = min(
-                        existing_at + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP
-                    )
-                except OverflowError:
-                    existing_until = MAX_TIMESTAMP
+                existing_until = _clamp_add(existing_at, MAX_ACCEPTANCE_AGE)
             prior_active = self.expired_unsent > 0 and (
                 existing_until is None or now <= existing_until
             )
@@ -1213,10 +1212,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 new_reasons = ["age"]
             combined = base_reasons | set(new_reasons)
             ordered_reasons = [r for r in VALID_EXPIRY_REASONS if r in combined]
-            try:
-                until = min(now + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP)
-            except OverflowError:
-                until = MAX_TIMESTAMP
+            until = _clamp_add(now, MAX_ACCEPTANCE_AGE)
             if prior_active and existing_until is not None:
                 until = min(max(until, existing_until), MAX_TIMESTAMP)
             return (
@@ -1242,10 +1238,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             )
             if until is None:
                 base_at = timestamp(new_at) or now
-                try:
-                    until = min(base_at + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP)
-                except OverflowError:
-                    until = MAX_TIMESTAMP
+                until = _clamp_add(base_at, MAX_ACCEPTANCE_AGE)
             if now > until:
                 new_ack_rej = (
                     self._config_ack_rejected
@@ -1683,6 +1676,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_attempts": delivery_attempts,
             "delivery_failures": delivery_failures,
             "expired_unsent": expired_unsent,
+            "expired_unsent_reasons": list(self.expired_unsent_reasons),
             "expired_unsent_at": self.expired_unsent_at,
             "expired_unsent_until": self.expired_unsent_until,
         }
@@ -1727,16 +1721,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_attempts": 0,
             "delivery_failures": 0,
             "expired_unsent": self.expired_unsent,
+            "expired_unsent_reasons": list(self.expired_unsent_reasons),
             "expired_unsent_at": self.expired_unsent_at,
             "expired_unsent_until": self.expired_unsent_until,
         }
 
     def _compute_degraded_latch(self, reason, now, until=None, matched_reasons=None):
         default_window = MAX_AGE if reason == "outbox_overflow" else MAX_ACCEPTANCE_AGE
-        try:
-            fallback_until = min(now + default_window, MAX_TIMESTAMP)
-        except OverflowError:
-            fallback_until = MAX_TIMESTAMP
+        fallback_until = _clamp_add(now, default_window)
         candidate_until = (
             min(max(until, fallback_until), MAX_TIMESTAMP)
             if until is not None
@@ -2205,6 +2197,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "delivery_attempts": attempts,
             "delivery_failures": failures,
             "expired_unsent": expired_unsent,
+            "expired_unsent_reasons": list(self.expired_unsent_reasons),
             "expired_unsent_at": self.expired_unsent_at,
             "expired_unsent_until": self.expired_unsent_until,
         }
@@ -2347,18 +2340,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 cand_until = self.degraded_until
                 if cand_at is None:
                     cand_at = now.isoformat()
-                    try:
-                        computed_until = min(now + horizon, MAX_TIMESTAMP)
-                    except OverflowError:
-                        computed_until = MAX_TIMESTAMP
-                    cand_until = computed_until.isoformat()
+                    cand_until = _clamp_add(now, horizon).isoformat()
                 elif cand_until is None:
                     base_at = timestamp(cand_at) or now
-                    try:
-                        computed_until = min(base_at + horizon, MAX_TIMESTAMP)
-                    except OverflowError:
-                        computed_until = MAX_TIMESTAMP
-                    cand_until = computed_until.isoformat()
+                    cand_until = _clamp_add(base_at, horizon).isoformat()
                 until = timestamp(cand_until)
                 if until is not None and now > until:
                     pending_degraded = (
