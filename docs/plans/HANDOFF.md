@@ -2,6 +2,18 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 twentieth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `698fe14` (`run_id`: `20261118T004922Z-f1724a`, 248.1s standards and 294.2s specification) reported **0 Critical findings** and zero live-gate/routing/privacy/CAP/quarantine/store/offload/room/packaging defects, leaving 5 unique items (`F1`/`HA-SNAP-01` High/Medium, `F2` Medium, `F3` Low, `HA-ACK-02` Low, `HA-DEG-03` Low).
+
+All 5 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor review/refinements and contract/README/report updates:
+- **`F1` / `HA-SNAP-01`**: Switched `_healthy_snapshot()` to safe `.get()` / membership lookups falling back to `"ineligible"` and per-event `qualify()` reasons when `_bound_records()` evicts unprotected current `ineligible` items past 1,000 records, and moved `_healthy_snapshot()` inside `_update_once()`'s `try:` block.
+- **`F2` & `F3`**: Persisted validated `expired_unsent`, `expired_unsent_at`, and `expired_unsent_until` in store (`7`-day `MAX_ACCEPTANCE_AGE` latch from latest expiration or cleared on reload via valid unconsumed `expired_unsent_at <= acknowledge_degraded_at <= load_now`), surfaced latched counts across healthy, degraded, and `_stopped_health()` snapshots, kept pre-fetch `_sync_degraded_notification()` aligned with `self.expired_unsent`, and keyed notification state tuples on exact integer `expired_count`.
+- **`HA-ACK-02`**: Tracked `_ack_cleared_reason` alongside `_ack_cleared_on_load` so Poll 1 marks `acknowledge_rejected: true` only when the cleared reason itself re-latches, not on unrelated new degradations (`outbox_overflow`, `malformed_cancellation`, etc.).
+- **`HA-DEG-03`**: Preserved feed cancellation trigger precedence (`conflicting_cancellation` / `malformed_cancellation`) over concurrent `CancellationEvidenceOverflow` while enforcing `max(until, fallback_until)` and documenting concurrent-overflow history/horizon recovery guidance.
+
+Verification on the repaired candidate: complete local gates (`43` Node, `99` stdlib `-W error` HA, `7` skill, `21` Chromium Playwright, `11` real HA = `181` total), Ruff lint/format, deterministic packaging (`823de6d0...` extension ZIP, `8510ccca...` HA ZIP), live anonymous smoke (`2026-11-18T01:10:34.474Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117`, refresh clean-HEAD logs, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 nineteenth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `6bd9bc9` (`run_id`: `20261118T002932Z-5e3623`, 361.5s standards and 230.3s specification) reported **0 Critical, 0 High, and 0 Medium standards findings**, and zero live-gate/routing/privacy/CAP/quarantine/store/ack/offload/room/packaging defects, leaving 5 items (`SPEC-HA-01` Medium, `SIT-PERF-01` Low, `SIT-AVAIL-01` Low, `SPEC-HA-02` Nit, `DOC-01` Nit).

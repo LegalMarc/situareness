@@ -4716,3 +4716,585 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(o["key"] == "slice-exp" and o.get("expired") for o in last_outcomes)
         )
+
+    async def test_healthy_snapshot_handles_evicted_ineligible_records_and_wraps_errors(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime.now(timezone.utc)
+        cfg = config()
+        cfg.update(live_enabled=False, commissioning_passed=False, tts_entity=None)
+
+        def make_ineligible(i):
+            ev = d.normalize(feature())
+            ev["id"] = f"https://api.weather.gov/alerts/inelig-{i:04d}"
+            ev["event"] = "Flood Watch"
+            for key, delta in [
+                ("sent", -60),
+                ("effective", -60),
+                ("onset", 0),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                ev[key] = (now + timedelta(seconds=delta)).isoformat()
+            return cohere(ev)
+
+        events = [make_ineligible(i) for i in range(1005)]
+        hass = types.SimpleNamespace(data={}, services=Services())
+        store = Store()
+        coord = mod.SituarenessCoordinator(hass, cfg, store, None)
+        with patch.object(mod, "fetch", return_value=events):
+            health = await coord._async_update_data()
+
+        self.assertEqual(health["event_count"], 1005)
+        self.assertEqual(health["active_count"], 0)
+        self.assertFalse(health["evidence_degraded"])
+        self.assertLessEqual(len(store.saved[-1]["records"]), 1000)
+
+        # Direct snapshot call where leading candidate events are absent from records.
+        snap = coord._healthy_snapshot(
+            events[:5],
+            events[:5],
+            {},
+            [],
+            now,
+            0,
+            0,
+            False,
+            deliverable=0,
+        )
+        self.assertEqual(snap["events"][0]["state"], "ineligible")
+        self.assertTrue(snap["events"][0]["reasons"])
+
+        # Unexpected exception inside _healthy_snapshot is wrapped as UpdateFailed.
+        with (
+            patch.object(mod, "fetch", return_value=events[:1]),
+            patch.object(
+                coord, "_healthy_snapshot", side_effect=RuntimeError("snapshot boom")
+            ),
+        ):
+            with self.assertRaises(UpdateFailed):
+                await coord._async_update_data()
+
+    async def test_expired_unsent_persisted_latch_notification_and_acknowledgement(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        create_calls = []
+
+        def fake_create(hass, msg, title=None, notification_id=None):
+            create_calls.append({"message": msg, "title": title})
+            notifications[notification_id] = {"message": msg, "title": title}
+
+        fake_pn = types.SimpleNamespace(
+            async_create=fake_create,
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
+
+        class MutableClock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        MutableClock.current = now
+
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_0"],
+            tts_entity=None,
+        )
+
+        def make_ev(name):
+            ev = d.normalize(feature())
+            ev["id"] = f"https://api.weather.gov/alerts/pers-{name}"
+            for key, delta in [
+                ("sent", -60),
+                ("effective", -60),
+                ("onset", 0),
+                ("expires", 8 * 86400),
+                ("ends", 8 * 86400),
+            ]:
+                ev[key] = (now + timedelta(seconds=delta)).isoformat()
+            return cohere(ev)
+
+        ev1 = make_ev("one")
+        fp1 = d.fingerprint(ev1, d.qualify(ev1, cfg, now))
+        aged_created = (now - timedelta(minutes=16)).isoformat()
+        persisted_initial = {
+            "records": {
+                ev1["id"]: {
+                    "state": "active",
+                    "fingerprint": fp1,
+                    "actions": {fp1: ["new_york_ny"]},
+                    "lineage": [ev1["id"]],
+                    "cap_identity": ev1["cap_identity"],
+                    "cap_references": [],
+                    "sent": ev1["sent"],
+                    "expires": ev1["expires"],
+                    "ends": ev1["ends"],
+                    "updated": now.isoformat(),
+                }
+            },
+            "outbox": [
+                {
+                    "key": "exp-persist-1",
+                    "incident_id": ev1["id"],
+                    "fingerprint": fp1,
+                    "kind": "phone",
+                    "target": "mobile_app_0",
+                    "location": None,
+                    "affected_names": ["New York"],
+                    "event": "Tornado Warning",
+                    "instruction": ev1["instruction"],
+                    "source_url": ev1["id"],
+                    "attempts": 0,
+                    "created": aged_created,
+                }
+            ],
+            "initialized": True,
+            "was_live": True,
+        }
+        hass = types.SimpleNamespace(data={}, services=Services())
+        store1 = Store()
+
+        with patch.object(mod, "datetime", MutableClock):
+            coord1 = mod.SituarenessCoordinator(hass, cfg, store1, persisted_initial)
+            with patch.object(mod, "fetch", return_value=[ev1]):
+                h1 = await coord1._async_update_data()
+            self.assertEqual(h1["expired_unsent"], 1)
+            self.assertTrue(h1["partial"])
+            saved1 = store1.saved[-1]
+            self.assertEqual(saved1["expired_unsent"], 1)
+            self.assertEqual(saved1["expired_unsent_at"], now.isoformat())
+            self.assertEqual(
+                saved1["expired_unsent_until"], (now + timedelta(days=7)).isoformat()
+            )
+            self.assertEqual(len(create_calls), 1)
+            self.assertIn(
+                "1 queued qualifying alert target(s) aged past",
+                notifications["situareness_degraded"]["message"],
+            )
+
+            # Subsequent clean poll keeps latch without churning async_create.
+            MutableClock.current = now + timedelta(minutes=5)
+            with patch.object(mod, "fetch", return_value=[ev1]):
+                h2 = await coord1._async_update_data()
+            self.assertEqual(h2["expired_unsent"], 1)
+            self.assertTrue(h2["partial"])
+            self.assertEqual(len(create_calls), 1)
+
+            # Reload preserves latch; another expiration increments to 2 and updates notification.
+            MutableClock.current = now + timedelta(hours=1)
+            saved_with_second_exp = {
+                **store1.saved[-1],
+                "outbox": [
+                    {
+                        "key": "exp-persist-2",
+                        "incident_id": ev1["id"],
+                        "fingerprint": fp1,
+                        "kind": "phone",
+                        "target": "mobile_app_0",
+                        "location": None,
+                        "affected_names": ["New York"],
+                        "event": "Tornado Warning",
+                        "instruction": ev1["instruction"],
+                        "source_url": ev1["id"],
+                        "attempts": 0,
+                        "created": (
+                            MutableClock.current - timedelta(minutes=16)
+                        ).isoformat(),
+                    }
+                ],
+            }
+            store2 = Store()
+            create_calls.clear()
+            coord2 = mod.SituarenessCoordinator(
+                hass, cfg, store2, saved_with_second_exp
+            )
+            self.assertEqual(coord2.expired_unsent, 1)
+            self.assertEqual(coord2._stopped_health()["expired_unsent"], 1)
+            self.assertTrue(coord2._stopped_health()["partial"])
+            self.assertEqual(len(create_calls), 1)
+
+            with patch.object(mod, "fetch", return_value=[ev1]):
+                h3 = await coord2._async_update_data()
+            self.assertEqual(h3["expired_unsent"], 2)
+            self.assertEqual(store2.saved[-1]["expired_unsent"], 2)
+            self.assertEqual(len(create_calls), 2)
+            self.assertIn(
+                "2 queued qualifying alert target(s) aged past",
+                notifications["situareness_degraded"]["message"],
+            )
+
+            # Another clean poll at count=2 does not churn.
+            MutableClock.current = now + timedelta(hours=2)
+            with patch.object(mod, "fetch", return_value=[ev1]):
+                h4 = await coord2._async_update_data()
+            self.assertEqual(h4["expired_unsent"], 2)
+            self.assertEqual(len(create_calls), 2)
+
+            # Early/invalid acknowledge_degraded_at while healthy is rejected and preserves latch.
+            persisted_two = store2.saved[-1]
+            entry_updates = []
+            entry_cfg = {
+                **cfg,
+                "acknowledge_degraded_at": (now - timedelta(minutes=1)).isoformat(),
+            }
+            entry_obj = types.SimpleNamespace(entry_id="e-exp", data={})
+            hass_with_entries = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda entry, data: (
+                        setattr(entry, "data", data),
+                        entry_updates.append(data),
+                    )
+                ),
+            )
+            coord_rej = mod.SituarenessCoordinator(
+                hass_with_entries, entry_cfg, Store(), persisted_two, entry=entry_obj
+            )
+            self.assertTrue(coord_rej.acknowledge_rejected)
+            self.assertEqual(coord_rej.expired_unsent, 2)
+            self.assertIn(
+                "2 queued target(s) expired unsent",
+                notifications["situareness_degraded"]["message"],
+            )
+
+            # Valid acknowledge_degraded_at while healthy clears expired_unsent latch
+            # and commits consumption together on Poll 1 save.
+            ack_valid = (now + timedelta(minutes=30)).isoformat()
+            entry_ok = types.SimpleNamespace(entry_id="e-exp-ok", data={})
+            store_ok = Store()
+            coord_ok = mod.SituarenessCoordinator(
+                hass_with_entries,
+                {**cfg, "acknowledge_degraded_at": ack_valid},
+                store_ok,
+                persisted_two,
+                entry=entry_ok,
+            )
+            self.assertFalse(coord_ok.acknowledge_rejected)
+            self.assertEqual(coord_ok.expired_unsent, 0)
+            self.assertIsNone(coord_ok.expired_unsent_at)
+            self.assertIsNone(coord_ok.expired_unsent_until)
+            self.assertFalse(coord_ok._stopped_health()["partial"])
+            self.assertNotIn("situareness_degraded", notifications)
+            with patch.object(mod, "fetch", return_value=[ev1]):
+                h_ok = await coord_ok._async_update_data()
+            self.assertEqual(h_ok["expired_unsent"], 0)
+            self.assertFalse(h_ok["partial"])
+            self.assertEqual(store_ok.saved[-1]["expired_unsent"], 0)
+            self.assertIn(ack_valid, entry_ok.data["consumed_acknowledgements"])
+
+            # 7-day auto-clear on poll and on reload.
+            MutableClock.current = now + timedelta(days=7, hours=2)
+            coord_expire_poll = mod.SituarenessCoordinator(
+                hass, cfg, Store(), persisted_two
+            )
+            # Load at +7d 2h already clears because expired_unsent_until was +7d 1h.
+            self.assertEqual(coord_expire_poll.expired_unsent, 0)
+
+            MutableClock.current = now + timedelta(days=7, minutes=30)
+            store_poll_exp = Store()
+            coord_expire_during_poll = mod.SituarenessCoordinator(
+                hass, cfg, store_poll_exp, persisted_two
+            )
+            self.assertEqual(coord_expire_during_poll.expired_unsent, 2)
+            MutableClock.current = now + timedelta(days=7, hours=2)
+            with patch.object(mod, "fetch", return_value=[ev1]):
+                h_after_horizon = await coord_expire_during_poll._async_update_data()
+            self.assertEqual(h_after_horizon["expired_unsent"], 0)
+            self.assertFalse(h_after_horizon["partial"])
+            self.assertEqual(store_poll_exp.saved[-1]["expired_unsent"], 0)
+
+        # Invalid persisted expired_unsent types fail store validation.
+        for bad_payload in (
+            {"records": {}, "expired_unsent": True},
+            {"records": {}, "expired_unsent": -1},
+            {"records": {}, "expired_unsent_at": "not-a-date"},
+            {"records": {}, "expired_unsent_until": "2026-11-17T12:00:00"},
+        ):
+            self.assertFalse(mod._valid_persisted_store(bad_payload))
+            bad_coord = mod.SituarenessCoordinator(hass, cfg, Store(), bad_payload)
+            self.assertEqual(bad_coord.degraded_reason, "malformed_store")
+            self.assertEqual(bad_coord.expired_unsent, 0)
+
+    async def test_ack_cleared_reason_tracks_cleared_reason_only(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime.now(timezone.utc)
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_0"],
+            tts_entity=None,
+            acknowledge_degraded_at=(now - timedelta(minutes=5)).isoformat(),
+        )
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda entry, data: setattr(entry, "data", data)
+            ),
+        )
+        persisted_jl = {
+            "records": {},
+            "outbox": [],
+            "initialized": True,
+            "was_live": True,
+            "degraded": True,
+            "degraded_reason": "journal_lost",
+            "degraded_at": (now - timedelta(hours=1)).isoformat(),
+            "degraded_until": (now + timedelta(days=7)).isoformat(),
+        }
+        coord = mod.SituarenessCoordinator(
+            hass,
+            cfg,
+            Store(),
+            persisted_jl,
+            entry=types.SimpleNamespace(entry_id="ack-reason", data={}),
+        )
+        self.assertFalse(coord.degraded)
+        self.assertFalse(coord.acknowledge_rejected)
+        self.assertEqual(coord._ack_cleared_reason, "journal_lost")
+
+        # Next poll triggers a DIFFERENT degraded reason -> must NOT set acknowledge_rejected=True.
+        base_ev = d.normalize(feature())
+        base_ev["id"] = "https://api.weather.gov/alerts/ack-diff-base"
+        for key, delta in [
+            ("sent", -300),
+            ("effective", -300),
+            ("onset", -60),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            base_ev[key] = (now + timedelta(seconds=delta)).isoformat()
+        base_ev = cohere(base_ev)
+        conflict_feed = collector.CollectedEvents(
+            [base_ev], 2, [], False, conflicting_cancellation=True
+        )
+        with patch.object(mod, "fetch", return_value=conflict_feed):
+            h_diff = await coord._async_update_data()
+        self.assertEqual(h_diff["degraded_reason"], "conflicting_cancellation")
+        self.assertFalse(h_diff["acknowledge_rejected"])
+
+        # Same-reason re-latch DOES set acknowledge_rejected=True.
+        persisted_same = {
+            "records": {},
+            "outbox": [],
+            "initialized": True,
+            "was_live": True,
+            "degraded": True,
+            "degraded_reason": "conflicting_cancellation",
+            "degraded_at": (now - timedelta(hours=1)).isoformat(),
+            "degraded_until": (now + timedelta(days=7)).isoformat(),
+        }
+        coord_same = mod.SituarenessCoordinator(
+            hass,
+            {
+                **cfg,
+                "acknowledge_degraded_at": (now - timedelta(minutes=4)).isoformat(),
+            },
+            Store(),
+            persisted_same,
+            entry=types.SimpleNamespace(entry_id="ack-same", data={}),
+        )
+        with patch.object(mod, "fetch", return_value=conflict_feed):
+            h_same = await coord_same._async_update_data()
+        self.assertEqual(h_same["degraded_reason"], "conflicting_cancellation")
+        self.assertTrue(h_same["acknowledge_rejected"])
+
+    async def test_feed_cancellation_priority_over_concurrent_overflow(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc)
+
+        class Clock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        Clock.current = now
+
+        cfg = config()
+        cfg.update(live_enabled=False, commissioning_passed=False, tts_entity=None)
+        hass = types.SimpleNamespace(data={}, services=Services())
+
+        base_ev = d.normalize(feature())
+        base_ev["id"] = "https://api.weather.gov/alerts/prio-base"
+        for key, delta in [
+            ("sent", -300),
+            ("effective", -300),
+            ("onset", -60),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            base_ev[key] = (now + timedelta(seconds=delta)).isoformat()
+        base_ev = cohere(base_ev)
+        conflict_feed = collector.CollectedEvents(
+            [base_ev], 2, [], False, conflicting_cancellation=True
+        )
+
+        long_horizon = now + timedelta(days=10)
+        long_overflow = d.CancellationEvidenceOverflow(
+            "protected overflow",
+            dropped_horizon=long_horizon,
+            records={},
+            plans=[],
+        )
+        store = Store()
+        coord = mod.SituarenessCoordinator(hass, cfg, store, None)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=conflict_feed),
+            patch.object(mod, "reconcile", side_effect=long_overflow),
+        ):
+            h1 = await coord._async_update_data()
+
+        self.assertEqual(h1["degraded_reason"], "conflicting_cancellation")
+        self.assertEqual(h1["degraded_until"], long_horizon.isoformat())
+        self.assertEqual(h1["degraded_at"], now.isoformat())
+        self.assertIn(
+            "or the latest evicted component horizon if history also overflowed",
+            notifications["situareness_degraded"]["message"],
+        )
+
+        # Second concurrent poll preserves degraded_reason and degraded_at cleanly.
+        Clock.current = now + timedelta(minutes=10)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=conflict_feed),
+            patch.object(mod, "reconcile", side_effect=long_overflow),
+        ):
+            h2 = await coord._async_update_data()
+        self.assertEqual(h2["degraded_reason"], "conflicting_cancellation")
+        self.assertEqual(h2["degraded_at"], now.isoformat())
+
+        # Third poll where conflicting_cancellation continues WITHOUT overflow still retains
+        # degraded_reason, stable degraded_at, and the overflow-extended degraded_until.
+        Clock.current = now + timedelta(minutes=20)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=conflict_feed),
+        ):
+            h3 = await coord._async_update_data()
+        self.assertEqual(h3["degraded_reason"], "conflicting_cancellation")
+        self.assertEqual(h3["degraded_at"], now.isoformat())
+        self.assertEqual(h3["degraded_until"], long_horizon.isoformat())
+
+        # Short overflow horizon (< 7 days) with malformed_cancellation keeps 7-day floor.
+        mal_cancel = d.normalize(feature())
+        mal_cancel["id"] = "https://api.weather.gov/alerts/prio-mal-cancel"
+        mal_cancel["message_type"] = "Cancel"
+        mal_cancel["references"] = []
+        mal_cancel["reference_identities"] = []
+        mal_cancel["sent"] = (now - timedelta(seconds=10)).isoformat()
+        mal_cancel["effective"] = (now - timedelta(seconds=10)).isoformat()
+        mal_cancel["onset"] = (now - timedelta(seconds=10)).isoformat()
+        mal_cancel["expires"] = (now + timedelta(seconds=1800)).isoformat()
+        mal_cancel["ends"] = (now + timedelta(seconds=1800)).isoformat()
+
+        short_overflow = d.CancellationEvidenceOverflow(
+            "short overflow",
+            dropped_horizon=now + timedelta(hours=1),
+            records={},
+            plans=[],
+        )
+        Clock.current = now
+        coord_short = mod.SituarenessCoordinator(hass, cfg, Store(), None)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=[mal_cancel]),
+            patch.object(mod, "reconcile", side_effect=short_overflow),
+        ):
+            h_short = await coord_short._async_update_data()
+        self.assertEqual(h_short["degraded_reason"], "malformed_cancellation")
+        self.assertEqual(
+            h_short["degraded_until"], (now + timedelta(days=7)).isoformat()
+        )
