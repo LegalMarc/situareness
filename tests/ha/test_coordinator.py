@@ -7256,3 +7256,257 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(coord.acknowledged_degraded_at, t2)
         self.assertEqual(coord.consumed_acknowledgements, [t0, t2])
+
+    async def test_save_skips_disk_verify_when_hass_stopping(self):
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        stopping_state = types.SimpleNamespace(name="stopping", value="STOPPING")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_file = Path(tmp) / "situareness.deferred"
+
+            class DeferredStore:
+                path = store_file
+
+                async def async_save(self, data):
+                    # Emulates HA Store.async_save deferring writes to final_write during shutdown.
+                    return None
+
+            async def run_exec(fn, *args):
+                return await asyncio.to_thread(fn, *args)
+
+            hass = types.SimpleNamespace(
+                state=stopping_state,
+                data={},
+                services=Services(),
+                async_add_executor_job=run_exec,
+            )
+            coord = mod.SituarenessCoordinator(
+                hass,
+                config(),
+                DeferredStore(),
+                {},
+            )
+            await coord._save({"id-1": {"state": "ineligible"}}, [], [])
+            self.assertIn("id-1", coord.records)
+
+            hass.state = types.SimpleNamespace(name="running", value="RUNNING")
+            with self.assertRaises(OSError):
+                await coord._save({"id-2": {"state": "ineligible"}}, [], [])
+
+    async def test_setup_entry_cleans_data_and_notification_when_forward_fails(self):
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        dismiss_calls = []
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, nid: (
+                dismiss_calls.append(nid),
+                notifications.pop(nid, None),
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        async def run_exec(fn, *args):
+            return await asyncio.to_thread(fn, *args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "situareness.json").write_text("{}", encoding="utf-8")
+
+            class ForwardFailEntries:
+                def async_update_entry(self, ent, data=None):
+                    ent.data = data
+
+                async def async_forward_entry_setups(self, ent, platforms):
+                    raise RuntimeError("platform setup boom")
+
+            class DegradedFirstRefreshCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    self.data = await self._update_once()
+
+            listeners = []
+            entry = types.SimpleNamespace(
+                entry_id="fwd-fail",
+                data={"journal_initialized": True},
+                state="setup_error",
+                async_on_state_change=lambda cb: (
+                    listeners.append(cb),
+                    lambda: listeners.remove(cb),
+                )[-1],
+            )
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                config_entries=ForwardFailEntries(),
+                async_add_executor_job=run_exec,
+            )
+
+            class EmptyStore(Store):
+                async def async_load(self):
+                    return None
+
+            with (
+                patch.object(mod, "Store", EmptyStore),
+                patch.object(
+                    mod, "SituarenessCoordinator", DegradedFirstRefreshCoordinator
+                ),
+                patch.object(
+                    mod,
+                    "fetch",
+                    return_value=collector.CollectedEvents([], 0, set(), False),
+                ),
+                self.assertRaisesRegex(RuntimeError, "platform setup boom"),
+            ):
+                await mod.async_setup_entry(hass, entry)
+
+            self.assertNotIn(entry.entry_id, hass.data.get(mod.DOMAIN, {}))
+            self.assertNotIn("situareness_degraded", notifications)
+            self.assertGreaterEqual(len(dismiss_calls), 1)
+            for cb in list(listeners):
+                cb()
+            await asyncio.sleep(0)
+            self.assertEqual(listeners, [])
+
+    async def test_compute_expired_unsent_resets_elapsed_prior_window(self):
+        from datetime import datetime, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        old_at = datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 11, 17, 12, 0, tzinfo=timezone.utc)
+        persisted = {
+            "records": {},
+            "outbox": [],
+            "expired_unsent": 4,
+            "expired_unsent_at": old_at.isoformat(),
+            "expired_unsent_until": (old_at + mod.MAX_ACCEPTANCE_AGE).isoformat(),
+            "expired_unsent_reasons": ["target_removed"],
+        }
+        coord = mod.SituarenessCoordinator(
+            types.SimpleNamespace(data={}, services=Services()),
+            config(),
+            Store(),
+            persisted,
+        )
+        # Preserve the elapsed window directly to test poll_expired > 0 right after outage recovery.
+        coord.expired_unsent = 4
+        coord.expired_unsent_at = old_at.isoformat()
+        coord.expired_unsent_until = (old_at + mod.MAX_ACCEPTANCE_AGE).isoformat()
+        coord.expired_unsent_reasons = ["target_removed"]
+
+        count, new_at, new_until, reasons, ack_rej = coord._compute_expired_unsent(
+            1, now, outcomes=[{"expired": True, "reason": "age"}]
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(new_at, now.isoformat())
+        self.assertEqual(new_until, (now + mod.MAX_ACCEPTANCE_AGE).isoformat())
+        self.assertEqual(reasons, ["age"])
+        self.assertFalse(ack_rej)
+
+    async def test_failed_platform_unload_restores_quarantine_ambiguous_notice(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, nid: notifications.pop(nid, None),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        async def run_exec(fn, *args):
+            return await asyncio.to_thread(fn, *args)
+
+        async def fail_unload(entry, platforms):
+            return False
+
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(async_unload_platforms=fail_unload),
+            async_add_executor_job=run_exec,
+        )
+        coord = mod.SituarenessCoordinator(hass, config(), Store(), {})
+        entry = types.SimpleNamespace(entry_id="resume-qa")
+        hass.data.setdefault(mod.DOMAIN, {})[entry.entry_id] = coord
+
+        ambiguous_batch = collector.CollectedEvents([], 1, set(), True, source_count=1)
+        with patch.object(mod, "fetch", return_value=ambiguous_batch):
+            health = await coord._async_update_data()
+
+        self.assertTrue(health["quarantine_ambiguous"])
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness alert scope ambiguous",
+        )
+        self.assertFalse(await mod.async_unload_entry(hass, entry))
+        self.assertIn(entry.entry_id, hass.data[mod.DOMAIN])
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness alert scope ambiguous",
+        )

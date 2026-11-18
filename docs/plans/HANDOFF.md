@@ -2,6 +2,18 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 twenty-sixth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `4ea74ca` (`run_id`: `20261118T031956Z-d2125a`, 312.2s standards and 316.6s specification) reported **0 Critical, 0 High, and 0 Medium findings**, with zero live-gate/routing/privacy/persistence-compat/CAP-cancellation/bounds/overflow/ack/packaging/catalog/index defects, leaving 6 unique findings (`SIT-R1`/`SPEC-HA-02` Low, `SPEC-HA-01` Low, `SIT-R2` Nit, `SIT-R3` Nit, `SPEC-ROOM-01` Nit, `SPEC-HA-03` Nit).
+
+All 6 findings were repaired cleanly in Round 26 (`custom_components/situareness/__init__.py`, `extension/room.js`, `tests/ha/test_coordinator.py`, `tests/browser/room.spec.js`, and documentation):
+- **`SIT-R1` / `SPEC-HA-02`**: Added `_is_hass_stopping(hass)` to skip `_verify_store_save` when Home Assistant is in `stopping`/`final_write`/`stopped` states (avoiding false `UpdateFailed` on deferred `CoreState.stopping` writes), added a docstring documenting HA `Store` internals (`Store.path` and 512-byte tail layout), and added unit test coverage.
+- **`SPEC-HA-01`**: Wrapped `hass.data` registration and `async_forward_entry_setups()` in `async_setup_entry()` so failed platform forwarding pops `hass.data`, dismisses `situareness_degraded`, and calls `await coordinator.async_stop()` before entering `setup_error` or retry, with unit test coverage.
+- **`SIT-R2` & `SPEC-HA-03`**: Updated `_compute_expired_unsent()` to reset base count, anchor timestamp, reasons, and horizon once `now > existing_until` before adding new expirations, and tracked `self._last_quarantine_ambiguous` across polls so `resume_after_failed_unload()` restores active `"Situareness alert scope ambiguous"` notices on failed platform unload, with unit tests for both.
+- **`SPEC-ROOM-01` & `SIT-R3`**: Prioritized `!enabled.length` ahead of `paused` in `extension/room.js` `renderStatus()` so paused/all-disabled collectors display neutral `"No sources enabled"` status (tested in `tests/browser/room.spec.js`), and rewrote `docs/spec/o3-mvp.md`, `docs/ha/README.md`, and `home-assistant/README.md` without private leading-underscore symbol names or implementation save counts, splitting dense bullets cleanly.
+
+Verification on the repaired candidate: complete local gates (`44` Node, `130` stdlib `-W error` HA with zero asyncio slow-callback warnings, `7` skill, `21` Chromium Playwright, `13` real HA = `215` total), Ruff lint/format, deterministic packaging (`9ef4d967...` extension ZIP, `62b29da3...` HA ZIP), live anonymous smoke (`2026-11-18T15:40:26.722Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117`, refresh clean-HEAD logs, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 twenty-fifth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `18342bc` (`run_id`: `20261118T025653Z-90db5a`, 240.5s standards and 276.3s specification) reported **0 Critical and 0 High findings**, and zero live-gate/routing/privacy/CAP-cancellation/bounds/store-schema/stop-cancellation/room/INDEX defects, leaving 8 unique findings (`HA-UNLOAD-01` Medium, `SR-01` Medium, `HA-SETUP-02`/`SR-03` Low, `HA-PERSIST-03` Low, `HA-RETRY-04` Low, `DOC-CTX-05`/`SR-02` Low, `SR-04` Nit, `TEST-NIT-06` Nit).

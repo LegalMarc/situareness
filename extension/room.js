@@ -156,10 +156,9 @@ function renderStatus(state) {
   const enabled = (state?.sources || []).filter(
     (source) => source.enabled !== false,
   );
-  els.collectorDot.className = `status-dot ${paused ? "paused" : !enabled.length ? "neutral" : enabled.some((source) => source.status === "error") ? "error" : "ok"}`;
-  if (paused) els.collectorLabel.textContent = "Collection paused";
-  else if (!enabled.length)
-    els.collectorLabel.textContent = "No sources enabled";
+  els.collectorDot.className = `status-dot ${!enabled.length ? "neutral" : paused ? "paused" : enabled.some((source) => source.status === "error") ? "error" : "ok"}`;
+  if (!enabled.length) els.collectorLabel.textContent = "No sources enabled";
+  else if (paused) els.collectorLabel.textContent = "Collection paused";
   else if (running) els.collectorLabel.textContent = "Collecting updates…";
   else if (collector.last_run_at)
     els.collectorLabel.textContent = `Collector active · last run ${relativeAge(collector.last_run_at)}`;

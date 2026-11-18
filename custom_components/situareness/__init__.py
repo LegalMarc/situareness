@@ -561,6 +561,14 @@ def _clear_corrupt_store_backups(storage_dir, prefix):
 
 
 def _verify_store_save(store_path, save_id):
+    """Verify atomic disk persistence after Home Assistant Store.async_save.
+
+    Home Assistant's Store.async_save delegates to _async_handle_write_data, which
+    catches and logs (SerializationError, WriteError) without raising. Because
+    save_id is placed as the final key in payload and Store serializes keys in
+    insertion order, reading the final 512 bytes of Store.path confirms the write
+    landed on disk when Home Assistant is not deferring writes to shutdown.
+    """
     path = Path(store_path)
     with path.open("rb") as stream:
         stream.seek(0, 2)
@@ -569,6 +577,22 @@ def _verify_store_save(store_path, save_id):
         tail = stream.read()
     if save_id.encode("ascii") not in tail:
         raise OSError("Store write was not committed")
+
+
+def _is_hass_stopping(hass):
+    state = getattr(hass, "state", None)
+    for candidate in (
+        state,
+        getattr(state, "value", None),
+        getattr(state, "name", None),
+    ):
+        if isinstance(candidate, str) and candidate.lower() in (
+            "stopping",
+            "final_write",
+            "stopped",
+        ):
+            return True
+    return False
 
 
 def _clear_retry_listener(hass, entry_id):
@@ -825,6 +849,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self._refresh_lock = asyncio.Lock()
         self._fetch_task = None
         self._stopping = False
+        self._last_quarantine_ambiguous = False
         self._notified_degraded_state = None
         self._checked_notification_clear = False
         self._sync_degraded_notification()
@@ -982,7 +1007,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         }
         await self.store.async_save(payload)
         store_path = getattr(self.store, "path", None)
-        if isinstance(store_path, (str, Path)):
+        if isinstance(store_path, (str, Path)) and not _is_hass_stopping(self.hass):
             await self.hass.async_add_executor_job(
                 _verify_store_save, store_path, save_id
             )
@@ -1057,16 +1082,38 @@ class SituarenessCoordinator(DataUpdateCoordinator):
 
     def _compute_expired_unsent(self, poll_expired, now, outcomes=()):
         if poll_expired > 0:
-            new_at = (
-                now.isoformat()
-                if (
-                    self.expired_unsent <= 0
-                    or not isinstance(self.expired_unsent_at, str)
-                    or timestamp(self.expired_unsent_at) is None
-                )
-                else self.expired_unsent_at
+            existing_at = (
+                timestamp(self.expired_unsent_at)
+                if isinstance(self.expired_unsent_at, str)
+                else None
             )
-            new_count = self.expired_unsent + poll_expired
+            existing_until = (
+                timestamp(self.expired_unsent_until)
+                if isinstance(self.expired_unsent_until, str)
+                else None
+            )
+            if (
+                self.expired_unsent > 0
+                and existing_until is None
+                and existing_at is not None
+            ):
+                try:
+                    existing_until = min(
+                        existing_at + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP
+                    )
+                except OverflowError:
+                    existing_until = MAX_TIMESTAMP
+            prior_active = self.expired_unsent > 0 and (
+                existing_until is None or now <= existing_until
+            )
+            base_count = self.expired_unsent if prior_active else 0
+            base_reasons = set(self.expired_unsent_reasons) if prior_active else set()
+            new_at = (
+                self.expired_unsent_at
+                if (prior_active and existing_at is not None)
+                else now.isoformat()
+            )
+            new_count = base_count + poll_expired
             new_reasons = [
                 o.get("reason")
                 for o in outcomes
@@ -1074,18 +1121,13 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             ]
             if not new_reasons:
                 new_reasons = ["age"]
-            combined = set(self.expired_unsent_reasons) | set(new_reasons)
+            combined = base_reasons | set(new_reasons)
             ordered_reasons = [r for r in VALID_EXPIRY_REASONS if r in combined]
             try:
                 until = min(now + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP)
             except OverflowError:
                 until = MAX_TIMESTAMP
-            existing_until = (
-                timestamp(self.expired_unsent_until)
-                if isinstance(self.expired_unsent_until, str)
-                else None
-            )
-            if existing_until is not None:
+            if prior_active and existing_until is not None:
                 until = min(max(until, existing_until), MAX_TIMESTAMP)
             return (
                 new_count,
@@ -1137,8 +1179,13 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
 
     def _sync_degraded_notification(
-        self, quarantine_ambiguous=False, expired_unsent=None
+        self, quarantine_ambiguous=None, expired_unsent=None
     ):
+        if quarantine_ambiguous is None:
+            quarantine_ambiguous = self._last_quarantine_ambiguous
+        else:
+            quarantine_ambiguous = bool(quarantine_ambiguous)
+            self._last_quarantine_ambiguous = quarantine_ambiguous
         if expired_unsent is None:
             expired_unsent = self.expired_unsent
         expired_count = int(expired_unsent or 0)
@@ -1613,7 +1660,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(
                 "Could not persist cancellation evidence safety state"
             ) from save_err
-        self._sync_degraded_notification(expired_unsent=self.expired_unsent)
+        self._sync_degraded_notification(
+            quarantine_ambiguous=bool(getattr(events, "quarantine_ambiguous", False)),
+            expired_unsent=self.expired_unsent,
+        )
         return self._degraded_health(
             events=events,
             candidate_events=candidate_events,
@@ -2242,7 +2292,12 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     self.config,
                     datetime.now(timezone.utc),
                 )
-                self._sync_degraded_notification(expired_unsent=total_expired_unsent)
+                self._sync_degraded_notification(
+                    quarantine_ambiguous=bool(
+                        getattr(events, "quarantine_ambiguous", False)
+                    ),
+                    expired_unsent=total_expired_unsent,
+                )
                 return self._degraded_health(
                     events=events,
                     candidate_events=candidate_events,
@@ -2375,6 +2430,14 @@ async def async_setup_entry(hass, entry):
     )
     try:
         await coordinator.async_config_entry_first_refresh()
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+        try:
+            await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        except BaseException:
+            hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+            _dismiss_degraded_notification(hass)
+            await coordinator.async_stop()
+            raise
     except Exception:
         if callable(getattr(entry, "async_on_state_change", None)):
             unsub = None
@@ -2412,8 +2475,6 @@ async def async_setup_entry(hass, entry):
             unsub = entry.async_on_state_change(_on_entry_state_change)
             _SETUP_RETRY_UNSUBS[key] = unsub
         raise
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 

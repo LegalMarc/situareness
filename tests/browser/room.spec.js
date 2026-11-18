@@ -730,10 +730,24 @@ test("no enabled sources has a neutral status and useful empty state", async () 
     "No sources enabled",
   );
   await expect(page.locator("#collector-dot")).toHaveClass(/neutral/);
+  await expect(page.locator("#feed-state")).toContainText("No sources enabled");
   await expect(page.locator("#feed-state")).toContainText(
-    "Enable a source in settings",
+    "Enable a source in settings to collect events.",
   );
   await expect(page.locator("#feed-state .spinner")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Pause collection" }).click();
+  await expect(
+    page.getByRole("button", { name: "Resume collection" }),
+  ).toBeVisible();
+  await expect(page.locator("#collector-label")).toHaveText(
+    "No sources enabled",
+  );
+  await expect(page.locator("#collector-dot")).toHaveClass(/neutral/);
+  await expect(page.locator("#feed-state")).toContainText("No sources enabled");
+  await expect(page.locator("#feed-state")).toContainText(
+    "Enable a source in settings to collect events.",
+  );
 });
 
 test("a broken bundled defaults response produces an explicit startup error", async () => {
