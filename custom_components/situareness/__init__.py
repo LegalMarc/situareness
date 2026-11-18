@@ -1109,7 +1109,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             base_count = self.expired_unsent if prior_active else 0
             base_reasons = set(self.expired_unsent_reasons) if prior_active else set()
             new_at = (
-                self.expired_unsent_at
+                max(existing_at, now).isoformat()
                 if (prior_active and existing_at is not None)
                 else now.isoformat()
             )
@@ -1540,7 +1540,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "quarantine_ambiguous": quarantine_ambiguous,
             "cancellation_uncertain": cancellation_uncertain,
             "evidence_degraded": not is_outbox_overflow,
-            "output_blocked": not is_outbox_overflow,
+            "output_blocked": not is_outbox_overflow or quarantine_ambiguous,
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
             "degraded_until": self.degraded_until,
@@ -2010,7 +2010,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "partial": partial,
             "cancellation_uncertain": cancellation_uncertain,
             "evidence_degraded": False,
-            "output_blocked": False,
+            "output_blocked": quarantine_ambiguous,
             "degraded_reason": self.degraded_reason,
             "degraded_at": self.degraded_at,
             "degraded_until": self.degraded_until,

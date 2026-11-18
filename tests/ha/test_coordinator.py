@@ -3280,6 +3280,8 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         with patch.object(mod, "fetch", return_value=ambig):
             h2 = await coord._async_update_data()
         self.assertTrue(h2["quarantine_ambiguous"])
+        self.assertFalse(h2["evidence_degraded"])
+        self.assertTrue(h2["output_blocked"])
         self.assertIn("situareness_degraded", notifications)
         self.assertEqual(
             notifications["situareness_degraded"]["title"],
@@ -3288,6 +3290,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         with patch.object(mod, "fetch", return_value=[ev]):
             h3 = await coord._async_update_data()
         self.assertFalse(h3["quarantine_ambiguous"])
+        self.assertFalse(h3["output_blocked"])
         self.assertNotIn("situareness_degraded", notifications)
 
         # Degraded journal_lost poll carrying quarantined_cancel_lineages reports
@@ -4998,25 +5001,33 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 h3 = await coord2._async_update_data()
             self.assertEqual(h3["expired_unsent"], 2)
             self.assertEqual(store2.saved[-1]["expired_unsent"], 2)
+            self.assertEqual(
+                store2.saved[-1]["expired_unsent_at"],
+                (now + timedelta(hours=1)).isoformat(),
+            )
             self.assertEqual(len(create_calls), 2)
             self.assertIn(
                 "2 queued qualifying alert target(s) aged past",
                 notifications["situareness_degraded"]["message"],
             )
 
-            # Another clean poll at count=2 does not churn.
+            # Another clean poll at count=2 does not churn or alter expired_unsent_at.
             MutableClock.current = now + timedelta(hours=2)
             with patch.object(mod, "fetch", return_value=[ev1]):
                 h4 = await coord2._async_update_data()
             self.assertEqual(h4["expired_unsent"], 2)
+            self.assertEqual(
+                store2.saved[-1]["expired_unsent_at"],
+                (now + timedelta(hours=1)).isoformat(),
+            )
             self.assertEqual(len(create_calls), 2)
 
-            # Early/invalid acknowledge_degraded_at while healthy is rejected and preserves latch.
+            # Early/invalid acknowledge_degraded_at (including between 1st and 2nd expiration) is rejected.
             persisted_two = store2.saved[-1]
             entry_updates = []
             entry_cfg = {
                 **cfg,
-                "acknowledge_degraded_at": (now - timedelta(minutes=1)).isoformat(),
+                "acknowledge_degraded_at": (now + timedelta(minutes=30)).isoformat(),
             }
             entry_obj = types.SimpleNamespace(entry_id="e-exp", data={})
             hass_with_entries = types.SimpleNamespace(
@@ -5049,9 +5060,9 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 notifications["situareness_degraded"]["message"],
             )
 
-            # Valid acknowledge_degraded_at while healthy clears expired_unsent latch
+            # Valid acknowledge_degraded_at >= latest expired_unsent_at while healthy clears latch
             # and commits consumption together on Poll 1 save.
-            ack_valid = (now + timedelta(minutes=30)).isoformat()
+            ack_valid = (now + timedelta(minutes=90)).isoformat()
             entry_ok = types.SimpleNamespace(entry_id="e-exp-ok", data={})
             store_ok = Store()
             coord_ok = mod.SituarenessCoordinator(
@@ -6126,6 +6137,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(h1["evidence_degraded"])
         self.assertIsNone(h1["degraded_reason"])
         self.assertTrue(h1["quarantine_ambiguous"])
+        self.assertTrue(h1["output_blocked"])
         self.assertTrue(h1["partial"])
         self.assertLessEqual(len(store.saved[-1]["records"]), 1000)
 
@@ -6134,6 +6146,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         with patch.object(mod, "fetch", return_value=clean_feed):
             h2 = await coord._async_update_data()
         self.assertFalse(h2["quarantine_ambiguous"])
+        self.assertFalse(h2["output_blocked"])
         self.assertFalse(h2["evidence_degraded"])
         self.assertIsNone(h2["degraded_reason"])
 

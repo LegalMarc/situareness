@@ -2,6 +2,17 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 twenty-seventh Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `0cb3656` (`run_id`: `20261118T155112Z-c46492`, 275.5s standards and 251.4s specification) reported **0 Critical and 0 High findings** and zero Standards findings above Nit, leaving 4 unique findings (`SIT-EXP-ACK-01` Medium, `SIT-ACK-COMMIT-02` Low, `TRUTH-01` Nit, `DOC-01`/`SIT-LOOP-03` Nit).
+
+All 4 findings were repaired cleanly in Round 27 (`custom_components/situareness/__init__.py`, `tests/ha/test_coordinator.py`, `docs/spec/o3-mvp.md`, `docs/ha/README.md`, and `home-assistant/README.md`):
+- **`SIT-EXP-ACK-01`**: Updated `_compute_expired_unsent()` so `expired_unsent_at` advances to `max(existing_at, now).isoformat()` whenever a poll adds new expirations (`poll_expired > 0`), preventing an earlier `acknowledge_degraded_at` from silently clearing later unseen expirations on reload, and verified intermediate-timestamp rejection in unit tests.
+- **`TRUTH-01`**: Set `output_blocked: True` whenever `quarantine_ambiguous` holds in `_degraded_health` and `_healthy_snapshot` (while keeping `evidence_degraded: False` outside evidence degraded modes) with unit test assertions.
+- **`SIT-ACK-COMMIT-02` & `DOC-01` / `SIT-LOOP-03`**: Updated `docs/spec/o3-mvp.md`, `docs/ha/README.md`, and `home-assistant/README.md` to distinguish poll-time post-verification commits from load-time rejected/no-op ISO-8601 ack writes and initial store-error markers, document `output_blocked: true` during `quarantine_ambiguous` + latest-expiration `expired_unsent_at` semantics, and accurately describe bounded `<=10`-item qualification rechecks plus `O(n)` in-memory setup/outbox/snapshot bookkeeping on the event loop.
+
+Verification on the repaired candidate: complete local gates (`44` Node, `130` stdlib `-W error` HA with zero asyncio slow-callback warnings, `7` skill, `21` Chromium Playwright, `13` real HA = `215` total), Ruff lint/format, deterministic packaging (`9ef4d967...` extension ZIP, `7b1751b5...` HA ZIP), live anonymous smoke (`2026-11-18T16:02:18.203Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117`, refresh clean-HEAD logs, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 twenty-sixth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `4ea74ca` (`run_id`: `20261118T031956Z-d2125a`, 312.2s standards and 316.6s specification) reported **0 Critical, 0 High, and 0 Medium findings**, with zero live-gate/routing/privacy/persistence-compat/CAP-cancellation/bounds/overflow/ack/packaging/catalog/index defects, leaving 6 unique findings (`SIT-R1`/`SPEC-HA-02` Low, `SPEC-HA-01` Low, `SIT-R2` Nit, `SIT-R3` Nit, `SPEC-ROOM-01` Nit, `SPEC-HA-03` Nit).
