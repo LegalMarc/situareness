@@ -461,6 +461,39 @@ def _count_deliverable(outbox, records, candidate_events, config, health_now):
     )
 
 
+def _strip_withheld_actions(records, plans, groups, now):
+    withheld_keys = {(groups.get(plan["id"]), plan["fingerprint"]) for plan in plans}
+    now_iso = now.isoformat()
+    for eid, record in records.items():
+        if record.get("updated") == now_iso:
+            rec_actions = record.get("actions")
+            if isinstance(rec_actions, dict):
+                for fp in list(rec_actions):
+                    if (groups.get(eid), fp) in withheld_keys:
+                        rec_actions.pop(fp, None)
+
+
+def _select_deliverable_batch(
+    outbox,
+    records,
+    config,
+    now,
+    max_attempts,
+    exclude_keys=(),
+    candidate_events=(),
+):
+    excluded = set(exclude_keys)
+    deliverable_items = [
+        x
+        for x in outbox
+        if x["key"] not in excluded and pending_valid(x, records, config, now)
+    ]
+    deliverable_items.sort(key=lambda x: x.get("attempts", 0) > 0)
+    batch = deliverable_items[:max_attempts]
+    by_id = {event["id"]: event for event in candidate_events}
+    return batch, by_id
+
+
 def _has_corrupt_store_backup(storage_dir, prefix):
     directory = Path(storage_dir)
     if not directory.is_dir():
@@ -808,7 +841,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             else None
         )
         if self.expired_unsent > 0 and (
-            exp_at_ts is None or exp_at_ts <= ack_ts <= current_now
+            exp_at_ts is not None and exp_at_ts <= ack_ts <= current_now
         ):
             self.expired_unsent = 0
             self.expired_unsent_at = None
@@ -1347,19 +1380,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self.degraded_reason = reason
         self.degraded_until = new_until.isoformat()
 
-    @staticmethod
-    def _strip_withheld_actions(records, plans, groups, now):
-        withheld_keys = {
-            (groups.get(plan["id"]), plan["fingerprint"]) for plan in plans
-        }
-        now_iso = now.isoformat()
-        for eid, record in records.items():
-            if record.get("updated") == now_iso:
-                rec_actions = record.get("actions")
-                if isinstance(rec_actions, dict):
-                    for fp in list(rec_actions):
-                        if (groups.get(eid), fp) in withheld_keys:
-                            rec_actions.pop(fp, None)
+    _strip_withheld_actions = staticmethod(_strip_withheld_actions)
 
     async def _persist_degraded_poll(
         self,
@@ -1376,7 +1397,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         expired_unsent=0,
         expired_outcomes=(),
     ):
-        self._strip_withheld_actions(records, plans, groups, now)
+        await self.hass.async_add_executor_job(
+            _strip_withheld_actions, records, plans, groups, now
+        )
         self.last_degraded_poll = now.isoformat()
         self._update_expired_unsent(expired_unsent, now)
         try:
@@ -1448,7 +1471,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
         already_delivered = False
         if pre_drain_records is not None:
-            self._strip_withheld_actions(records, plans, groups, now)
+            await self.hass.async_add_executor_job(
+                _strip_withheld_actions, records, plans, groups, now
+            )
             self._update_expired_unsent(extra_expired, now)
             await self._save(
                 records, outbox, list(self.outcomes) + list(extra_outcomes)
@@ -1532,16 +1557,16 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             return attempts, failures, expired_unsent
         # Expired items and each completed 10-target delivery group are coalesced into one save;
         # a crash between service call and save may duplicate that group.
-        excluded = set(exclude_keys)
-        deliverable_items = [
-            x
-            for x in self.outbox
-            if x["key"] not in excluded
-            and pending_valid(x, self.records, self.config, now)
-        ]
-        deliverable_items.sort(key=lambda x: x.get("attempts", 0) > 0)
-        batch = deliverable_items[:max_attempts]
-        by_id = {event["id"]: event for event in candidate_events}
+        batch, by_id = await self.hass.async_add_executor_job(
+            _select_deliverable_batch,
+            self.outbox,
+            self.records,
+            self.config,
+            now,
+            max_attempts,
+            exclude_keys,
+            candidate_events,
+        )
         if deadline is None:
             deadline = now + timedelta(seconds=30)
         for offset in range(0, len(batch), 10):
@@ -1916,7 +1941,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self._latch_degraded("outbox_overflow", now, now + MAX_AGE)
                 self._ack_cleared_on_load = False
                 self._ack_cleared_reason = None
-                self._strip_withheld_actions(records, dropped_plans, groups, now)
+                await self.hass.async_add_executor_job(
+                    _strip_withheld_actions, records, dropped_plans, groups, now
+                )
                 self.last_degraded_poll = None
                 outcomes_to_save = (
                     list(self.outcomes)

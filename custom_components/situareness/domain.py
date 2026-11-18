@@ -1033,16 +1033,35 @@ def _quarantined_record(
 
 
 def _bound_records(
-    records, graph_events, groups, seen, planned_in_poll, now, plans=None
+    records,
+    graph_events,
+    groups,
+    seen,
+    planned_in_poll,
+    now,
+    plans=None,
+    quarantine_all=False,
 ):
     """Enforce the 1,000-record cap, raising overflow if protected history exceeds it."""
 
     def _is_actionable_record(record):
         state = record.get("state")
-        if state in ("active", "quarantined", "unconfirmed", "cancelled"):
+        if state in ("active", "cancelled"):
             return True
         if record.get("cancel_message") or record.get("uncertain_targets"):
             return True
+        if state in ("quarantined", "unconfirmed"):
+            if record.get("prior_state") == "active":
+                return True
+            if action_history(record):
+                since = timestamp(record.get("inactive_since") or record.get("updated"))
+                if (
+                    since is not None
+                    and since <= now
+                    and now - since <= timedelta(minutes=15)
+                ):
+                    return True
+            return not quarantine_all and state == "quarantined"
         if state in ("ineligible", "ended_or_absent") and action_history(record):
             since = timestamp(record.get("inactive_since") or record.get("updated"))
             return (
@@ -1079,6 +1098,7 @@ def _bound_records(
         return (
             eid in protected,
             _is_actionable_record(rec),
+            rec.get("state") in ("quarantined", "unconfirmed"),
             eid in seen,
             eid in current_graph_ids,
             bool(rec.get("cancel_message")),
@@ -1655,6 +1675,13 @@ def reconcile(
                 state="ended_or_absent", inactive_since=since, updated=now.isoformat()
             )
     records = _bound_records(
-        records, graph_events, groups, seen, planned_in_poll, now, plans=plans
+        records,
+        graph_events,
+        groups,
+        seen,
+        planned_in_poll,
+        now,
+        plans=plans,
+        quarantine_all=quarantine_all,
     )
     return records, plans

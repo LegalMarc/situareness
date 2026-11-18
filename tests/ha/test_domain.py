@@ -2014,6 +2014,45 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "NWS pagination limit reached"):
             await collector.fetch(session_51, ["NY"])
 
+    async def test_pagination_enforces_total_fetch_timeout(self):
+        import asyncio
+        import json
+        from unittest.mock import patch
+
+        class SlowPageSession:
+            def __init__(self):
+                self.urls = []
+
+            def get(self, url, **kwargs):
+                page = len(self.urls) + 1
+                self.urls.append(url)
+                ev = feature()
+                cap_id = f"urn:oid:slow-{page:02d}"
+                ev["id"] = f"https://api.weather.gov/alerts/{cap_id}"
+                ev["properties"] = {**ev["properties"], "id": cap_id}
+                body = {
+                    "type": "FeatureCollection",
+                    "features": [ev],
+                    "pagination": {
+                        "next": f"https://api.weather.gov/alerts?page={page + 1}"
+                    },
+                }
+                resp = Response(json.dumps(body).encode())
+
+                class SlowContext:
+                    async def __aenter__(self_ctx):
+                        await asyncio.sleep(0.03)
+                        return resp
+
+                    async def __aexit__(self_ctx, *args):
+                        pass
+
+                return SlowContext()
+
+        with patch.object(collector, "MAX_FETCH_SECONDS", 0.05):
+            with self.assertRaises(TimeoutError):
+                await collector.fetch(SlowPageSession(), ["NY"])
+
     def test_out_of_range_timestamps_and_horizon_overflow_resilience(self):
         self.assertIsNone(d.timestamp("9999-12-31T23:59:59Z"))
         self.assertIsNone(d.timestamp("0001-01-01T00:00:00Z"))
@@ -2422,6 +2461,80 @@ class Collector(unittest.IsolatedAsyncioTestCase):
                 for i in range(50)
             )
         )
+
+    def test_quarantine_all_over_1000_ineligible_truncates_without_overflow_while_protecting_actionable(
+        self,
+    ):
+        cfg = config()
+        ineligible_burst = []
+        for i in range(1005):
+            ev = cap_event(f"qall-{i}", -1, message_type="Alert")
+            ev["instruction"] = "Stay tuned for routine updates."
+            ineligible_burst.append(ev)
+
+        prior = {
+            "https://api.weather.gov/alerts/qall-prior-active": {
+                "state": "unconfirmed",
+                "prior_state": "active",
+                "fingerprint": "fp-prior-act",
+                "actions": {"fp-prior-act": ["new_york_ny"]},
+                "lineage": ["https://api.weather.gov/alerts/qall-prior-active"],
+                "cap_identity": ["nws@example.test", "qall-prior-act", NOW.isoformat()],
+                "cap_references": [],
+                "sent": (NOW - timedelta(minutes=30)).isoformat(),
+                "expires": (NOW + timedelta(hours=1)).isoformat(),
+                "ends": (NOW + timedelta(hours=1)).isoformat(),
+                "updated": (NOW - timedelta(minutes=30)).isoformat(),
+            },
+            "https://api.weather.gov/alerts/qall-bridge": {
+                "state": "quarantined",
+                "prior_state": None,
+                "fingerprint": "fp-bridge",
+                "actions": {"fp-bridge": ["new_york_ny"]},
+                "lineage": ["https://api.weather.gov/alerts/qall-bridge"],
+                "cap_identity": ["nws@example.test", "qall-bridge", NOW.isoformat()],
+                "cap_references": [],
+                "sent": (NOW - timedelta(minutes=5)).isoformat(),
+                "expires": (NOW + timedelta(hours=1)).isoformat(),
+                "ends": (NOW + timedelta(hours=1)).isoformat(),
+                "inactive_since": (NOW - timedelta(minutes=5)).isoformat(),
+                "updated": (NOW - timedelta(minutes=5)).isoformat(),
+            },
+        }
+        records_qall, plans_qall = d.reconcile(
+            prior,
+            ineligible_burst,
+            cfg,
+            NOW,
+            quarantine_all=True,
+        )
+        self.assertEqual(len(records_qall), 1000)
+        self.assertEqual(plans_qall, [])
+        self.assertIn("https://api.weather.gov/alerts/qall-prior-active", records_qall)
+        self.assertIn("https://api.weather.gov/alerts/qall-bridge", records_qall)
+
+        # Normal poll (quarantine_all=False) still protects scoped state == "quarantined".
+        scoped_prior = {
+            "https://api.weather.gov/alerts/scoped-q": {
+                "state": "quarantined",
+                "prior_state": None,
+                "lineage": ["https://api.weather.gov/alerts/scoped-q"],
+                "cap_identity": None,
+                "cap_references": None,
+                "updated": (NOW - timedelta(hours=2)).isoformat(),
+            }
+        }
+        records_scoped, _ = d.reconcile(
+            scoped_prior,
+            ineligible_burst[:1000],
+            cfg,
+            NOW,
+            partial=True,
+            quarantine_lineages=[["https://api.weather.gov/alerts/scoped-q"]],
+            quarantine_all=False,
+        )
+        self.assertEqual(len(records_scoped), 1000)
+        self.assertIn("https://api.weather.gov/alerts/scoped-q", records_scoped)
 
 
 if __name__ == "__main__":
