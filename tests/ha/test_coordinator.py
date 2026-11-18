@@ -6342,7 +6342,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         for bad_payload in (
             {"records": {}, "expired_unsent_reasons": ["unknown"]},
             {"records": {}, "expired_unsent_reasons": "age"},
-            {"records": {}, "expired_unsent_reasons": ["age"] * 5},
+            {"records": {}, "expired_unsent_reasons": ["age"] * 6},
             {"records": {}, "outcomes": [{"key": "k", "reason": "bad_reason"}]},
         ):
             self.assertFalse(mod._valid_persisted_store(bad_payload))
@@ -7939,3 +7939,134 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0]["created"], "2026-06-01T15:55:00+00:00")
         self.assertEqual(merged[0]["attempts"], 2)
+
+        # SIT-M1: cancelled incident outbox item emits {"expired": True, "reason": "cancelled"} outcome & count.
+        can_records = {
+            "https://api.weather.gov/alerts/a1": {
+                "state": "cancelled",
+                "fingerprint": "fp1",
+                "lineage": ["https://api.weather.gov/alerts/a1"],
+                "actions": {"fp1": ["new_york_ny"]},
+                "updated": "2026-06-01T15:56:00+00:00",
+            }
+        }
+        _, kept_can, exp_can_count, exp_can_outcomes = mod._migrate_outbox_with_index(
+            [item_utc], can_records, [], now_dt, live_cfg
+        )
+        self.assertEqual(kept_can, [])
+        self.assertEqual(exp_can_count, 1)
+        self.assertEqual(len(exp_can_outcomes), 1)
+        self.assertTrue(exp_can_outcomes[0]["expired"])
+        self.assertEqual(exp_can_outcomes[0]["reason"], "cancelled")
+
+        # SIT-R03: non-degraded _stopped_health reports persisted cancellation_uncertain & quarantined_count.
+        coord_unc = mod.SituarenessCoordinator(
+            hass_r30,
+            live_cfg,
+            Store(),
+            {
+                "initialized": True,
+                "records": {
+                    "https://api.weather.gov/alerts/u1": {
+                        "state": "quarantined",
+                        "reasons": ["cancellation scope uncertain"],
+                        "updated": deg_at,
+                    }
+                },
+            },
+        )
+        stopped_unc = coord_unc._stopped_health()
+        self.assertTrue(stopped_unc["cancellation_uncertain"])
+        self.assertEqual(stopped_unc["quarantined_count"], 1)
+        self.assertTrue(stopped_unc["partial"])
+
+        # SIT-R02: _queue_outbox_plans continues first-fit for smaller later plans after a larger plan overflows.
+        existing_outbox = [
+            {
+                "key": f"existing-{i}",
+                "incident_id": "https://api.weather.gov/alerts/e0",
+                "fingerprint": f"fp-e-{i}",
+                "kind": "phone",
+                "target": cfg["phones"][0],
+                "location": None,
+                "source_url": "https://api.weather.gov/alerts/e0",
+                "created": now_real.isoformat(),
+                "attempts": 0,
+                "instruction": "Take shelter",
+                "affected_names": ["New York"],
+            }
+            for i in range(4998)
+        ]
+        p_big = {
+            "id": "https://api.weather.gov/alerts/big",
+            "fingerprint": "fp-big",
+            "event": "Tornado Warning",
+            "instruction": "Take shelter",
+            "affected": ["new_york_ny"],
+            "phones": ["p1", "p2", "p3"],
+        }
+        p_small = {
+            "id": "https://api.weather.gov/alerts/small",
+            "fingerprint": "fp-small",
+            "event": "Tornado Warning",
+            "instruction": "Take shelter",
+            "affected": ["new_york_ny"],
+            "phones": ["p1", "p2"],
+        }
+        planned_items = [
+            (
+                p_big,
+                [
+                    (
+                        {
+                            "key": f"big-{j}",
+                            "incident_id": p_big["id"],
+                            "fingerprint": "fp-big",
+                            "kind": "phone",
+                            "target": f"p{j}",
+                            "location": None,
+                            "source_url": p_big["id"],
+                            "created": now_real.isoformat(),
+                            "attempts": 0,
+                            "instruction": "Take shelter",
+                            "affected_names": ["New York"],
+                        },
+                        ("g1", "fp-big", "phone", f"p{j}", None),
+                    )
+                    for j in range(3)
+                ],
+            ),
+            (
+                p_small,
+                [
+                    (
+                        {
+                            "key": f"small-{j}",
+                            "incident_id": p_small["id"],
+                            "fingerprint": "fp-small",
+                            "kind": "phone",
+                            "target": f"p{j}",
+                            "location": None,
+                            "source_url": p_small["id"],
+                            "created": now_real.isoformat(),
+                            "attempts": 0,
+                            "instruction": "Take shelter",
+                            "affected_names": ["New York"],
+                        },
+                        ("g2", "fp-small", "phone", f"p{j}", None),
+                    )
+                    for j in range(2)
+                ],
+            ),
+        ]
+        with patch.object(
+            mod,
+            "_build_planned_items",
+            return_value=(set(), planned_items, 5003, {}),
+        ):
+            out_q, ov_q, drop_q, _, _, _, _ = await coord_unc._queue_outbox_plans(
+                {}, [p_big, p_small], existing_outbox, [], {}, now_real
+            )
+        self.assertTrue(ov_q)
+        self.assertEqual(len(out_q), 5000)
+        self.assertEqual(drop_q, [p_big])

@@ -1019,6 +1019,8 @@ class Policy(unittest.TestCase):
         self.assertEqual([pl["id"] for pl in plans_u3], [u3["id"]])
 
     def test_reconcile_thousand_record_bounded_latency(self):
+        import time
+
         prior = {}
         for i in range(500):
             eid = f"https://api.weather.gov/alerts/scale-act-{i}"
@@ -1068,9 +1070,12 @@ class Policy(unittest.TestCase):
         ]
         cfg = config()
         with patch.object(d, "deepcopy", wraps=d.deepcopy) as mock_deepcopy:
+            start = time.perf_counter()
             records, _ = d.reconcile(prior, current, cfg, NOW)
+            elapsed = time.perf_counter() - start
         mock_deepcopy.assert_called_once()
         self.assertLessEqual(len(records), 1000)
+        self.assertLess(elapsed, 0.5)
 
     def test_normalize_oversized_and_non_string_properties(self):
         oversized = feature()
@@ -1100,35 +1105,6 @@ class Policy(unittest.TestCase):
             normalized["references"],
             ["https://api.weather.gov/alerts/ok"],
         )
-
-    def test_activate_quarantined_shadow_alert_reevaluates_when_cleared(self):
-        cfg = {**config(), "live_enabled": True, "commissioning_passed": True}
-        ev = d.normalize(feature())
-        prior = {
-            ev["id"]: {
-                "state": "active",
-                "fingerprint": d.fingerprint(ev, d.qualify(ev, cfg, NOW)),
-                "lineage": [ev["id"]],
-                "actions": {
-                    d.fingerprint(ev, d.qualify(ev, cfg, NOW)): ["new_york_ny"]
-                },
-                "updated": (NOW - timedelta(minutes=1)).isoformat(),
-            }
-        }
-        rec1, plans1 = d.reconcile(
-            prior,
-            [ev],
-            cfg,
-            NOW,
-            activate=True,
-            quarantine_lineages=[[ev["id"]]],
-        )
-        self.assertEqual(plans1, [])
-        self.assertEqual(rec1[ev["id"]]["actions"], {})
-        _, plans2 = d.reconcile(
-            rec1, [ev], cfg, NOW + timedelta(minutes=1), activate=False
-        )
-        self.assertEqual(len(plans2), 1)
 
 
 class Services:

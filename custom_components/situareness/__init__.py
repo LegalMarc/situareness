@@ -20,6 +20,7 @@ from .config import validate
 from .const import DOMAIN
 from .delivery import (
     MAX_AGE,
+    MAX_ATTEMPTS,
     deliver_one,
     expired_by_age,
     expiry_reason,
@@ -58,7 +59,13 @@ VALID_RECORD_STATES = {
     "superseded",
     "cancelled",
 }
-VALID_EXPIRY_REASONS = ("age", "clock_rollback", "target_removed", "exhausted")
+VALID_EXPIRY_REASONS = (
+    "age",
+    "clock_rollback",
+    "target_removed",
+    "exhausted",
+    "cancelled",
+)
 _EVIDENCE_REASON_RANK = {
     "conflicting_cancellation": 4,
     "malformed_cancellation": 3,
@@ -386,11 +393,16 @@ def _migrate_outbox_with_index(
         ids.sort(key=lambda eid: (records[eid]["state"] != "active", eid))
     check_time = now - degraded_delta if degraded_delta is not None else now
     candidates = []
+    cancelled_unique = {}
     for item in outbox:
         if not isinstance(item, dict):
             continue
         incident = item.get("incident_id")
         if records.get(incident, {}).get("state") == "cancelled":
+            key = _outbox_signature(groups, item, records)
+            prior_can = cancelled_unique.get(key)
+            if prior_can is None or item["attempts"] > prior_can["attempts"]:
+                cancelled_unique[key] = item
             continue
         successors = event_index.get(
             (groups.get(incident), item.get("fingerprint")), []
@@ -451,6 +463,11 @@ def _migrate_outbox_with_index(
         else:
             unique[key] = item
     expired_items = [item for key, item in expired_unique.items() if key not in unique]
+    cancelled_items = [
+        item
+        for key, item in cancelled_unique.items()
+        if key not in unique and key not in expired_unique
+    ]
     expired_outcomes = [
         {
             "key": x["key"],
@@ -461,8 +478,23 @@ def _migrate_outbox_with_index(
             "at": now.isoformat(),
         }
         for x in expired_items
+    ] + [
+        {
+            "key": x["key"],
+            "accepted": False,
+            "expired": True,
+            "reason": "cancelled",
+            "attempt": x["attempts"],
+            "at": now.isoformat(),
+        }
+        for x in cancelled_items
     ]
-    return groups, list(unique.values()), len(expired_items), expired_outcomes
+    return (
+        groups,
+        list(unique.values()),
+        len(expired_items) + len(cancelled_items),
+        expired_outcomes,
+    )
 
 
 def _build_planned_items(
@@ -1255,16 +1287,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             expired_unsent = self.expired_unsent
         expired_count = int(expired_unsent or 0)
         reasons = tuple(self.expired_unsent_reasons) if expired_count > 0 else ()
+        max_age_mins = int(MAX_AGE.total_seconds() // 60)
         cause_labels = {
-            "age": "aged past the 15-minute delivery window",
+            "age": f"aged past the {max_age_mins}-minute delivery window",
             "clock_rollback": "invalidated by backward clock rollback (created > now)",
             "target_removed": "dropped after target removal from situareness.json",
-            "exhausted": "exhausted all 3 delivery attempts (MAX_ATTEMPTS = 3)",
+            "exhausted": f"exhausted all {MAX_ATTEMPTS} delivery attempts (MAX_ATTEMPTS = {MAX_ATTEMPTS})",
+            "cancelled": "cancelled by source before delivery completed",
         }
         cause_text = "; ".join(cause_labels[r] for r in reasons) if reasons else ""
         if expired_count > 0:
             if not reasons or reasons == ("age",):
-                expired_note = f" {expired_count} queued target(s) expired unsent past the 15-minute delivery window."
+                expired_note = f" {expired_count} queued target(s) expired unsent past the {max_age_mins}-minute delivery window."
             else:
                 expired_note = (
                     f" {expired_count} queued target(s) expired unsent ({cause_text})."
@@ -1291,37 +1325,28 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
                 if self.degraded_reason == "outbox_overflow":
                     title = "Situareness delivery outbox full"
-                    if is_live:
-                        message = (
-                            "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld "
-                            "while bounded delivery attempts up to 100 queued targets per poll (30s deadline, 15-minute MAX_AGE), "
-                            "so queued targets (including first attempts) beyond ~1,500 attempts per 15-minute window "
-                            "(or fewer under slow timeouts) can expire unsent (expired_unsent)."
-                            + expired_note
-                            + " "
-                            + rej_note
-                            + "This clears automatically on any poll where current plans fit within the 5,000-target limit; "
-                            "one-shot acknowledge_degraded_at in situareness.json "
-                            "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
-                            "only once outbox overflow has cleared (otherwise the next poll re-latches with a new degraded_at). "
-                            "Continue using independent official alert channels."
-                        )
-                    else:
-                        message = (
+                    lead = (
+                        "Situareness outbox reached the 5,000-target limit; overflowing alert plans are withheld while "
+                        if is_live
+                        else (
                             "Situareness monitoring is degraded in shadow mode (live output disabled): "
-                            "the outbox reached the 5,000-target limit and overflowing alert plans are withheld. "
-                            "When live output is enabled, bounded delivery attempts up to 100 queued targets per poll "
-                            "(30s deadline, 15-minute MAX_AGE), so queued targets (including first attempts) beyond ~1,500 attempts "
-                            "per 15-minute window (or fewer under slow timeouts) can expire unsent (expired_unsent)."
-                            + expired_note
-                            + " "
-                            + rej_note
-                            + "This clears automatically on any poll where current plans fit within the 5,000-target limit; "
-                            "one-shot acknowledge_degraded_at in situareness.json "
-                            "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
-                            "only once outbox overflow has cleared (otherwise the next poll re-latches with a new degraded_at). "
-                            "Continue using independent official alert channels."
+                            "the outbox reached the 5,000-target limit and overflowing alert plans are withheld. When live output is enabled, "
                         )
+                    )
+                    message = (
+                        lead
+                        + f"bounded delivery attempts up to 100 queued targets per poll (30s deadline, {max_age_mins}-minute MAX_AGE), "
+                        + f"so queued targets (including first attempts) beyond ~1,500 attempts per {max_age_mins}-minute window "
+                        + "(or fewer under slow timeouts) can expire unsent (expired_unsent)."
+                        + expired_note
+                        + " "
+                        + rej_note
+                        + "This clears automatically on any poll where current plans fit within the 5,000-target limit; "
+                        "one-shot acknowledge_degraded_at in situareness.json "
+                        "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                        "only once outbox overflow has cleared (otherwise the next poll re-latches with a new degraded_at). "
+                        "Continue using independent official alert channels."
+                    )
                 else:
                     title = "Situareness monitoring degraded"
                     prefix = (
@@ -1590,7 +1615,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             or any(
                 r.get("state") == "quarantined"
                 and "cancellation scope uncertain" in r.get("reasons", [])
-                for r in (records or {}).values()
+                for r in record_map.values()
             )
         )
         is_outbox_overflow = self.degraded_reason == "outbox_overflow"
@@ -1658,15 +1683,26 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         """Expose a redacted non-degraded snapshot when stopped before first poll."""
         if self.degraded:
             return self._degraded_health(deliverable=0)
+        record_map = self.records or {}
+        quarantined_recs = [
+            r
+            for r in record_map.values()
+            if isinstance(r, dict) and r.get("state") == "quarantined"
+        ]
+        quarantined_count = len(quarantined_recs)
+        cancellation_uncertain = any(
+            "cancellation scope uncertain" in (r.get("reasons") or ())
+            for r in quarantined_recs
+        )
         return {
             "last_success": None,
             "event_count": 0,
             "source_feature_count": 0,
             "active_count": None,
-            "partial": bool(self.expired_unsent),
-            "quarantined_count": 0,
+            "partial": bool(self.expired_unsent or quarantined_count),
+            "quarantined_count": quarantined_count,
             "quarantine_ambiguous": False,
-            "cancellation_uncertain": False,
+            "cancellation_uncertain": cancellation_uncertain,
             "evidence_degraded": False,
             "output_blocked": False,
             "degraded_reason": None,
@@ -1869,7 +1905,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         for plan, new_items in planned_items:
             if not new_items:
                 continue
-            if not outbox_overflow and len(outbox) + len(new_items) <= 5000:
+            if len(outbox) + len(new_items) <= 5000:
                 for item, sig in new_items:
                     outbox.append(item)
                     existing.add(sig)

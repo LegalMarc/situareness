@@ -2,6 +2,18 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 thirty-first Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `aab5fb1` (`run_id`: `20261118T182230Z-b16dc5`, 381.8s standards and 297.0s specification) reported **0 Critical and 0 High findings**, leaving 6 unique findings (`SIT-M1` Medium, `SIT-R01` Medium contract availability note, `SIT-R02` Low, `SIT-R03` Low, `SIT-N1` Low, `SIT-R04` Nit).
+
+All 6 findings were resolved cleanly in Round 31 (`custom_components/situareness/__init__.py`, `docs/spec/o3-mvp.md`, `docs/CONTEXT.md`, `docs/ha/README.md`, `home-assistant/README.md`, and `tests/ha/test_coordinator.py`):
+- **`SIT-M1`**: Added `"cancelled"` to `VALID_EXPIRY_REASONS` and `_sync_degraded_notification()` `cause_labels`, and emitted `{"expired": True, "reason": "cancelled"}` outcomes + `expired_unsent` count increments when `_migrate_outbox_with_index()` drops pending outbox items whose incident transitioned to `"cancelled"`, with unit test coverage.
+- **`SIT-R01`**: Documented in `docs/spec/o3-mvp.md` (§Bounded storage) that protecting all cancellation components across up to 10 configured states is an intentional fail-closed CAP-evidence trade-off rather than evicting cancellation tombstones.
+- **`SIT-R02` & `SIT-R03`**: Switched `_queue_outbox_plans()` to continue first-fit queueing for smaller non-empty plans after a larger plan overflows (`o3-mvp.md#home-assistant`), fixed `_degraded_health()` to scan `record_map`, and updated non-degraded `_stopped_health()` to surface persisted `quarantined_count`, `cancellation_uncertain`, and `partial`, with unit tests for both.
+- **`SIT-N1` & `SIT-R04`**: Factored the shared live/shadow `outbox_overflow` notification builder and interpolated `MAX_AGE`/`MAX_ATTEMPTS` constants in `_sync_degraded_notification()`, consolidated repeated bounds prose in `docs/ha/README.md` and `home-assistant/README.md` to link to `docs/spec/o3-mvp.md#home-assistant`, and clarified `outbox_overflow` pre-drain service-call persistence in `docs/CONTEXT.md`.
+
+Verification on the repaired candidate: `ruff check`/`ruff format --check` (12 files), `44` Node, `134` stdlib `-W error` HA, `7` skill, `22` Chromium Playwright, and `13` real HA = `220` total tests, deterministic packaging (`9d54a200...` extension ZIP, `065d3c81...` HA ZIP), live anonymous smoke (`2026-11-18T18:33:43.120Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: run full clean `run_gates.py`, commit/push to `wip/supervisor-handoff-20261117`, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 thirtieth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `30e7149` (`run_id`: `20261118T180246Z-dd8694`, 216.4s standards) reported **0 Critical findings**, 0 Specification findings above Low, and 6 unique findings (`F1` High, `F2`/`SIT-01`/`SIT-02` Low, `F3`/`SIT-03` Nit).
