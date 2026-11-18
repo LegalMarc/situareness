@@ -1036,6 +1036,22 @@ def _bound_records(
     records, graph_events, groups, seen, planned_in_poll, now, plans=None
 ):
     """Enforce the 1,000-record cap, raising overflow if protected history exceeds it."""
+
+    def _is_actionable_record(record):
+        state = record.get("state")
+        if state in ("active", "quarantined", "unconfirmed", "cancelled"):
+            return True
+        if record.get("cancel_message") or record.get("uncertain_targets"):
+            return True
+        if state in ("ineligible", "ended_or_absent") and action_history(record):
+            since = timestamp(record.get("inactive_since") or record.get("updated"))
+            return (
+                since is not None
+                and since <= now
+                and now - since <= timedelta(minutes=15)
+            )
+        return False
+
     cancellation_groups = {
         groups.get(eid)
         for eid, record in records.items()
@@ -1044,33 +1060,31 @@ def _bound_records(
     actionable_groups = {
         groups.get(eid)
         for eid, record in records.items()
-        if record.get("state") in ("active", "quarantined", "unconfirmed", "cancelled")
-        or record.get("cancel_message")
-        or record.get("actions")
-        or record.get("uncertain_targets")
+        if _is_actionable_record(record)
     }
     current_graph_ids = {event["id"] for event in graph_events}
     protected = {
         eid
         for eid, record in records.items()
         if groups.get(eid) in cancellation_groups
+        or _is_actionable_record(record)
         or (
             (eid in seen or eid in current_graph_ids)
-            and (
-                record.get("state") != "ineligible"
-                or groups.get(eid) in actionable_groups
-            )
+            and groups.get(eid) in actionable_groups
         )
     }
 
     def sort_key(item):
+        eid, rec = item
         return (
-            item[0] in protected,
-            item[0] in seen,
-            item[0] in current_graph_ids,
-            bool(item[1].get("cancel_message")),
-            item[1].get("state") == "cancelled",
-            item[1].get("updated", ""),
+            eid in protected,
+            _is_actionable_record(rec),
+            eid in seen,
+            eid in current_graph_ids,
+            bool(rec.get("cancel_message")),
+            rec.get("state") == "cancelled",
+            bool(action_history(rec)),
+            rec.get("updated", ""),
         )
 
     if len(protected) > 1000:

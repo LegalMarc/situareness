@@ -2,6 +2,19 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 twenty-first Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `e13efc8` (`run_id`: `20261118T011756Z-942760`, 335.6s standards and 324.1s specification) reported **0 Critical findings** and zero live-gate/routing/privacy/CAP-quarantine/outbox-overflow/async-offload/room/packaging defects, leaving 9 unique findings (`HA-BOUND-01` Medium, `SPEC-HA-01` Medium, `HA-BOUND-02` Low, `HA-NOTE-01`/`SPEC-HA-02` Low, `SPEC-HA-03` Low, `HA-OUT-01` Low, `DOC-HA-01` Low, `HA-STORE-01` Low, `HA-JL-01` Nit).
+
+All 9 findings were repaired via `ha-repair` (`775aa2e8`) plus supervisor review/refinements and contract/README/report updates:
+- **`HA-BOUND-01` & `HA-BOUND-02`**: Extracted `_is_actionable_record()` in `domain.py` `_bound_records()` so absent `quarantined`/`unconfirmed`/15m-bridge `ended_or_absent` (`actions`) records stay protected ahead of `ineligible` bursts, while excluding non-actionable hidden `superseded` placeholders outside actionable/cancellation groups (and preventing >15m `superseded` history from lingering in `protected`).
+- **`SPEC-HA-01`**: Removed the raw 1,000-feature abort in `collector.py` (`fetch()`) while preserving `feature_count` (`source_count`), `MAX_PAGES`, `MAX_BYTES`, and `MAX_QUARANTINE_IDS` bounds and testing 1,005-feature collector bursts end-to-end through `_async_update_data()`.
+- **`HA-NOTE-01` / `SPEC-HA-02`**: Updated `_sync_degraded_notification()` rejected-ack text (standalone `expired_count > 0` and concurrent `quarantine_ambiguous`) to name premature (`< expired_unsent_at`), missing `expired_unsent_at`, and already-consumed causes plus `expired_unsent_at <= acknowledge_degraded_at <= reload time`.
+- **`SPEC-HA-03` & `HA-JL-01`**: Added `VALID_RECORD_STATES` schema validation in `_valid_persisted_store()`, rejected future `journal_lost_at > detect_now` with `MAX_TIMESTAMP` horizon clamping, extracted `_clear_degraded_state()`, and cleaned up unused `batch_expired` unpacking.
+- **`HA-OUT-01`, `HA-STORE-01`, & `DOC-HA-01`**: Expanded `delivery.expired_by_age()` to surface unexhausted active/suspended-active targets dropped on clock rollback (`created > now`) or target invalidation, armed `_needs_corrupt_cleanup` with warning logs until `.corrupt.*` unlink succeeds (entering `journal_lost` when an already-recovered entry loses its main store), and restored delivery-semantics disclosures across `docs/ha/README.md`, `docs/spec/o3-mvp.md`, and `home-assistant/README.md`.
+
+Verification on the repaired candidate: complete local gates (`43` Node, `105` stdlib `-W error` HA, `7` skill, `21` Chromium Playwright, `11` real HA = `187` total), Ruff lint/format, deterministic packaging (`823de6d0...` extension ZIP, `790df37b...` HA ZIP), live anonymous smoke (`2026-11-18T01:42:19.648Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117`, refresh clean-HEAD logs, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 twentieth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `698fe14` (`run_id`: `20261118T004922Z-f1724a`, 248.1s standards and 294.2s specification) reported **0 Critical findings** and zero live-gate/routing/privacy/CAP/quarantine/store/offload/room/packaging defects, leaving 5 unique items (`F1`/`HA-SNAP-01` High/Medium, `F2` Medium, `F3` Low, `HA-ACK-02` Low, `HA-DEG-03` Low).

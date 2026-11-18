@@ -4788,6 +4788,43 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(UpdateFailed):
                 await coord._async_update_data()
 
+        # End-to-end collector.fetch -> _async_update_data() with >1,000 distinct ineligible features.
+        import json
+        from test_domain import Response, Session
+
+        raw_features = []
+        for i in range(1005):
+            raw = feature()
+            cap_id = f"urn:oid:e2e-inelig-{i:04d}"
+            raw["id"] = f"https://api.weather.gov/alerts/{cap_id}"
+            raw["properties"] = {
+                **raw["properties"],
+                "id": cap_id,
+                "event": "Flood Watch",
+            }
+            for key, delta in [
+                ("sent", -60),
+                ("effective", -60),
+                ("onset", 0),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                raw["properties"][key] = (now + timedelta(seconds=delta)).isoformat()
+            raw_features.append(raw)
+        raw_payload = json.dumps(
+            {"type": "FeatureCollection", "features": raw_features}
+        ).encode()
+        e2e_cfg = {**cfg, "states": ["NY"]}
+        e2e_store = Store()
+        e2e_coord = mod.SituarenessCoordinator(hass, e2e_cfg, e2e_store, None)
+        e2e_coord.session = Session(Response(raw_payload))
+        e2e_health = await e2e_coord._async_update_data()
+        self.assertEqual(e2e_health["event_count"], 1005)
+        self.assertEqual(e2e_health["source_feature_count"], 1005)
+        self.assertEqual(e2e_health["active_count"], 0)
+        self.assertFalse(e2e_health["evidence_degraded"])
+        self.assertLessEqual(len(e2e_store.saved[-1]["records"]), 1000)
+
     async def test_expired_unsent_persisted_latch_notification_and_acknowledgement(
         self,
     ):
@@ -4997,8 +5034,18 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(coord_rej.acknowledge_rejected)
             self.assertEqual(coord_rej.expired_unsent, 2)
+            rej_msg = notifications["situareness_degraded"]["message"]
+            self.assertIn("2 queued target(s) expired unsent", rej_msg)
             self.assertIn(
-                "2 queued target(s) expired unsent",
+                "earlier than expired_unsent_at, missing expired_unsent_at, or already consumed",
+                rej_msg,
+            )
+            self.assertIn(
+                "expired_unsent_at <= acknowledge_degraded_at <= reload time", rej_msg
+            )
+            coord_rej._sync_degraded_notification(quarantine_ambiguous=True)
+            self.assertIn(
+                "earlier than expired_unsent_at, or already consumed",
                 notifications["situareness_degraded"]["message"],
             )
 
@@ -5298,3 +5345,340 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             h_short["degraded_until"], (now + timedelta(days=7)).isoformat()
         )
+
+    async def test_valid_persisted_store_rejects_missing_or_unknown_record_states(self):
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        for bad_record in (
+            {"updated": "2026-11-17T00:00:00+00:00"},
+            {"state": "unknown_state"},
+            {"state": 123},
+            {"state": "active", "prior_state": "bad_prior"},
+            {"state": "active", "prior_state": 42},
+        ):
+            self.assertFalse(
+                mod._valid_persisted_store({"records": {"id-1": bad_record}})
+            )
+
+        self.assertTrue(
+            mod._valid_persisted_store(
+                {
+                    "records": {
+                        "id-1": {
+                            "state": "active",
+                            "prior_state": None,
+                            "updated": "2026-11-17T00:00:00+00:00",
+                        },
+                        "id-2": {
+                            "state": "unconfirmed",
+                            "prior_state": "active",
+                        },
+                    }
+                }
+            )
+        )
+
+    async def test_expired_unsent_captures_clock_rollback_and_deconfigured_active_targets(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 17, 14, 0, tzinfo=timezone.utc)
+
+        class FixedClock:
+            @classmethod
+            def now(cls, tz):
+                return now
+
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_current"],
+            tts_entity=None,
+        )
+        ev = d.normalize(feature())
+        ev["id"] = "https://api.weather.gov/alerts/inv-active"
+        for key, delta in [
+            ("sent", -60),
+            ("effective", -60),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            ev[key] = (now + timedelta(seconds=delta)).isoformat()
+        ev = cohere(ev)
+        fp = d.fingerprint(ev, d.qualify(ev, cfg, now))
+
+        persisted = {
+            "records": {
+                ev["id"]: {
+                    "state": "active",
+                    "fingerprint": fp,
+                    "actions": {fp: ["new_york_ny"]},
+                    "lineage": [ev["id"]],
+                    "cap_identity": ev["cap_identity"],
+                    "cap_references": [],
+                    "sent": ev["sent"],
+                    "expires": ev["expires"],
+                    "ends": ev["ends"],
+                    "updated": now.isoformat(),
+                }
+            },
+            "outbox": [
+                {
+                    "key": "future-created-key",
+                    "incident_id": ev["id"],
+                    "fingerprint": fp,
+                    "kind": "phone",
+                    "target": "mobile_app_current",
+                    "location": None,
+                    "affected_names": ["New York"],
+                    "event": "Tornado Warning",
+                    "instruction": ev["instruction"],
+                    "source_url": ev["id"],
+                    "attempts": 0,
+                    "created": (now + timedelta(minutes=2)).isoformat(),
+                },
+                {
+                    "key": "removed-target-key",
+                    "incident_id": ev["id"],
+                    "fingerprint": fp,
+                    "kind": "phone",
+                    "target": "mobile_app_removed",
+                    "location": None,
+                    "affected_names": ["New York"],
+                    "event": "Tornado Warning",
+                    "instruction": ev["instruction"],
+                    "source_url": ev["id"],
+                    "attempts": 0,
+                    "created": (now - timedelta(minutes=1)).isoformat(),
+                },
+            ],
+            "initialized": True,
+            "was_live": True,
+        }
+        hass = types.SimpleNamespace(data={}, services=Services())
+        store = Store()
+        coord = mod.SituarenessCoordinator(hass, cfg, store, persisted)
+        with (
+            patch.object(mod, "datetime", FixedClock),
+            patch.object(mod, "fetch", return_value=[ev]),
+        ):
+            health = await coord._async_update_data()
+
+        self.assertEqual(health["expired_unsent"], 2)
+        self.assertTrue(health["partial"])
+        expired_keys = {
+            o["key"] for o in store.saved[-1]["outcomes"] if o.get("expired")
+        }
+        self.assertEqual(expired_keys, {"future-created-key", "removed-target-key"})
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness alert targets expired unsent",
+        )
+        self.assertIn(
+            "2 queued qualifying alert target(s)",
+            notifications["situareness_degraded"]["message"],
+        )
+
+    async def test_corrupt_backup_cleanup_retries_and_missing_store_enters_journal_lost(
+        self,
+    ):
+        import asyncio
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / ".storage"
+            storage_dir.mkdir()
+            prefix = f"{mod.DOMAIN}.entry-corrupt"
+            corrupt_path = storage_dir / f"{prefix}.corrupt.20261117"
+            corrupt_path.write_text("{broken", encoding="utf-8")
+
+            # unlink OSError logs warning and returns False so coordinator retries cleanup.
+            with (
+                patch.object(Path, "unlink", side_effect=OSError("permission denied")),
+                self.assertLogs(mod._LOGGER, level="WARNING") as cm,
+            ):
+                ok = mod._clear_corrupt_store_backups(storage_dir, prefix)
+            self.assertFalse(ok)
+            self.assertTrue(corrupt_path.exists())
+            self.assertIn("Could not remove corrupt store backup", cm.output[0])
+
+            async def run_exec(fn, *args):
+                return fn(*args)
+
+            entry = types.SimpleNamespace(
+                entry_id="entry-corrupt",
+                data={"journal_initialized": True},
+            )
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                async_add_executor_job=run_exec,
+                config_entries=types.SimpleNamespace(
+                    async_update_entry=lambda ent, data=None: setattr(
+                        ent, "data", data
+                    ),
+                    async_forward_entry_setups=lambda *a: asyncio.sleep(0),
+                ),
+            )
+            cfg = config()
+            store = Store()
+            coord = mod.SituarenessCoordinator(
+                hass, cfg, store, {}, entry=entry, has_corrupt_backup=True
+            )
+            self.assertTrue(coord._needs_corrupt_cleanup)
+            with patch.object(mod, "_clear_corrupt_store_backups", return_value=False):
+                await coord._save({}, [], [])
+            self.assertTrue(coord._needs_corrupt_cleanup)
+            await coord._save({}, [], [])
+            self.assertFalse(coord._needs_corrupt_cleanup)
+            self.assertFalse(corrupt_path.exists())
+
+            # Missing main store on already-recovered initialized entry + stale .corrupt.* backup
+            # enters journal_lost (not malformed_store) while keeping _needs_corrupt_cleanup=True.
+            stale_corrupt = storage_dir / f"{mod.DOMAIN}.recovered-lost.corrupt.1"
+            stale_corrupt.write_text("{stale", encoding="utf-8")
+            (Path(tmp) / "situareness.json").write_text("{}", encoding="utf-8")
+            recovered_entry = types.SimpleNamespace(
+                entry_id="recovered-lost",
+                data={"journal_initialized": True},
+            )
+
+            class NoneStore(Store):
+                async def async_load(self):
+                    return None
+
+            class CapturingCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    self.data = await self._update_once()
+
+            with (
+                patch.object(mod, "Store", NoneStore),
+                patch.object(mod, "SituarenessCoordinator", CapturingCoordinator),
+                patch.object(mod, "fetch", return_value=[]),
+            ):
+                await mod.async_setup_entry(hass, recovered_entry)
+            lost_coord = hass.data[mod.DOMAIN][recovered_entry.entry_id]
+            self.assertEqual(lost_coord.degraded_reason, "journal_lost")
+            self.assertFalse(stale_corrupt.exists())
+
+    async def test_journal_lost_at_future_reset_and_near_max_timestamp_clamped(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime(2026, 11, 17, 16, 0, tzinfo=timezone.utc)
+
+        class Clock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        Clock.current = now
+        cfg = config()
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+            ),
+        )
+        future_entry = types.SimpleNamespace(
+            entry_id="jl-future",
+            data={
+                "journal_initialized": True,
+                "journal_lost_at": (now + timedelta(days=2)).isoformat(),
+                "malformed_store_at": "2026-11-10T00:00:00+00:00",
+            },
+        )
+        with patch.object(mod, "datetime", Clock):
+            coord_future = mod.SituarenessCoordinator(
+                hass, cfg, Store(), None, entry=future_entry
+            )
+        self.assertEqual(coord_future.degraded_reason, "journal_lost")
+        self.assertEqual(coord_future.degraded_at, now.isoformat())
+        self.assertEqual(
+            coord_future.degraded_until, (now + timedelta(days=7)).isoformat()
+        )
+        self.assertEqual(future_entry.data["journal_lost_at"], now.isoformat())
+        self.assertNotIn("malformed_store_at", future_entry.data)
+
+        # Near MAX_TIMESTAMP detect_now clamps degraded_until to MAX_TIMESTAMP without OverflowError.
+        Clock.current = mod.MAX_TIMESTAMP - timedelta(days=2)
+        near_max_entry = types.SimpleNamespace(
+            entry_id="jl-max",
+            data={"journal_initialized": True},
+        )
+        with patch.object(mod, "datetime", Clock):
+            coord_max = mod.SituarenessCoordinator(
+                hass, cfg, Store(), None, entry=near_max_entry
+            )
+        self.assertEqual(coord_max.degraded_reason, "journal_lost")
+        self.assertEqual(coord_max.degraded_until, mod.MAX_TIMESTAMP.isoformat())

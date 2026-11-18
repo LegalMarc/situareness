@@ -1909,8 +1909,22 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(events.quarantine_ambiguous)
         self.assertLessEqual(len(events.quarantined_lineages[0]), 5001)
         body["features"] = [feature()] * 1001
-        with self.assertRaises(ValueError):
-            await collector.fetch(Session(Response(json.dumps(body).encode())), ["NY"])
+        events = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events.source_count, 1001)
+        distinct_features = []
+        for i in range(1005):
+            item = feature()
+            item["id"] = f"https://api.weather.gov/alerts/bulk-{i:04d}"
+            distinct_features.append(item)
+        body["features"] = distinct_features
+        distinct_events = await collector.fetch(
+            Session(Response(json.dumps(body).encode())), ["NY"]
+        )
+        self.assertEqual(len(distinct_events), 1005)
+        self.assertEqual(distinct_events.source_count, 1005)
 
     async def test_null_properties_with_valid_feature_id_quarantines_locally(self):
         import json
@@ -2252,6 +2266,131 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(e["id"] in records for e in active_events))
         kept_inelig = sum(1 for e in ineligible_events if e["id"] in records)
         self.assertEqual(kept_inelig, 895)
+
+    def test_absent_actionable_records_survive_ineligible_burst_without_replanning(
+        self,
+    ):
+        cfg = config()
+        bridge_ev = cap_event("bridge-act", -2, message_type="Alert")
+        bridge_fp = d.fingerprint(bridge_ev, d.qualify(bridge_ev, cfg, NOW))
+        unconf_id = "https://api.weather.gov/alerts/absent-unconf"
+        quar_id = "https://api.weather.gov/alerts/absent-quar"
+        prior = {
+            unconf_id: {
+                "state": "unconfirmed",
+                "prior_state": "active",
+                "fingerprint": "fp-unconf",
+                "actions": {"fp-unconf": ["new_york_ny"]},
+                "lineage": [unconf_id],
+                "cap_identity": ["nws@example.test", "absent-unconf", NOW.isoformat()],
+                "cap_references": [],
+                "sent": (NOW - timedelta(minutes=20)).isoformat(),
+                "expires": (NOW + timedelta(hours=1)).isoformat(),
+                "ends": (NOW + timedelta(hours=1)).isoformat(),
+                "updated": (NOW - timedelta(minutes=20)).isoformat(),
+            },
+            quar_id: {
+                "state": "quarantined",
+                "prior_state": "active",
+                "fingerprint": "fp-quar",
+                "actions": {"fp-quar": ["new_york_ny"]},
+                "lineage": [quar_id],
+                "cap_identity": ["nws@example.test", "absent-quar", NOW.isoformat()],
+                "cap_references": [],
+                "sent": (NOW - timedelta(minutes=20)).isoformat(),
+                "expires": (NOW + timedelta(hours=1)).isoformat(),
+                "ends": (NOW + timedelta(hours=1)).isoformat(),
+                "updated": (NOW - timedelta(minutes=20)).isoformat(),
+            },
+            bridge_ev["id"]: {
+                "state": "ended_or_absent",
+                "prior_state": "active",
+                "fingerprint": bridge_fp,
+                "actions": {bridge_fp: ["new_york_ny"]},
+                "lineage": [bridge_ev["id"]],
+                "cap_identity": bridge_ev["cap_identity"],
+                "cap_references": [],
+                "sent": bridge_ev["sent"],
+                "expires": bridge_ev["expires"],
+                "ends": bridge_ev["ends"],
+                "inactive_since": (NOW - timedelta(minutes=5)).isoformat(),
+                "updated": (NOW - timedelta(minutes=5)).isoformat(),
+            },
+        }
+        ineligible_burst = []
+        for i in range(1000):
+            ev = cap_event(f"abs-inelig-{i}", -1, message_type="Alert")
+            ev["instruction"] = "Stay tuned for routine updates."
+            ineligible_burst.append(ev)
+
+        records, plans = d.reconcile(prior, ineligible_burst, cfg, NOW)
+        self.assertEqual(len(records), 1000)
+        self.assertEqual(plans, [])
+        self.assertIn(unconf_id, records)
+        self.assertIn(quar_id, records)
+        self.assertIn(bridge_ev["id"], records)
+
+        # Returning bridge alert within 15 minutes does not re-plan duplicate alarm.
+        records_back, plans_back = d.reconcile(
+            records, [bridge_ev], cfg, NOW + timedelta(minutes=1)
+        )
+        self.assertEqual(records_back[bridge_ev["id"]]["state"], "active")
+        self.assertEqual(plans_back, [])
+
+    def test_superseded_placeholders_in_non_actionable_groups_truncate_without_overflow(
+        self,
+    ):
+        cfg = config()
+        prior = {}
+        ineligible_events = []
+        for i in range(500):
+            ev = cap_event(f"sup-inelig-{i}", -1, message_type="Alert")
+            ev["instruction"] = "Stay tuned for routine updates."
+            sup_id = f"https://api.weather.gov/alerts/sup-hidden-{i}"
+            lineage = sorted([sup_id, ev["id"]])
+            prior[sup_id] = {
+                "state": "superseded",
+                "lineage": lineage,
+                "cap_identity": [
+                    "nws@example.test",
+                    f"sup-hidden-{i}",
+                    NOW.isoformat(),
+                ],
+                "cap_references": [],
+                "sent": NOW.isoformat(),
+                "expires": NOW.isoformat(),
+                "ends": NOW.isoformat(),
+                "updated": (NOW - timedelta(hours=1)).isoformat(),
+            }
+            ev["references"] = [sup_id]
+            ev["reference_identities"] = [prior[sup_id]["cap_identity"]]
+            ev["cap_references_valid"] = True
+            ineligible_events.append(ev)
+        for i in range(50):
+            tomb_id = f"https://api.weather.gov/alerts/sup-tomb-{i}"
+            prior[tomb_id] = {
+                "state": "cancelled",
+                "cancel_message": True,
+                "lineage": [tomb_id],
+                "cap_identity": ["nws@example.test", f"sup-tomb-{i}", NOW.isoformat()],
+                "cap_references": [],
+                "sent": NOW.isoformat(),
+                "expires": NOW.isoformat(),
+                "ends": NOW.isoformat(),
+                "updated": NOW.isoformat(),
+            }
+
+        records, plans = d.reconcile(
+            prior, ineligible_events, cfg, NOW, graph_events=ineligible_events
+        )
+        self.assertEqual(len(records), 1000)
+        self.assertEqual(plans, [])
+        self.assertTrue(
+            all(
+                f"https://api.weather.gov/alerts/sup-tomb-{i}" in records
+                for i in range(50)
+            )
+        )
 
 
 if __name__ == "__main__":

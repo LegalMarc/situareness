@@ -99,25 +99,25 @@ def pending_valid(item, records, config, now, *, allow_suspended=False):
 
 
 def expired_by_age(item, records, config, now):
-    """Return True when a valid active-alert item expired solely due to MAX_AGE."""
+    """Return True when an unexhausted queued target for an active alert fails delivery."""
     try:
-        created = datetime.fromisoformat(item["created"])
+        if pending_valid(item, records, config, now, allow_suspended=True):
+            return False
         attempts = item["attempts"]
         if (
-            created.tzinfo is None
-            or created > now
-            or now - created <= MAX_AGE
-            or isinstance(attempts, bool)
+            isinstance(attempts, bool)
             or not isinstance(attempts, int)
             or not 0 <= attempts < MAX_ATTEMPTS
         ):
             return False
-        return pending_valid(
-            {**item, "created": now.isoformat()},
-            records,
-            config,
-            now,
-            allow_suspended=False,
+        record = records.get(item["incident_id"], {})
+        return (
+            record.get("state") == "active"
+            and record.get("fingerprint") == item["fingerprint"]
+        ) or (
+            record.get("state") in ("quarantined", "unconfirmed")
+            and record.get("prior_state") == "active"
+            and item["fingerprint"] in action_history(record)
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return False

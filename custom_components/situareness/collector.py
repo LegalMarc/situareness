@@ -118,8 +118,6 @@ async def fetch(session, states):
             raise ValueError("invalid NWS response")
         for feature in payload["features"]:
             feature_count += 1
-            if feature_count > 1000:
-                raise ValueError("NWS event limit reached")
             try:
                 event = normalize(feature)
             except OversizedFeature:

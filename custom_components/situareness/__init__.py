@@ -47,6 +47,15 @@ PERSISTED_DEGRADED_REASONS = {
     "conflicting_cancellation",
     "journal_lost",
 }
+VALID_RECORD_STATES = {
+    "active",
+    "ineligible",
+    "ended_or_absent",
+    "quarantined",
+    "unconfirmed",
+    "superseded",
+    "cancelled",
+}
 
 
 def _read_config(path):
@@ -90,11 +99,21 @@ def _valid_persisted_store(persisted):
         for eid, record in records.items():
             if not isinstance(eid, str) or not isinstance(record, dict):
                 return False
-            for req_str_key in ("state", "updated"):
-                if req_str_key in record and not isinstance(record[req_str_key], str):
-                    return False
+            state = record.get("state")
+            if not isinstance(state, str) or state not in VALID_RECORD_STATES:
+                return False
+            if "updated" in record and not isinstance(record["updated"], str):
+                return False
+            if (
+                "prior_state" in record
+                and record["prior_state"] is not None
+                and (
+                    not isinstance(record["prior_state"], str)
+                    or record["prior_state"] not in VALID_RECORD_STATES
+                )
+            ):
+                return False
             for opt_str_key in (
-                "prior_state",
                 "fingerprint",
                 "action_identity",
                 "action_fingerprint",
@@ -452,12 +471,17 @@ def _has_corrupt_store_backup(storage_dir, prefix):
 def _clear_corrupt_store_backups(storage_dir, prefix):
     directory = Path(storage_dir)
     if not directory.is_dir():
-        return
+        return True
+    ok = True
     for candidate in directory.glob(f"{prefix}.corrupt.*"):
         try:
             candidate.unlink()
-        except OSError:
-            pass
+        except OSError as err:
+            _LOGGER.warning(
+                "Could not remove corrupt store backup %s: %s", candidate.name, err
+            )
+            ok = False
+    return ok
 
 
 class SituarenessCoordinator(DataUpdateCoordinator):
@@ -539,12 +563,22 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             entry_ts = (
                 timestamp(entry_lost_at) if isinstance(entry_lost_at, str) else None
             )
-            if entry_ts is not None and detect_now - entry_ts <= MAX_ACCEPTANCE_AGE:
+            if (
+                entry_ts is not None
+                and entry_ts <= detect_now
+                and detect_now - entry_ts <= MAX_ACCEPTANCE_AGE
+            ):
                 stable_lost_at = entry_lost_at
                 lost_ts = entry_ts
             else:
                 stable_lost_at = detect_now.isoformat()
                 lost_ts = detect_now
+            try:
+                lost_until = min(
+                    max(lost_ts, detect_now) + MAX_ACCEPTANCE_AGE, MAX_TIMESTAMP
+                )
+            except OverflowError:
+                lost_until = MAX_TIMESTAMP
             self.records = {}
             self.outbox = []
             self.outcomes = []
@@ -553,18 +587,25 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.degraded = True
             self.degraded_reason = "journal_lost"
             self.degraded_at = stable_lost_at
-            self.degraded_until = (
-                max(lost_ts, detect_now) + MAX_ACCEPTANCE_AGE
-            ).isoformat()
+            self.degraded_until = lost_until.isoformat()
             self.acknowledged_degraded_at = None
             self.last_degraded_poll = detect_now.isoformat()
             self.expired_unsent = 0
             self.expired_unsent_at = None
             self.expired_unsent_until = None
-            if self._entry.data.get("journal_lost_at") != stable_lost_at:
+            if (
+                self._entry.data.get("journal_lost_at") != stable_lost_at
+                or "malformed_store_at" in self._entry.data
+            ):
+                new_data = {
+                    k: v
+                    for k, v in self._entry.data.items()
+                    if k != "malformed_store_at"
+                }
+                new_data["journal_lost_at"] = stable_lost_at
                 self.hass.config_entries.async_update_entry(
                     self._entry,
-                    data={**self._entry.data, "journal_lost_at": stable_lost_at},
+                    data=new_data,
                 )
         else:
             persisted = persisted if isinstance(persisted, dict) else {}
@@ -776,14 +817,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             self.consumed_acknowledgements, ack
         )
         self.acknowledged_degraded_at = ack
-        self.acknowledge_rejected = False
         self._ack_cleared_on_load = True
         self._ack_cleared_reason = self.degraded_reason
+        self._clear_degraded_state(ack_rejected=False)
+        return True
+
+    def _clear_degraded_state(self, *, ack_rejected=None):
         self.degraded = False
         self.degraded_reason = None
         self.degraded_at = None
         self.degraded_until = None
-        return True
+        if ack_rejected is not None:
+            self.acknowledge_rejected = ack_rejected
 
     async def _save(self, records, outbox, outcomes, *, preserve_lost_at=False):
         await self.store.async_save(
@@ -813,13 +858,15 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
         self.was_live = live(self.config)
         if self._needs_corrupt_cleanup:
-            if self._entry is not None:
-                await self.hass.async_add_executor_job(
+            cleaned = True
+            if self._entry is not None and hasattr(self.hass, "config"):
+                cleaned = await self.hass.async_add_executor_job(
                     _clear_corrupt_store_backups,
                     self.hass.config.path(".storage"),
                     f"{DOMAIN}.{self._entry.entry_id}",
                 )
-            self._needs_corrupt_cleanup = False
+            if cleaned:
+                self._needs_corrupt_cleanup = False
         clear_lost_at = not preserve_lost_at
         needs_entry_ack = self._entry is not None and (
             (
@@ -1041,7 +1088,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 if self.acknowledge_rejected:
                     msg += (
                         " Configured acknowledge_degraded_at in situareness.json was also rejected "
-                        "(invalid, missing a timezone offset, over-length, or in the future; consumed if valid ISO-8601)."
+                        "(invalid, missing a timezone offset, over-length, in the future, "
+                        "earlier than expired_unsent_at, or already consumed; consumed if valid ISO-8601)."
                     )
                 msg += expired_note
                 persistent_notification.async_create(
@@ -1055,12 +1103,23 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         elif self.acknowledge_rejected:
             state = ("acknowledge_rejected", live(self.config), expired_count)
             if self._notified_degraded_state != state:
-                msg = (
-                    "Configured acknowledge_degraded_at in situareness.json was invalid, "
-                    "missing a timezone offset, over-length, or in the future, so it was rejected "
-                    "(and consumed if valid ISO-8601). Situareness monitoring remains online."
-                    + expired_note
-                )
+                if expired_count > 0:
+                    msg = (
+                        "Configured acknowledge_degraded_at in situareness.json was invalid, "
+                        "missing a timezone offset, over-length, in the future, earlier than expired_unsent_at, "
+                        "missing expired_unsent_at, or already consumed; consumed if valid ISO-8601, "
+                        "so it did not clear latched expired_unsent. "
+                        "Set a new one-shot acknowledge_degraded_at with expired_unsent_at <= acknowledge_degraded_at <= reload time "
+                        "or wait for the seven-day hold to expire."
+                        + expired_note
+                        + " Continue using independent official alert channels."
+                    )
+                else:
+                    msg = (
+                        "Configured acknowledge_degraded_at in situareness.json was invalid, "
+                        "missing a timezone offset, over-length, or in the future, so it was rejected "
+                        "(and consumed if valid ISO-8601). Situareness monitoring remains online."
+                    )
                 persistent_notification.async_create(
                     self.hass,
                     msg,
@@ -1741,11 +1800,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     self.degraded_until = computed_until.isoformat()
                 until = timestamp(self.degraded_until)
                 if until is not None and now > until:
-                    self.degraded = False
-                    self.degraded_reason = None
-                    self.degraded_at = None
-                    self.degraded_until = None
-                    self.acknowledge_rejected = self._config_ack_rejected
+                    self._clear_degraded_state(ack_rejected=self._config_ack_rejected)
             degraded_delta = (
                 now - last_ts
                 if (
@@ -1799,7 +1854,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 attempts,
                 failures,
                 already_delivered,
-                batch_expired,
+                _,
             ) = await self._queue_outbox_plans(
                 records,
                 plans,
@@ -1828,7 +1883,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     (
                         attempts,
                         failures,
-                        batch_expired,
+                        _,
                     ) = await self._deliver_outbox_batch(candidate_events, now)
                 total_expired_unsent = self.expired_unsent
                 deliverable = await self.hass.async_add_executor_job(
@@ -1855,11 +1910,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     expired_unsent=total_expired_unsent,
                 )
             if self.degraded and self.degraded_reason == "outbox_overflow":
-                self.degraded = False
-                self.degraded_reason = None
-                self.degraded_at = None
-                self.degraded_until = None
-                self.acknowledge_rejected = self._config_ack_rejected
+                self._clear_degraded_state(ack_rejected=self._config_ack_rejected)
             self._ack_cleared_on_load = False
             self._ack_cleared_reason = None
             self.last_degraded_poll = None
@@ -1872,7 +1923,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self._update_expired_unsent(migrated_expired, now)
             await self._save(records, outbox, outcomes_to_save)
             if not already_delivered:
-                attempts, failures, batch_expired = await self._deliver_outbox_batch(
+                attempts, failures, _ = await self._deliver_outbox_batch(
                     candidate_events, now
                 )
             total_expired_unsent = self.expired_unsent
@@ -1914,6 +1965,9 @@ async def async_setup_entry(hass, entry):
     prefix = f"{DOMAIN}.{entry.entry_id}"
     store = Store(hass, 1, prefix, private=True)
     has_corrupt_backup = False
+    store_file_existed = await hass.async_add_executor_job(
+        Path(hass.config.path(".storage", prefix)).exists
+    )
     try:
         persisted = await store.async_load()
     except (json.JSONDecodeError, ValueError, NotImplementedError):
@@ -1934,7 +1988,12 @@ async def async_setup_entry(hass, entry):
         _has_corrupt_store_backup, hass.config.path(".storage"), prefix
     ):
         has_corrupt_backup = True
-        persisted = ["corrupt_json"]
+        if (
+            store_file_existed
+            or "malformed_store_at" in entry.data
+            or entry.data.get("journal_initialized") is not True
+        ):
+            persisted = ["corrupt_json"]
     elif isinstance(persisted, dict) and persisted:
         persisted_valid = await hass.async_add_executor_job(
             _valid_persisted_store, persisted
