@@ -113,7 +113,10 @@ def _valid_persisted_store(persisted):
             state = record.get("state")
             if not isinstance(state, str) or state not in VALID_RECORD_STATES:
                 return False
-            if "updated" in record and not isinstance(record["updated"], str):
+            if "updated" in record and (
+                not isinstance(record["updated"], str)
+                or timestamp(record["updated"]) is None
+            ):
                 return False
             if (
                 "prior_state" in record
@@ -561,13 +564,15 @@ def _clear_corrupt_store_backups(storage_dir, prefix):
 
 
 def _verify_store_save(store_path, save_id):
-    """Verify atomic disk persistence after Home Assistant Store.async_save.
+    """Confirm that Home Assistant Store committed save_id to the filesystem.
 
-    Home Assistant's Store.async_save delegates to _async_handle_write_data, which
-    catches and logs (SerializationError, WriteError) without raising. Because
-    save_id is placed as the final key in payload and Store serializes keys in
-    insertion order, reading the final 512 bytes of Store.path confirms the write
-    landed on disk when Home Assistant is not deferring writes to shutdown.
+    The coordinator constructs Store with private=True, atomic_writes=True, and
+    serialize_in_event_loop=False so JSON serialization and atomic write/fsync
+    run off the event loop. Because Store._async_handle_write_data catches and
+    logs SerializationError and WriteError without raising, and save_id is the
+    final key in payload (serialized in insertion order), checking the tail of
+    Store.path detects swallowed write failures when HA is not deferring writes
+    for CoreState.stopping shutdown.
     """
     path = Path(store_path)
     with path.open("rb") as stream:
@@ -987,9 +992,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             exp_count, exp_at, exp_until, exp_reasons, exp_ack_rej = expired_state
         save_id = uuid.uuid4().hex
         payload = {
-            "records": records,
-            "outbox": outbox,
-            "outcomes": outcomes[-100:],
+            "records": dict(records),
+            "outbox": [dict(item) for item in outbox],
+            "outcomes": [dict(item) for item in outcomes[-100:]],
             "initialized": True,
             "was_live": live(self.config),
             "degraded": self.degraded,
@@ -1323,17 +1328,23 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self._notified_degraded_state = state
                 self._checked_notification_clear = False
         elif quarantine_ambiguous:
+            is_live = live(self.config)
             state = (
                 "quarantine_ambiguous",
-                live(self.config),
+                is_live,
                 self.acknowledge_rejected,
                 expired_count,
                 reasons,
             )
             if self._notified_degraded_state != state:
+                shadow_note = (
+                    " (Shadow mode: live output is disabled.)" if not is_live else ""
+                )
                 msg = (
                     "Situareness could not determine safe scope for one or more malformed NWS features, "
-                    "so all alert lineages are suspended for this poll. Continue using independent official alert channels."
+                    "so all alert lineages are suspended for this poll."
+                    + shadow_note
+                    + " Continue using independent official alert channels."
                 )
                 if self.acknowledge_rejected:
                     msg += (
@@ -1351,8 +1362,12 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self._notified_degraded_state = state
                 self._checked_notification_clear = False
         elif self.acknowledge_rejected:
-            state = ("acknowledge_rejected", live(self.config), expired_count, reasons)
+            is_live = live(self.config)
+            state = ("acknowledge_rejected", is_live, expired_count, reasons)
             if self._notified_degraded_state != state:
+                shadow_note = (
+                    " (Shadow mode: live output is disabled.)" if not is_live else ""
+                )
                 if expired_count > 0:
                     msg = (
                         "Configured acknowledge_degraded_at in situareness.json was invalid, "
@@ -1362,6 +1377,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         "Set a new one-shot acknowledge_degraded_at with expired_unsent_at <= acknowledge_degraded_at <= reload time "
                         "or wait for the seven-day hold to expire."
                         + expired_note
+                        + shadow_note
                         + " Continue using independent official alert channels."
                     )
                 else:
@@ -1369,6 +1385,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         "Configured acknowledge_degraded_at in situareness.json was invalid, "
                         "missing a timezone offset, over-length, or in the future, so it was rejected "
                         "(and consumed if valid ISO-8601). Situareness monitoring remains online."
+                        + shadow_note
                     )
                 persistent_notification.async_create(
                     self.hass,
@@ -1379,21 +1396,29 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self._notified_degraded_state = state
                 self._checked_notification_clear = False
         elif expired_count > 0:
-            state = ("expired_unsent", live(self.config), expired_count, reasons)
+            is_live = live(self.config)
+            state = ("expired_unsent", is_live, expired_count, reasons)
             if self._notified_degraded_state != state:
+                shadow_note = (
+                    " (Shadow mode: live output is disabled.)" if not is_live else ""
+                )
                 if not reasons or reasons == ("age",):
                     msg = (
                         f"{expired_count} queued qualifying alert target(s) aged past the 15-minute delivery window "
                         "before delivery completed. Partial/expired_unsent remains elevated until acknowledged on reload "
                         "(acknowledge_degraded_at in situareness.json, expired_unsent_at <= acknowledge_degraded_at <= reload time) "
-                        "or seven days pass without new expirations. Continue using independent official alert channels."
+                        "or seven days pass without new expirations."
+                        + shadow_note
+                        + " Continue using independent official alert channels."
                     )
                 else:
                     msg = (
                         f"{expired_count} queued qualifying alert target(s) expired unsent before delivery completed ({cause_text}). "
                         "Partial/expired_unsent remains elevated until acknowledged on reload "
                         "(acknowledge_degraded_at in situareness.json, expired_unsent_at <= acknowledge_degraded_at <= reload time) "
-                        "or seven days pass without new expirations. Continue using independent official alert channels."
+                        "or seven days pass without new expirations."
+                        + shadow_note
+                        + " Continue using independent official alert channels."
                     )
                 persistent_notification.async_create(
                     self.hass,
@@ -2132,7 +2157,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     )
                 )
             except CancellationEvidenceOverflow as err:
-                records = err.records if err.records is not None else self.records
+                records = (
+                    err.records if err.records is not None else deepcopy(self.records)
+                )
                 plans = list(getattr(err, "plans", None) or ())
                 if degraded_trigger is None:
                     degraded_trigger = "cancellation_evidence_overflow"
@@ -2384,7 +2411,14 @@ async def async_setup_entry(hass, entry):
     except (ValueError, OSError, json.JSONDecodeError) as err:
         raise ConfigEntryNotReady(f"Invalid situareness.json: {err}") from err
     prefix = f"{DOMAIN}.{entry.entry_id}"
-    store = Store(hass, 1, prefix, private=True)
+    store = Store(
+        hass,
+        1,
+        prefix,
+        private=True,
+        atomic_writes=True,
+        serialize_in_event_loop=False,
+    )
     has_corrupt_backup = False
     store_file_existed = await hass.async_add_executor_job(
         Path(hass.config.path(".storage", prefix)).exists

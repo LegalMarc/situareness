@@ -407,7 +407,7 @@ def lineage_index(records, events):
     return {eid: find(eid) for eid in parent}, members
 
 
-def cancellation_horizon(group_ids, records):
+def cancellation_horizon(group_ids, records, now=None):
     """Return the retention horizon across all timestamps in a lineage component."""
     timestamps = []
     for eid in group_ids:
@@ -415,6 +415,8 @@ def cancellation_horizon(group_ids, records):
         if not isinstance(record, dict):
             continue
         obs = timestamp(record.get("updated"))
+        if obs is None and isinstance(now, datetime):
+            obs = now
         if obs is not None:
             try:
                 upper = min(obs + timedelta(minutes=5), MAX_TIMESTAMP)
@@ -896,7 +898,7 @@ def _expire_cancellation_horizons(prior, records, members, active_feed_groups, n
             for eid in ids
         ):
             continue
-        horizon = cancellation_horizon(ids, prior)
+        horizon = cancellation_horizon(ids, prior, now=now)
         if horizon is None or now > horizon:
             for eid in ids:
                 if prior[eid].get("cancel_message") or prior[eid].get(
@@ -1120,7 +1122,11 @@ def _bound_records(
         dropped_component_horizons = [
             h
             for g in dropped_groups
-            if (h := cancellation_horizon(all_members_by_group.get(g, []), records))
+            if (
+                h := cancellation_horizon(
+                    all_members_by_group.get(g, []), records, now=now
+                )
+            )
             is not None
         ]
         try:

@@ -2,6 +2,17 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 twenty-eighth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `62337c2` (`run_id`: `20261118T160611Z-e864d7`, 313.6s standards and 346.7s specification) reported **0 Critical and 0 High findings**, with zero Specification findings above Low, leaving 6 unique findings (`HA-01` Medium, `HA-02` Low, `SPEC-L1` Low, `HA-03` Low/Nit, `DOC-01`/`DOC-N1` Low/Nit, `SPEC-N1` Nit).
+
+All 6 findings were repaired cleanly in Round 28 (`custom_components/situareness/__init__.py`, `custom_components/situareness/domain.py`, `tests/ha/test_domain.py`, `tests/ha/test_coordinator.py`, and consolidated docs):
+- **`HA-01` & `HA-02`**: Constructed `Store(hass, 1, prefix, private=True, atomic_writes=True, serialize_in_event_loop=False)` with isolated top-level collection copies in `_save`, updated `_verify_store_save` docstring for off-loop JSON serialization/atomic filesystem writes, widened at-least-once duplicate caveats across contract, READMEs, and `docs/CONTEXT.md` to cover crash, power loss, or save failure, and verified constructor args in `RecordingStore`.
+- **`HA-03` & `SPEC-L1`**: Changed `CancellationEvidenceOverflow` fallback to `deepcopy(self.records)`, required parseable `timestamp(record["updated"])` in `_valid_persisted_store`, and bounded missing-`"updated"` records by poll observation time `now + 5m` in `cancellation_horizon(..., now=now)` with unit test coverage.
+- **`SPEC-N1` & `DOC-01` / `DOC-N1`**: Qualified `quarantine_ambiguous`, `acknowledge_rejected`, and `expired_unsent` notifications with `" (Shadow mode: live output is disabled.)"` when live output is off (tested for shadow vs live), corrected `"setup-time store validation"` timing in `docs/spec/o3-mvp.md`, and consolidated duplicated normative prose in `docs/ha/README.md`, `home-assistant/README.md`, and `docs/reference/cap-cancellation.md` into concise operator/CAP summaries linking to `docs/spec/o3-mvp.md#home-assistant`.
+
+Verification on the repaired candidate: `ruff check`/`ruff format --check` (13 files), `44` Node, `131` stdlib `-W error` HA, `7` skill, `21` Chromium Playwright, and `13` real HA = `216` total tests, deterministic packaging (`9ef4d967...` extension ZIP, `df8811b2...` HA ZIP), live anonymous smoke (`2026-11-18T16:20:37.855Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: run full clean `run_gates.py`, commit/push to `wip/supervisor-handoff-20261117`, refresh clean-HEAD logs, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 twenty-seventh Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `0cb3656` (`run_id`: `20261118T155112Z-c46492`, 275.5s standards and 251.4s specification) reported **0 Critical and 0 High findings** and zero Standards findings above Nit, leaving 4 unique findings (`SIT-EXP-ACK-01` Medium, `SIT-ACK-COMMIT-02` Low, `TRUTH-01` Nit, `DOC-01`/`SIT-LOOP-03` Nit).

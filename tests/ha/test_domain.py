@@ -2219,12 +2219,23 @@ class Collector(unittest.IsolatedAsyncioTestCase):
                 "state": "cancelled",
                 "expires": "9998-12-30T00:00:00+00:00",
             },
+            "https://api.weather.gov/alerts/near-max-legacy-cap": {
+                "state": "cancelled",
+                "expires": "9998-12-30T00:00:00+00:00",
+                "updated": "9998-12-30T00:00:00+00:00",
+            },
         }
         self.assertEqual(
             d.cancellation_horizon(
-                ["https://api.weather.gov/alerts/near-max-unbounded"], near_max
+                ["https://api.weather.gov/alerts/near-max-legacy-cap"], near_max
             ),
             d.MAX_TIMESTAMP,
+        )
+        self.assertEqual(
+            d.cancellation_horizon(
+                ["https://api.weather.gov/alerts/near-max-unbounded"], near_max, now=NOW
+            ),
+            NOW + timedelta(minutes=5) + d.MAX_ACCEPTANCE_AGE,
         )
         self.assertEqual(
             d.cancellation_horizon(

@@ -2644,11 +2644,13 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         load_result = None
 
         seen_private = []
+        seen_store_kwargs = []
 
         class RecordingStore(Store):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
                 seen_private.append(kwargs.get("private"))
+                seen_store_kwargs.append(kwargs)
 
             async def async_load(self):
                 if load_error is not None:
@@ -2711,6 +2713,7 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             await mod.async_remove_entry(hass, entry)
             self.assertEqual(events, ["dismiss", "remove"])
             self.assertEqual(seen_private, [True])
+            seen_store_kwargs.clear()
             self.assertNotIn("situareness_degraded", notifications)
 
             # Invalid or disallowed degraded_reason values fail store validation, and
@@ -2776,6 +2779,14 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(setup_coord.config_entry, err_entry)
                 self.assertTrue(err_entry.data.get("journal_initialized"))
                 self.assertTrue(all(seen_private))
+                self.assertTrue(
+                    seen_store_kwargs
+                    and all(
+                        kw.get("atomic_writes") is True
+                        and kw.get("serialize_in_event_loop") is False
+                        for kw in seen_store_kwargs
+                    )
+                )
 
             perm_err = RuntimeError("storage error")
             perm_err.__cause__ = PermissionError("denied")
@@ -5106,12 +5117,13 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(h_after_horizon["partial"])
             self.assertEqual(store_poll_exp.saved[-1]["expired_unsent"], 0)
 
-        # Invalid persisted expired_unsent types fail store validation.
+        # Invalid persisted expired_unsent types and unparseable record.updated fail store validation.
         for bad_payload in (
             {"records": {}, "expired_unsent": True},
             {"records": {}, "expired_unsent": -1},
             {"records": {}, "expired_unsent_at": "not-a-date"},
             {"records": {}, "expired_unsent_until": "2026-11-17T12:00:00"},
+            {"records": {"id-1": {"state": "active", "updated": "not-a-timestamp"}}},
         ):
             self.assertFalse(mod._valid_persisted_store(bad_payload))
             bad_coord = mod.SituarenessCoordinator(hass, cfg, Store(), bad_payload)
@@ -7522,4 +7534,128 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             notifications["situareness_degraded"]["title"],
             "Situareness alert scope ambiguous",
+        )
+
+    async def test_shadow_notification_qualification_and_overflow_record_isolation(
+        self,
+    ):
+        from datetime import datetime, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, nid: notifications.pop(nid, None),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        shadow_cfg = config()
+        live_cfg = {**shadow_cfg, "live_enabled": True, "commissioning_passed": True}
+        hass = types.SimpleNamespace(data={}, services=Services())
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for cfg_variant, expect_shadow in ((shadow_cfg, True), (live_cfg, False)):
+            notifications.clear()
+            coord_qa = mod.SituarenessCoordinator(hass, cfg_variant, Store(), {})
+            coord_qa._sync_degraded_notification(quarantine_ambiguous=True)
+            qa_msg = notifications["situareness_degraded"]["message"]
+            self.assertEqual(
+                "Shadow mode: live output is disabled." in qa_msg, expect_shadow
+            )
+
+            notifications.clear()
+            mod.SituarenessCoordinator(
+                hass,
+                cfg_variant,
+                Store(),
+                {"records": {}, "expired_unsent": 1, "expired_unsent_at": now_iso},
+            )
+            exp_msg = notifications["situareness_degraded"]["message"]
+            self.assertEqual(
+                "Shadow mode: live output is disabled." in exp_msg, expect_shadow
+            )
+
+            notifications.clear()
+            mod.SituarenessCoordinator(
+                hass,
+                {**cfg_variant, "acknowledge_degraded_at": "invalid"},
+                Store(),
+                {"records": {}},
+            )
+            rej_msg = notifications["situareness_degraded"]["message"]
+            self.assertEqual(
+                "Shadow mode: live output is disabled." in rej_msg, expect_shadow
+            )
+
+        # Fallback records=None on CancellationEvidenceOverflow must not mutate self.records in place.
+        class FailingStore(Store):
+            async def async_save(self, value):
+                raise OSError("disk full")
+
+        async def run_exec(fn, *args):
+            return await asyncio.to_thread(fn, *args)
+
+        hass_fail = types.SimpleNamespace(
+            data={}, services=Services(), async_add_executor_job=run_exec
+        )
+        initial_rec = {
+            "https://api.weather.gov/alerts/a1": {
+                "state": "active",
+                "actions": {"fp1": ["new_york_ny"]},
+                "updated": now_iso,
+            }
+        }
+        coord_iso = mod.SituarenessCoordinator(
+            hass_fail, live_cfg, FailingStore(), {"records": initial_rec}
+        )
+        original_actions = dict(
+            coord_iso.records["https://api.weather.gov/alerts/a1"]["actions"]
+        )
+        overflow_plans = [
+            {
+                "id": "https://api.weather.gov/alerts/a1",
+                "fingerprint": "fp1",
+                "event": "Tornado Warning",
+                "instruction": "Take shelter immediately",
+                "affected_names": ["New York"],
+                "new_items": [],
+            }
+        ]
+        overflow_err = d.CancellationEvidenceOverflow(
+            "overflow", records=None, plans=overflow_plans
+        )
+        with (
+            patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents([], 0, set(), False),
+            ),
+            patch.object(mod, "reconcile", side_effect=overflow_err),
+            self.assertRaises(UpdateFailed),
+        ):
+            await coord_iso._async_update_data()
+        self.assertEqual(
+            coord_iso.records["https://api.weather.gov/alerts/a1"]["actions"],
+            original_actions,
         )
