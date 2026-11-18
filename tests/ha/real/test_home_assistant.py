@@ -237,14 +237,17 @@ async def test_recorder_excludes_high_churn_attributes(
         and "last_success" not in row
         and "degraded_at" not in row
         and "degraded_until" not in row
+        and "expired_unsent_at" not in row
+        and "expired_unsent_until" not in row
         for row in attrs
     )
-    assert "events" in hass.states.get("sensor.situareness_monitoring").attributes
-    assert "last_success" in hass.states.get("sensor.situareness_monitoring").attributes
-    assert "degraded_at" in hass.states.get("sensor.situareness_monitoring").attributes
-    assert (
-        "degraded_until" in hass.states.get("sensor.situareness_monitoring").attributes
-    )
+    sensor_attrs = hass.states.get("sensor.situareness_monitoring").attributes
+    assert "events" in sensor_attrs
+    assert "last_success" in sensor_attrs
+    assert "degraded_at" in sensor_attrs
+    assert "degraded_until" in sensor_attrs
+    assert "expired_unsent_at" in sensor_attrs
+    assert "expired_unsent_until" in sensor_attrs
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 

@@ -8084,3 +8084,13 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertIn("expired_unsent_at", post_stop)
         self.assertIn("expired_unsent_until", post_stop)
         self.assertTrue(post_stop["cancellation_uncertain"])
+
+        notes_r30.clear()
+        mod.SituarenessCoordinator(
+            hass_r30,
+            live_cfg,
+            Store(),
+            "not-a-dict",
+        )
+        self.assertIn("journal_lost", notes_r30["situareness_degraded"])
+        self.assertIn("tombstones", notes_r30["situareness_degraded"])

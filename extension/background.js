@@ -210,18 +210,18 @@ async function refresh(force, alarmClockAt = null, scheduledTime = null) {
             s.interval_minutes))
     );
   });
-  if (!due.length) {
-    if (Number.isFinite(alarmClockAt)) await persist();
-    return state;
-  }
   if (!Number.isFinite(alarmClockAt)) {
-    // Rephase the repeating alarm so a manual or startup fetch is followed by
-    // a full interval, rather than an immediately queued duplicate collection.
+    // Rephase the repeating alarm so a manual or startup fetch (even if no
+    // source is due) is followed by a full interval without double-counting slots.
     state.collector.last_non_alarm_clock_at = nowMs;
     await chrome.alarms.create(ALARM, {
       delayInMinutes: 1,
       periodInMinutes: 1,
     });
+  }
+  if (!due.length) {
+    await persist();
+    return state;
   }
   state.collector.running = true;
   await persist();

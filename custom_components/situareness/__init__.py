@@ -1364,7 +1364,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         message = (
                             prefix
                             + rej_note
-                            + "Manual store repair or replacement (deleting the store file and any .corrupt.* backups) in .storage (or removing and re-adding the integration entry) is required."
+                            + "Manual store repair or replacement (deleting the store file and any .corrupt.* backups in .storage, "
+                            "which enters journal_lost on reload requiring a seven-day hold or reload acknowledgement) "
+                            "or removing and re-adding the integration entry (which discards tombstones and can allow "
+                            "currently qualifying in-window alerts to re-evaluate) is required."
                             + expired_note
                             + " Continue using independent official alert channels."
                         )
@@ -1882,6 +1885,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             await self.hass.async_add_executor_job(
                 _strip_withheld_actions, records, plans, groups, now
             )
+            if self._stopping:
+                return outbox, False, [], records, 0, 0, False
             expired_state = self._compute_expired_unsent(
                 extra_expired, now, extra_outcomes
             )

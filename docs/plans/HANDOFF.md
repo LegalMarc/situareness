@@ -2,6 +2,18 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 thirty-fourth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `32a368a` (`run_id`: `20261118T185741Z-3fd414`, 318.8s specification) reported **0 Critical, 0 High, and 0 Medium findings**, leaving 5 Low/Nit findings (`SIT-SPEC-01` Low, `SIT-EVID-01` Low, `SR-01` Low, `SR-02` Low, `SR-03` Nit).
+
+All 5 findings were resolved cleanly in Round 34 (`custom_components/situareness/__init__.py`, `extension/background.js`, `home-assistant/README.md`, `tests/ha/real/test_home_assistant.py`, `tests/runtime/worker.test.js`, and `tests/ha/test_coordinator.py`):
+- **`SIT-SPEC-01`**: Added `if self._stopping: return outbox, False, [], records, 0, 0, False` immediately after `_strip_withheld_actions` and before the pre-drain `_save` in `_queue_outbox_plans()`.
+- **`SIT-EVID-01`**: Extended `tests/ha/real/test_home_assistant.py` recorder exclusion assertions to verify `expired_unsent_at` and `expired_unsent_until` alongside the existing four excluded attributes.
+- **`SR-01`**: Rephased `chrome.alarms.create(ALARM, { delayInMinutes: 1, periodInMinutes: 1 })` and persisted state on non-alarm `refresh(false)` calls in `extension/background.js` even when `!due.length`, preventing double-counted poll slots (verified in `tests/runtime/worker.test.js`).
+- **`SR-02` & `SR-03`**: Updated the `malformed_store` `situareness_degraded` notice to state that deleting `.storage/situareness.<entry_id>` and `.corrupt.*` backups enters `journal_lost` on reload while removing and re-adding discards tombstones (verified in `tests/ha/test_coordinator.py`), and noted in `home-assistant/README.md` that non-`outbox_overflow` degraded holds pause retry aging.
+
+Verification on the repaired candidate: `run_gates.py` (`219` total tests: `44` Node + `133` stdlib `-W error` HA + `7` skill + `22` Chromium Playwright + `13` real HA, plus Ruff lint/format), deterministic packaging, live anonymous smoke, and `audit_private.py`. Next: commit/push to `wip/supervisor-handoff-20261117` and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 thirty-third Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `335f7b6` (`run_id`: `20261118T184536Z-f50b2e`, 339.2s standards) reported **0 Critical, 0 High, and 0 Medium findings**, leaving 6 Low/Nit findings (`HA-01` Low, `DOC-01` Low, `SPEC-L1` Low, `HA-02` Nit, `SPEC-N1` Nit, `DOC-N1` Nit).

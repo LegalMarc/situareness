@@ -562,10 +562,13 @@ test("legacy storage_truncated flag without last_storage_loss_at does not fabric
     },
   };
   try {
+    alarm = null;
     await import("../../extension/background.js?legacy-storage-truncated");
     listeners.startup();
     const response = await send({ type: "GET_STATE" });
     assert.equal(response.ok, true);
+    assert.equal(alarm?.delayInMinutes, 1);
+    assert.equal(alarm?.periodInMinutes, 1);
     assert.equal(response.state.collector.last_storage_loss_at, null);
     assert.equal(
       persisted.situareness_state_v1.collector.last_storage_loss_at,
