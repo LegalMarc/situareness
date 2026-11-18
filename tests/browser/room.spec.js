@@ -1015,3 +1015,22 @@ test("a worker bundled configuration failure on REFRESH disables controls and sh
     page.getByRole("button", { name: "Pause collection" }),
   ).toBeDisabled();
 });
+
+test("hiding the context link also hides its meta divider", async () => {
+  await page.addInitScript(() => {
+    const original = chrome.runtime.sendMessage.bind(chrome.runtime);
+    Object.defineProperty(chrome.runtime, "sendMessage", {
+      configurable: true,
+      value: async (message) => {
+        const result = await original(message);
+        if (message?.type === "GET_STATE" && result?.ok && result.state?.config?.room) {
+          result.state.config.room.context_dashboard = null;
+        }
+        return result;
+      },
+    });
+  });
+  await page.reload();
+  await expect(page.locator("#dashboard-link")).toBeHidden();
+  await expect(page.locator("#dashboard-divider")).toBeHidden();
+});

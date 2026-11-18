@@ -1466,7 +1466,9 @@ def reconcile(
                 keep_prior_timestamps=identity_uncertain,
                 invalid_cancel=invalid_cancel,
             )
-            if continuing_withheld and fp in summary.get("pre_cancel_actions", {}):
+            if activate and not cancelled:
+                quarantined_rec["actions"] = {}
+            elif continuing_withheld and fp in summary.get("pre_cancel_actions", {}):
                 merged_actions = dict(quarantined_rec.get("actions", {}))
                 if len(merged_actions) < 100 and fp not in merged_actions:
                     merged_actions[fp] = summary["pre_cancel_actions"][fp]

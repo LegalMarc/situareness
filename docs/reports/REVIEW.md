@@ -73,6 +73,9 @@ The release gate is open until the current candidate has zero supported unresolv
 | `27fb7a0801e61ff27394e008d6f6879b794809d9` | Standards | Claude Opus 5.5, medium effort | Four findings (0 Critical, 0 High, 0 Medium, 2 Low, 2 Nit; `run_id`: `20261118T162534Z-c7cb5b`, 282.4s; zero shadow-default/live-gate/routing/horn/privacy/stop-unload/storage-init/browser-room/packaging defects); repaired in next candidate |
 | `27fb7a0801e61ff27394e008d6f6879b794809d9` | Specification | Claude Opus 5.5, medium effort | Three findings (1 High, 0 Medium, 2 Low, 0 Nit; `run_id`: `20261118T162534Z-c7cb5b`, 350.8s; zero shadow-default/live-gate/routing/horn/privacy/CAP-lineage/quarantine/ack/browser-room defects); repaired in next candidate |
 
+| `30e7149dd9d7a3a71be6efca535c5ef6515878ae` | Standards | Claude Opus 5.5, medium effort | Three findings (0 Critical, 1 High, 0 Medium, 1 Low, 1 Nit; `run_id`: `20261118T180246Z-dd8694`, 216.4s); repaired in next candidate |
+| `30e7149dd9d7a3a71be6efca535c5ef6515878ae` | Specification | Claude Opus 5.5, medium effort | Three findings (0 Critical, 0 High, 0 Medium, 2 Low, 1 Nit; `run_id`: `20261118T180246Z-dd8694`); repaired in next candidate |
+
 The exact model reported by completed CLI result metadata was `claude-opus-5-5`. The second standards/specification passes took 204.4 and 205.3 seconds respectively. They independently read an immutable full-source snapshot, complete change diff from the public root, documented contract/standards, and raw local test evidence. They executed no code or physical output.
 
 ## Standards findings at 2c0f1e1

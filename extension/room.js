@@ -70,6 +70,7 @@ const els = {
   notice: byId("notice"),
   freshness: byId("freshness-note"),
   retention: byId("retention-note"),
+  dashboardDivider: byId("dashboard-divider"),
   dashboard: byId("dashboard-link"),
   search: byId("search-input"),
   category: byId("category-filter"),
@@ -170,6 +171,7 @@ function renderStatus(state) {
       : `Home Assistant status: ${String(haStatus).replaceAll("_", " ")}. Room actions remain read-only.`;
   const dashboardUrl = safeHttpUrl(state?.config?.room?.context_dashboard);
   els.dashboard.hidden = !dashboardUrl;
+  if (els.dashboardDivider) els.dashboardDivider.hidden = !dashboardUrl;
   if (dashboardUrl) els.dashboard.href = dashboardUrl;
 }
 

@@ -576,19 +576,40 @@ def _verify_store_save(store_path, save_id):
     The coordinator constructs Store with private=True, atomic_writes=True, and
     serialize_in_event_loop=False so JSON serialization and atomic write/fsync
     run off the event loop. Because Store._async_handle_write_data catches and
-    logs SerializationError and WriteError without raising, parsing Store.path
-    as JSON and verifying data["save_id"] detects swallowed write failures
-    independently of key order or trailing envelope fields when HA is not
-    deferring writes for CoreState.stopping shutdown.
+    logs SerializationError and WriteError without raising, checking Store.path
+    for the save_id field (scanning the final 4 KiB tail first and falling back
+    to a bounded chunked binary scan without full JSON deserialization) detects
+    swallowed write failures independently of key order or trailing fields when
+    HA is not deferring writes for CoreState.stopping shutdown.
     """
     path = Path(store_path)
+    sid = save_id.encode("ascii")
+    needles = (b'"save_id": "' + sid + b'"', b'"save_id":"' + sid + b'"')
     try:
-        envelope = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            tail_start = max(0, size - 4096)
+            stream.seek(tail_start)
+            tail = stream.read()
+            if any(needle in tail for needle in needles):
+                return
+            if tail_start > 0:
+                stream.seek(0)
+                overlap = b""
+                remaining = tail_start + 128
+                while remaining > 0:
+                    chunk = stream.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    window = overlap + chunk
+                    if any(needle in window for needle in needles):
+                        return
+                    overlap = window[-128:]
+                    remaining -= len(chunk)
+    except OSError as err:
         raise OSError("Store write was not committed") from err
-    data = envelope.get("data") if isinstance(envelope, dict) else None
-    if not isinstance(data, dict) or data.get("save_id") != save_id:
-        raise OSError("Store write was not committed")
+    raise OSError("Store write was not committed")
 
 
 def _is_hass_stopping(hass):
@@ -985,12 +1006,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         expired_state=None,
         degraded_state=None,
         clear_ack_on_load=False,
+        was_live=_UNSET,
     ):
         target_last_poll = (
             self.last_degraded_poll
             if last_degraded_poll is _UNSET
             else last_degraded_poll
         )
+        target_was_live = live(self.config) if was_live is _UNSET else was_live
         if expired_state is None:
             exp_count = self.expired_unsent
             exp_at = self.expired_unsent_at
@@ -1014,7 +1037,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "outbox": [dict(item) for item in outbox],
             "outcomes": [dict(item) for item in outcomes[-100:]],
             "initialized": True,
-            "was_live": live(self.config),
+            "was_live": target_was_live,
             "degraded": deg_flag,
             "degraded_reason": deg_reason,
             "degraded_at": deg_at,
@@ -1055,7 +1078,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             outbox,
             outcomes[-100:],
             True,
-            live(self.config),
+            target_was_live,
             deg_flag,
             deg_reason,
             deg_at,
@@ -1213,13 +1236,21 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         )
 
     def _sync_degraded_notification(
-        self, quarantine_ambiguous=None, expired_unsent=None
+        self,
+        quarantine_ambiguous=None,
+        expired_unsent=None,
+        overflow_concurrent=None,
     ):
         if quarantine_ambiguous is None:
             quarantine_ambiguous = self._last_quarantine_ambiguous
         else:
             quarantine_ambiguous = bool(quarantine_ambiguous)
             self._last_quarantine_ambiguous = quarantine_ambiguous
+        if overflow_concurrent is None:
+            overflow_concurrent = getattr(self, "_overflow_concurrent", False)
+        else:
+            overflow_concurrent = bool(overflow_concurrent)
+            self._overflow_concurrent = overflow_concurrent
         if expired_unsent is None:
             expired_unsent = self.expired_unsent
         expired_count = int(expired_unsent or 0)
@@ -1246,6 +1277,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self.degraded_reason,
                 is_live,
                 self.acknowledge_rejected,
+                overflow_concurrent,
                 expired_count,
                 reasons,
             )
@@ -1315,12 +1347,23 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                             else "Monitoring remains degraded in shadow mode until "
                         )
                         if self.degraded_reason == "journal_lost":
-                            recovery_guidance = (
-                                "the seven-day degraded_until horizon expires on a clean poll, "
-                                "or until one-shot acknowledge_degraded_at in situareness.json "
-                                "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
-                                "(acknowledging early discards missing historical tombstones)."
-                            )
+                            if overflow_concurrent:
+                                recovery_guidance = (
+                                    "protected history fits within 1,000 records and the seven-day degraded_until horizon "
+                                    "(or the latest evicted component horizon) expires on a clean poll, "
+                                    "or until one-shot acknowledge_degraded_at in situareness.json "
+                                    "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                                    "once protected records no longer exceed 1,000 "
+                                    "(otherwise the next poll re-latches as cancellation_evidence_overflow with a new degraded_at; "
+                                    "acknowledging early discards missing and evicted tombstones)."
+                                )
+                            else:
+                                recovery_guidance = (
+                                    "the seven-day degraded_until horizon expires on a clean poll, "
+                                    "or until one-shot acknowledge_degraded_at in situareness.json "
+                                    "(degraded_at <= acknowledge_degraded_at <= reload time) takes effect permanently on reload "
+                                    "(acknowledging early discards missing historical tombstones)."
+                                )
                         elif self.degraded_reason == "cancellation_evidence_overflow":
                             recovery_guidance = (
                                 "protected history fits within 1,000 records and degraded_until "
@@ -1642,7 +1685,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             "expired_unsent": self.expired_unsent,
         }
 
-    def _compute_degraded_latch(self, reason, now, until=None):
+    def _compute_degraded_latch(self, reason, now, until=None, matched_reasons=None):
         default_window = MAX_AGE if reason == "outbox_overflow" else MAX_ACCEPTANCE_AGE
         try:
             fallback_until = min(now + default_window, MAX_TIMESTAMP)
@@ -1676,9 +1719,13 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             if (preserve_degraded_at and timestamp(self.degraded_at) is not None)
             else now.isoformat()
         )
+        reasons_in_poll = set(matched_reasons) if matched_reasons else {reason}
         ack_rejected = (
             True
-            if (self._ack_cleared_on_load and reason == self._ack_cleared_reason)
+            if (
+                self._ack_cleared_on_load
+                and self._ack_cleared_reason in reasons_in_poll
+            )
             else None
         )
         return (True, reason, degraded_at, new_until.isoformat(), ack_rejected)
@@ -1698,6 +1745,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         expired_unsent=0,
         expired_outcomes=(),
         degraded_state=None,
+        overflow_concurrent=False,
     ):
         await self.hass.async_add_executor_job(
             _strip_withheld_actions, records, plans, groups, now
@@ -1716,6 +1764,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 expired_state=expired_state,
                 degraded_state=degraded_state,
                 clear_ack_on_load=True,
+                was_live=self.was_live,
             )
         except Exception as save_err:
             raise UpdateFailed(
@@ -1724,6 +1773,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         self._sync_degraded_notification(
             quarantine_ambiguous=bool(getattr(events, "quarantine_ambiguous", False)),
             expired_unsent=self.expired_unsent,
+            overflow_concurrent=overflow_concurrent,
         )
         return self._degraded_health(
             events=events,
@@ -2164,6 +2214,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 return self._stopped_poll_result()
             # Initial shadow setup establishes a baseline; every subsequent restart reconciles normally.
             baseline = not self.initialized and not live(self.config)
+            poll_evidence_reasons = set()
+            if conflicting_cancel:
+                poll_evidence_reasons.add("conflicting_cancellation")
+            if malformed_cancel:
+                poll_evidence_reasons.add("malformed_cancellation")
             degraded_trigger = (
                 "conflicting_cancellation"
                 if conflicting_cancel
@@ -2197,6 +2252,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     err.records if err.records is not None else deepcopy(self.records)
                 )
                 plans = list(getattr(err, "plans", None) or ())
+                poll_evidence_reasons.add("cancellation_evidence_overflow")
                 if degraded_trigger is None:
                     degraded_trigger = "cancellation_evidence_overflow"
                 overflow_horizon = (
@@ -2226,7 +2282,10 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             )
             if degraded_trigger is not None:
                 pending_degraded = self._compute_degraded_latch(
-                    degraded_trigger, now, overflow_horizon
+                    degraded_trigger,
+                    now,
+                    overflow_horizon,
+                    matched_reasons=poll_evidence_reasons,
                 )
             elif self.degraded:
                 horizon = (
@@ -2312,6 +2371,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     expired_unsent=migrated_expired,
                     expired_outcomes=migrated_expired_outcomes,
                     degraded_state=pending_degraded,
+                    overflow_concurrent=(
+                        "cancellation_evidence_overflow" in poll_evidence_reasons
+                    ),
                 )
             pre_drain_attempted_keys = set()
             (
@@ -2431,6 +2493,11 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 expired_state=expired_state,
                 degraded_state=pending_degraded,
                 clear_ack_on_load=True,
+                was_live=(
+                    self.was_live
+                    if getattr(events, "quarantine_ambiguous", False)
+                    else live(self.config)
+                ),
             )
             attempts, failures = await self._finish_poll_delivery(
                 candidate_events,

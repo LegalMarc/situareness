@@ -7685,8 +7685,8 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 json.dumps(
                     {
                         "version": 1,
-                        "data": {"save_id": "abc123", "padding": "x" * 1024},
-                        "trailing": "y" * 1024,
+                        "data": {"save_id": "abc123", "padding": "x" * 6000},
+                        "trailing": "y" * 6000,
                     }
                 ),
                 encoding="utf-8",
@@ -7697,6 +7697,155 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
             p.write_text("{corrupt", encoding="utf-8")
             with self.assertRaises(OSError):
                 mod._verify_store_save(p, "abc123")
+
+        # F1: quarantine_ambiguous on first live poll must preserve was_live=False so shadow alerts activate when clean.
+        # SIT-01 & SIT-02: ack_rejected triggers when cleared reason recurs under higher-precedence reason,
+        # and journal_lost + concurrent overflow reports concurrent-overflow guidance.
+        from datetime import datetime, timedelta, timezone
+
+        now_real = datetime.now(timezone.utc)
+        live_cfg = {**config(), "live_enabled": True, "commissioning_passed": True}
+        ev_raw = feature()
+        ev_raw["properties"]["sent"] = (now_real - timedelta(minutes=2)).isoformat()
+        ev_raw["properties"]["effective"] = (
+            now_real - timedelta(minutes=2)
+        ).isoformat()
+        ev_raw["properties"]["expires"] = (now_real + timedelta(hours=1)).isoformat()
+        ev_raw["properties"]["ends"] = (now_real + timedelta(hours=1)).isoformat()
+        ev = d.normalize(ev_raw)
+        self.assertTrue(d.qualify(ev, live_cfg, now_real)["qualifies"])
+        fp = d.fingerprint(ev, d.qualify(ev, live_cfg, now_real))
+        shadow_rec = {
+            ev["id"]: {
+                "state": "active",
+                "fingerprint": fp,
+                "lineage": [ev["id"]],
+                "actions": {fp: ["new_york_ny"]},
+                "updated": (now_real - timedelta(minutes=1)).isoformat(),
+            }
+        }
+        hass_live = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        coord_amb = mod.SituarenessCoordinator(
+            hass_live,
+            live_cfg,
+            Store(),
+            {"records": shadow_rec, "initialized": True, "was_live": False},
+        )
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents([ev], 1, set(), True),
+        ):
+            await coord_amb._async_update_data()
+        self.assertFalse(coord_amb.was_live)
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents([ev], 1, set(), False),
+        ):
+            h_clean = await coord_amb._async_update_data()
+        self.assertTrue(coord_amb.was_live)
+        self.assertEqual(h_clean["planned_count"], 1)
+
+        notes_r30 = {}
+        fake_pn_r30 = types.SimpleNamespace(
+            async_create=lambda h, msg, title=None, notification_id=None: (
+                notes_r30.__setitem__(notification_id, msg)
+            ),
+            async_dismiss=lambda h, nid: notes_r30.pop(nid, None),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn_r30
+                ),
+                "homeassistant.components.persistent_notification": fake_pn_r30,
+            },
+        ):
+            spec.loader.exec_module(mod)
+        hass_r30 = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        ack_time = (now_real - timedelta(seconds=10)).isoformat()
+        deg_at = (now_real - timedelta(minutes=10)).isoformat()
+        deg_until = (now_real + timedelta(days=7)).isoformat()
+        coord_sit01 = mod.SituarenessCoordinator(
+            hass_r30,
+            {**live_cfg, "acknowledge_degraded_at": ack_time},
+            Store(),
+            {
+                "degraded": True,
+                "degraded_reason": "cancellation_evidence_overflow",
+                "degraded_at": deg_at,
+                "degraded_until": deg_until,
+                "records": shadow_rec,
+                "initialized": True,
+            },
+        )
+        with (
+            patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents([], 0, set(), False),
+            ),
+            patch.object(
+                mod,
+                "_resolve_and_scan_candidates",
+                return_value=([], False, False, True),
+            ),
+            patch.object(
+                mod,
+                "reconcile",
+                side_effect=d.CancellationEvidenceOverflow(
+                    "overflow", records=shadow_rec
+                ),
+            ),
+        ):
+            await coord_sit01._async_update_data()
+        self.assertTrue(coord_sit01.acknowledge_rejected)
+        self.assertEqual(coord_sit01.degraded_reason, "malformed_cancellation")
+
+        notes_r30.clear()
+        coord_sit02 = mod.SituarenessCoordinator(
+            hass_r30,
+            live_cfg,
+            Store(),
+            {
+                "degraded": True,
+                "degraded_reason": "journal_lost",
+                "degraded_at": deg_at,
+                "degraded_until": deg_until,
+                "records": {},
+                "initialized": True,
+            },
+        )
+        with (
+            patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents([], 0, set(), False),
+            ),
+            patch.object(
+                mod,
+                "reconcile",
+                side_effect=d.CancellationEvidenceOverflow(
+                    "overflow", records=shadow_rec
+                ),
+            ),
+        ):
+            await coord_sit02._async_update_data()
+        self.assertIn(
+            "protected history fits within 1,000 records",
+            notes_r30["situareness_degraded"],
+        )
 
         now_dt = d.timestamp("2026-06-01T16:00:00+00:00")
         cfg = config()

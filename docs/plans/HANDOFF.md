@@ -2,6 +2,19 @@
 
 Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 18 thirtieth Opus repair candidate
+
+Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `30e7149` (`run_id`: `20261118T180246Z-dd8694`, 216.4s standards) reported **0 Critical findings**, 0 Specification findings above Low, and 6 unique findings (`F1` High, `F2`/`SIT-01`/`SIT-02` Low, `F3`/`SIT-03` Nit).
+
+All 6 findings were repaired cleanly in Round 30 (`custom_components/situareness/__init__.py`, `custom_components/situareness/domain.py`, `extension/room.html`, `extension/room.js`, `home-assistant/README.md`, `docs/ha/README.md`, `tests/ha/test_domain.py`, `tests/ha/test_coordinator.py`, and `tests/browser/room.spec.js`):
+- **`F1`**: Preserved `was_live=self.was_live` across `quarantine_ambiguous` and `_persist_degraded_poll` saves, and cleared carried-over shadow `actions` on non-cancelled `_quarantined_record` transitions during `activate=True` so shadow-seen alerts blocked or quarantined on the first live poll still activate on the next clean poll without re-delivering already-activated alerts.
+- **`F2`**: Replaced full multi-MB JSON re-parsing in `_verify_store_save()` with a 4 KiB tail check for `"save_id"` plus a bounded chunked binary scan fallback (documented in `docs/ha/README.md`).
+- **`F3`**: Updated `home-assistant/README.md` to state that `outbox_overflow` clears on the next successful poll whose new plans fit (or 15 minutes after the latest overflow if unrenewed).
+- **`SIT-01` & `SIT-02`**: Tracked all triggering evidence reasons in `poll_evidence_reasons` so `_compute_degraded_latch` sets `acknowledge_rejected=True` even when an acknowledged cleared reason recurs under a higher-precedence reason, and added concurrent-overflow recovery guidance to `journal_lost` `situareness_degraded` notices when `cancellation_evidence_overflow` occurs simultaneously.
+- **`SIT-03`**: Added `id="dashboard-divider" hidden` before `#dashboard-link` in `extension/room.html` and toggled it in `extension/room.js` when `context_dashboard` is null or unsafe.
+
+Verification on the repaired candidate: `ruff check`/`ruff format --check` (12 files), `44` Node, `134` stdlib `-W error` HA, `7` skill, `22` Chromium Playwright, and `13` real HA = `220` total tests, deterministic packaging (`9d54a200...` extension ZIP, `248f9c57...` HA ZIP), live anonymous smoke (`2026-11-18T18:13:25.267Z`, HTTP 200 across NWS/USGS/BBC), and `audit_private.py`. Next: run full clean `run_gates.py`, commit/push to `wip/supervisor-handoff-20261117`, and run Opus `axes` + fresh `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 18 twenty-ninth Opus repair candidate
 
 Independent Claude Opus 5.5 (`claude-opus-5-5`, medium effort) `standards` and `spec` reviews of `27fb7a0` (`run_id`: `20261118T162534Z-c7cb5b`, 282.4s standards and 350.8s specification) reported **0 Critical findings**, 0 Standards findings above Low, and 7 unique findings (`F1` High, `F2`/`F3`/`SR-01`/`SR-02` Low, `SR-03`/`SR-04` Nit).
