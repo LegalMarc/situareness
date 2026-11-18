@@ -74,6 +74,8 @@ def cohere(event, *refs):
         sent = max(
             sent, max(d.timestamp(ref["sent"]) for ref in refs) + timedelta(seconds=1)
         )
+        if event.get("message_type") == "Alert":
+            event["message_type"] = "Update"
     event["sent"] = sent.isoformat()
     identifier = event["id"].split("/alerts/", 1)[1]
     event["cap_identity"] = ["nws@example.test", identifier, event["sent"]]
@@ -801,6 +803,12 @@ class Policy(unittest.TestCase):
             {"acknowledge_degraded_at": 123},
             {"acknowledge_degraded_at": "   "},
             {"acknowledge_degraded_at": "2026-11-17T10:00:00Z\n"},
+            {"acknowledge_degraded_at": "2026-11-17T10:00:00Z\u007f"},
+            {"acknowledge_degraded_at": "2026-11-17T10:00:00Z\u0085"},
+            {"acknowledge_degraded_at": "2026-11-17T10:00:00Z\u009f"},
+            {"locations": {"x": {"name": "New York\u007f"}}},
+            {"locations": {"x": {"name": "New York\u0085"}}},
+            {"locations": {"x": {"name": "New York\u009f"}}},
         ):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 c.validate(raw)
@@ -1353,6 +1361,7 @@ class Collector(unittest.IsolatedAsyncioTestCase):
         successor = copy.deepcopy(predecessor)
         successor["id"] += "-update"
         successor["properties"]["id"] += "-update"
+        successor["properties"]["messageType"] = "Update"
         successor["properties"]["sent"] = "2026-11-15T19:56:00Z"
         successor["properties"]["references"] = [
             {
@@ -2093,6 +2102,103 @@ class Collector(unittest.IsolatedAsyncioTestCase):
                 [],
             )
         self.assertEqual(ctx.exception.dropped_horizon, d.MAX_TIMESTAMP)
+
+    async def test_non_actual_and_alert_messages_do_not_supersede_actual_alerts(self):
+        import json
+
+        actual_raw = feature()
+        actual_raw["id"] = "https://api.weather.gov/alerts/actual-p"
+        actual_raw["properties"]["id"] = "actual-p"
+        actual_raw["properties"]["sent"] = "2026-11-15T19:55:00Z"
+        actual_norm = d.normalize(actual_raw)
+
+        for status in ("Test", "Exercise", "System"):
+            for msg_type in ("Update", "Cancel"):
+                non_actual_raw = copy.deepcopy(actual_raw)
+                non_actual_raw["id"] = (
+                    f"https://api.weather.gov/alerts/{status.lower()}-{msg_type.lower()}"
+                )
+                non_actual_raw["properties"]["id"] = (
+                    f"{status.lower()}-{msg_type.lower()}"
+                )
+                non_actual_raw["properties"]["status"] = status
+                non_actual_raw["properties"]["messageType"] = msg_type
+                non_actual_raw["properties"]["sent"] = "2026-11-15T19:56:00Z"
+                non_actual_raw["properties"]["references"] = [
+                    {
+                        "@id": actual_raw["id"],
+                        "identifier": actual_raw["properties"]["id"],
+                        "sender": actual_raw["properties"]["sender"],
+                        "sent": actual_raw["properties"]["sent"],
+                    }
+                ]
+                non_actual_norm = d.normalize(non_actual_raw)
+
+                # collector.fetch and resolve_candidates do not hide actual_raw.
+                body = {
+                    "type": "FeatureCollection",
+                    "features": [actual_raw, non_actual_raw],
+                }
+                fetched = await collector.fetch(
+                    Session(Response(json.dumps(body).encode())), ["NY"]
+                )
+                self.assertEqual(
+                    {e["id"] for e in fetched},
+                    {actual_raw["id"], non_actual_raw["id"]},
+                )
+                resolved = d.resolve_candidates(
+                    {},
+                    [actual_norm, non_actual_norm],
+                    [actual_norm, non_actual_norm],
+                    NOW,
+                )
+                self.assertEqual(
+                    {e["id"] for e in resolved},
+                    {actual_raw["id"], non_actual_raw["id"]},
+                )
+
+                # reconcile does not supersede, cancel, or merge lineage with actual_norm.
+                prior, _ = d.reconcile({}, [actual_norm], config(), NOW)
+                recs_absent, _ = d.reconcile(prior, [non_actual_norm], config(), NOW)
+                self.assertEqual(
+                    recs_absent[actual_norm["id"]]["state"], "ended_or_absent"
+                )
+                self.assertEqual(
+                    recs_absent[non_actual_norm["id"]]["lineage"],
+                    [non_actual_norm["id"]],
+                )
+                recs_both, plans_both = d.reconcile(
+                    prior, [actual_norm, non_actual_norm], config(), NOW
+                )
+                self.assertEqual(recs_both[actual_norm["id"]]["state"], "active")
+                self.assertEqual(plans_both, [])
+
+        # An Actual Alert with spurious references also does not supersede prior actual_norm.
+        spurious_alert = d.normalize(actual_raw)
+        spurious_alert["id"] = "https://api.weather.gov/alerts/spurious-alert"
+        spurious_alert["sent"] = "2026-11-15T19:57:00Z"
+        spurious_alert["cap_identity"] = [
+            "nws@example.test",
+            "spurious-alert",
+            spurious_alert["sent"],
+        ]
+        spurious_alert["references"] = [actual_norm["id"]]
+        spurious_alert["reference_identities"] = [actual_norm["cap_identity"]]
+        spurious_alert["cap_references_valid"] = True
+        resolved_spurious = d.resolve_candidates(
+            {}, [actual_norm, spurious_alert], [actual_norm, spurious_alert], NOW
+        )
+        self.assertEqual(
+            {e["id"] for e in resolved_spurious},
+            {actual_norm["id"], spurious_alert["id"]},
+        )
+        prior_p, _ = d.reconcile({}, [actual_norm], config(), NOW)
+        recs_spurious, _ = d.reconcile(prior_p, [spurious_alert], config(), NOW)
+        self.assertEqual(recs_spurious[actual_norm["id"]]["state"], "ended_or_absent")
+        self.assertEqual(
+            recs_spurious[spurious_alert["id"]]["lineage"],
+            [spurious_alert["id"]],
+        )
 
 
 if __name__ == "__main__":

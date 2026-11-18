@@ -175,6 +175,8 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         def mark_cap(event, seconds, refs=()):
             sent = (now + timedelta(seconds=seconds)).isoformat()
             event["sent"] = sent
+            if refs and event.get("message_type") == "Alert":
+                event["message_type"] = "Update"
             event["cap_identity"] = [
                 "nws@example.test",
                 event["id"].split("/alerts/", 1)[1],
@@ -3134,7 +3136,10 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
                 with patch.object(mod, "fetch", return_value=[]):
                     await coord._async_update_data()
                 self.assertNotIn("_clear_corrupt_store_backups", exec_calls)
+                self.assertIn("_resolve_and_scan_candidates", exec_calls)
                 self.assertIn("reconcile", exec_calls)
+                self.assertIn("_migrate_outbox_with_index", exec_calls)
+                self.assertIn("_count_deliverable", exec_calls)
 
                 # Two consecutive degraded polls with advancing timestamps emit notification once.
                 with patch.object(mod, "fetch", return_value=[bad_cancel]):
@@ -4114,3 +4119,307 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         clean_hc = mod.SituarenessCoordinator(hass, cfg, Store(), healthy_store)
         self.assertFalse(clean_hc.acknowledge_rejected)
         self.assertNotIn("situareness_degraded", notifications)
+
+    async def test_supersession_outbox_isolation_multi_ack_and_rejection_transitions(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+        from test_domain import c
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, notification_id: notifications.pop(
+                notification_id, None
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        now = datetime.now(timezone.utc)
+        cfg = config()
+        cfg.update(
+            live_enabled=True,
+            commissioning_passed=True,
+            phones=["mobile_app_one"],
+            tts_entity=None,
+        )
+
+        # Non-Actual Test Update/Cancel and Actual Alert messages referencing P
+        # do not steal or suspend P's pending outbox items.
+        class FlakyServices:
+            def __init__(self):
+                self.calls = []
+                self.fail = True
+
+            async def async_call(self, *args, **kwargs):
+                self.calls.append(args)
+                if self.fail:
+                    raise OSError("transient")
+
+        p_ev = d.normalize(feature())
+        p_ev["id"] = "https://api.weather.gov/alerts/outbox-p"
+        for key, delta in [
+            ("sent", -120),
+            ("effective", -120),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            p_ev[key] = (now + timedelta(seconds=delta)).isoformat()
+        cohere(p_ev)
+
+        test_upd = d.normalize(feature())
+        test_upd["id"] = "https://api.weather.gov/alerts/test-ref-p"
+        test_upd["status"] = "Test"
+        test_upd["message_type"] = "Update"
+        for key, delta in [
+            ("sent", -60),
+            ("effective", -60),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            test_upd[key] = (now + timedelta(seconds=delta)).isoformat()
+        cohere(test_upd, p_ev)
+        test_upd["message_type"] = "Update"
+
+        spurious_alert = d.normalize(feature())
+        spurious_alert["id"] = "https://api.weather.gov/alerts/alert-ref-p"
+        spurious_alert["instruction"] = "Ignore."
+        for key, delta in [
+            ("sent", -30),
+            ("effective", -30),
+            ("onset", 0),
+            ("expires", 1800),
+            ("ends", 1800),
+        ]:
+            spurious_alert[key] = (now + timedelta(seconds=delta)).isoformat()
+        cohere(spurious_alert, p_ev)
+        spurious_alert["message_type"] = "Alert"
+
+        flaky = FlakyServices()
+        outbox_store = Store()
+        outbox_hass = types.SimpleNamespace(data={}, services=flaky)
+        coord_p = mod.SituarenessCoordinator(outbox_hass, cfg, outbox_store, {})
+        with patch.object(mod, "fetch", return_value=[p_ev]):
+            await coord_p._async_update_data()
+        self.assertEqual(len(coord_p.outbox), 1)
+        self.assertEqual(coord_p.outbox[0]["incident_id"], p_ev["id"])
+
+        with patch.object(mod, "fetch", return_value=[p_ev, test_upd, spurious_alert]):
+            h_mig = await coord_p._async_update_data()
+        self.assertEqual(h_mig["pending_count"], 1)
+        self.assertEqual(coord_p.outbox[0]["incident_id"], p_ev["id"])
+        self.assertEqual(coord_p.records[p_ev["id"]]["state"], "active")
+
+        # Multi-slot consumed_acknowledgements:
+        # Trigger 1: future B recorded in entry.data over store A without store save
+        # survives reload with ack removed, and next _save() preserves [A, B].
+        ack_a = (now - timedelta(hours=2)).isoformat()
+        ack_b = (now + timedelta(hours=1)).isoformat()
+        store_with_a = {
+            "records": {},
+            "outbox": [],
+            "initialized": True,
+            "was_live": True,
+            "acknowledged_degraded_at": ack_a,
+        }
+        entry_m = types.SimpleNamespace(entry_id="multi-ack", data={})
+        hass_m = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            config_entries=types.SimpleNamespace(
+                async_update_entry=lambda ent, data=None: setattr(ent, "data", data)
+            ),
+        )
+        c_b_rej = mod.SituarenessCoordinator(
+            hass_m,
+            c.validate({**cfg, "acknowledge_degraded_at": ack_b}),
+            Store(),
+            store_with_a,
+            entry=entry_m,
+        )
+        self.assertTrue(c_b_rej.acknowledge_rejected)
+        self.assertEqual(entry_m.data.get("consumed_acknowledgements"), [ack_a, ack_b])
+        self.assertEqual(entry_m.data.get("acknowledged_degraded_at"), ack_b)
+
+        save_store_m = Store()
+        c_no_ack = mod.SituarenessCoordinator(
+            hass_m, cfg, save_store_m, store_with_a, entry=entry_m
+        )
+        self.assertEqual(c_no_ack.consumed_acknowledgements, [ack_a, ack_b])
+        self.assertEqual(c_no_ack.acknowledged_degraded_at, ack_b)
+        with patch.object(mod, "fetch", return_value=[]):
+            await c_no_ack._async_update_data()
+        self.assertEqual(
+            save_store_m.saved[-1]["consumed_acknowledgements"], [ack_a, ack_b]
+        )
+        self.assertEqual(save_store_m.saved[-1]["acknowledged_degraded_at"], ack_b)
+
+        # Trigger 2: consuming ack_1 then ack_2 remembers both and rejects replaying ack_1.
+        ack_1 = (now - timedelta(minutes=20)).isoformat()
+        ack_2 = (now - timedelta(minutes=5)).isoformat()
+        entry_t2 = types.SimpleNamespace(entry_id="multi-t2", data={})
+        store_t2 = Store()
+        deg1 = {
+            "records": {},
+            "outbox": [],
+            "initialized": True,
+            "was_live": True,
+            "degraded": True,
+            "degraded_reason": "journal_lost",
+            "degraded_at": (now - timedelta(minutes=30)).isoformat(),
+            "degraded_until": (now + timedelta(days=7)).isoformat(),
+        }
+        c_rec1 = mod.SituarenessCoordinator(
+            hass_m,
+            {**cfg, "acknowledge_degraded_at": ack_1},
+            store_t2,
+            deg1,
+            entry=entry_t2,
+        )
+        self.assertFalse(c_rec1.degraded)
+        with patch.object(mod, "fetch", return_value=[]):
+            await c_rec1._async_update_data()
+
+        deg2 = {
+            **store_t2.saved[-1],
+            "degraded": True,
+            "degraded_reason": "cancellation_evidence_overflow",
+            "degraded_at": (now - timedelta(minutes=10)).isoformat(),
+            "degraded_until": (now + timedelta(days=7)).isoformat(),
+        }
+        c_rec2 = mod.SituarenessCoordinator(
+            hass_m,
+            {**cfg, "acknowledge_degraded_at": ack_2},
+            store_t2,
+            deg2,
+            entry=entry_t2,
+        )
+        self.assertFalse(c_rec2.degraded)
+        with patch.object(mod, "fetch", return_value=[]):
+            await c_rec2._async_update_data()
+        self.assertEqual(
+            store_t2.saved[-1]["consumed_acknowledgements"], [ack_1, ack_2]
+        )
+
+        deg3 = {
+            **store_t2.saved[-1],
+            "degraded": True,
+            "degraded_reason": "malformed_cancellation",
+            "degraded_at": (now - timedelta(minutes=2)).isoformat(),
+            "degraded_until": (now + timedelta(days=7)).isoformat(),
+        }
+        c_replay1 = mod.SituarenessCoordinator(
+            hass_m,
+            {**cfg, "acknowledge_degraded_at": ack_1},
+            Store(),
+            deg3,
+            entry=entry_t2,
+        )
+        self.assertTrue(c_replay1.degraded)
+        self.assertTrue(c_replay1.acknowledge_rejected)
+
+        # acknowledge_rejected remains True and notifies after degraded_until expiry AND
+        # after outbox_overflow auto-clear while naive/future acknowledge_degraded_at stays set.
+        class ExpiryClock:
+            current = None
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        ExpiryClock.current = now + timedelta(minutes=1)
+        notifications.clear()
+        with patch.object(mod, "datetime", ExpiryClock):
+            exp_coord = mod.SituarenessCoordinator(
+                hass_m,
+                c.validate({**cfg, "acknowledge_degraded_at": "2026-11-17T10:00:00"}),
+                Store(),
+                {
+                    "records": {},
+                    "outbox": [],
+                    "initialized": True,
+                    "was_live": True,
+                    "degraded": True,
+                    "degraded_reason": "cancellation_evidence_overflow",
+                    "degraded_at": (now - timedelta(days=8)).isoformat(),
+                    "degraded_until": (now - timedelta(minutes=1)).isoformat(),
+                },
+            )
+            with patch.object(mod, "fetch", return_value=[]):
+                h_exp = await exp_coord._async_update_data()
+        self.assertFalse(exp_coord.degraded)
+        self.assertFalse(h_exp["evidence_degraded"])
+        self.assertTrue(h_exp["acknowledge_rejected"])
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness acknowledgement rejected",
+        )
+
+        # Same persistence across outbox_overflow auto-clear.
+        notifications.clear()
+        ov_auto_coord = mod.SituarenessCoordinator(
+            hass_m,
+            c.validate({**cfg, "acknowledge_degraded_at": "2026-11-17T10:00:00"}),
+            Store(),
+            {
+                "records": {},
+                "outbox": [],
+                "initialized": True,
+                "was_live": True,
+                "degraded": True,
+                "degraded_reason": "outbox_overflow",
+                "degraded_at": (now - timedelta(minutes=1)).isoformat(),
+                "degraded_until": (now + timedelta(minutes=14)).isoformat(),
+            },
+        )
+        with patch.object(mod, "fetch", return_value=[]):
+            h_ov_clear = await ov_auto_coord._async_update_data()
+        self.assertFalse(ov_auto_coord.degraded)
+        self.assertIsNone(h_ov_clear["degraded_reason"])
+        self.assertTrue(h_ov_clear["acknowledge_rejected"])
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness acknowledgement rejected",
+        )
+
+        # Merged quarantine_ambiguous + acknowledge_rejected notification copy preserves both notices.
+        notifications.clear()
+        ambig_coord = mod.SituarenessCoordinator(
+            hass_m,
+            c.validate({**cfg, "acknowledge_degraded_at": "2026-11-17T10:00:00"}),
+            Store(),
+            {"records": {}, "outbox": [], "initialized": True, "was_live": True},
+        )
+        ambig_events = collector.CollectedEvents([], 1, [], True)
+        with patch.object(mod, "fetch", return_value=ambig_events):
+            h_ambig = await ambig_coord._async_update_data()
+        self.assertTrue(h_ambig["quarantine_ambiguous"])
+        self.assertTrue(h_ambig["acknowledge_rejected"])
+        merged_note = notifications["situareness_degraded"]
+        self.assertEqual(merged_note["title"], "Situareness alert scope ambiguous")
+        self.assertIn("acknowledge_degraded_at", merged_note["message"])
+        self.assertIn("rejected", merged_note["message"])

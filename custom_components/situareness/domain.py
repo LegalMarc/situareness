@@ -835,6 +835,13 @@ def _invalid_graph_ids(prior, graph_events, now=None):
     return invalid_ids
 
 
+def _actual_superseding(event):
+    return event.get("status") == "Actual" and event.get("message_type") in (
+        "Update",
+        "Cancel",
+    )
+
+
 def resolve_candidates(previous, events, graph_events=None, now=None):
     """Restore predecessors hidden by a graph update rejected against prior state."""
     if graph_events is None:
@@ -844,7 +851,7 @@ def resolve_candidates(previous, events, graph_events=None, now=None):
     by_graph_id = {e["id"]: e for e in graph_list}
     valid_superseded = set()
     for source in graph_list:
-        if source["id"] in invalid_ids:
+        if source["id"] in invalid_ids or not _actual_superseding(source):
             continue
         references = list(
             zip(source.get("references", []), source.get("reference_identities", []))
@@ -938,7 +945,11 @@ def _cancel_record_identity(
             uncertain_targets = sorted(set(refs))
         return lineage, cap_id, cap_refs, uncertain_targets
     lineage = (
-        prior_rec.get("lineage", [eid]) if keep_prior_identity else sorted({eid, *refs})
+        prior_rec.get("lineage", [eid])
+        if keep_prior_identity
+        else sorted({eid, *refs})
+        if _actual_superseding(event)
+        else [eid]
     )
     cap_id = (
         prior_rec.get("cap_identity")
@@ -1121,9 +1132,11 @@ def reconcile(
             source.get("status") == "Actual" and source.get("message_type") == "Cancel"
         )
 
-    # Invalid/conflicting messages cannot establish lineage edges across siblings.
+    # Invalid/conflicting or non-superseding messages cannot establish lineage edges across siblings.
     grouping_events = [
-        {**source, "references": []} if source["id"] in invalid_ids else source
+        {**source, "references": []}
+        if source["id"] in invalid_ids or not _actual_superseding(source)
+        else source
         for source in graph_events
     ]
     groups, members = lineage_index(prior, grouping_events)
@@ -1163,6 +1176,7 @@ def reconcile(
         ref
         for e in events
         if e["id"] not in invalid_ids
+        and _actual_superseding(e)
         and e["id"] not in (uncertain_ids - continuing_uncertain_ids)
         and e["id"] not in cancelled_ids
         for ref in e.get("references", [])
@@ -1267,14 +1281,23 @@ def reconcile(
     candidate_ids = {event["id"] for event in events}
     for source in graph_events:
         eid = source["id"]
-        if eid not in records and eid not in candidate_ids and eid not in invalid_ids:
+        if (
+            eid not in records
+            and eid not in candidate_ids
+            and eid not in invalid_ids
+            and source.get("status") == "Actual"
+            and source.get("message_type") in ("Alert", "Update", "Cancel")
+        ):
+            can_supersede = _actual_superseding(source)
             records[eid] = {
                 "state": "superseded",
                 "actions": {},
-                "lineage": sorted({eid, *source.get("references", [])}),
+                "lineage": sorted({eid, *source.get("references", [])})
+                if can_supersede
+                else [eid],
                 "cap_identity": source.get("cap_identity"),
                 "cap_references": source.get("reference_identities")
-                if source.get("cap_references_valid")
+                if can_supersede and source.get("cap_references_valid")
                 else None,
                 "cancel_message": False,
                 "sent": source.get("sent"),
@@ -1500,7 +1523,7 @@ def reconcile(
                 record["cancelled_at"] = cancelled_at
         records[eid] = record
         seen.add(eid)
-        if not (cancelled or blocked):
+        if not (cancelled or blocked) and _actual_superseding(event):
             referenced.update(ref for ref in refs if ref != eid)
     for eid in cancelled_ids:
         if eid in records and not records[eid].get("cancel_message"):

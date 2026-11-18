@@ -39,7 +39,7 @@ def validate(raw):
             not isinstance(name_value, str)
             or not name_value.strip()
             or len(name_value) > 100
-            or any(ord(ch) < 32 for ch in name_value)
+            or any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in name_value)
         ):
             raise ValueError("invalid location name")
         p = loc.get("point")
@@ -106,7 +106,7 @@ def validate(raw):
         if (
             not isinstance(ack, str)
             or not ack.strip()
-            or any(ord(ch) < 32 for ch in ack)
+            or any(ord(ch) < 32 or 127 <= ord(ch) <= 159 for ch in ack)
         ):
             raise ValueError("acknowledge_degraded_at must be a string")
         ack_stripped = ack.strip()
