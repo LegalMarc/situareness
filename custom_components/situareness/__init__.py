@@ -21,6 +21,7 @@ from .const import DOMAIN
 from .delivery import (
     MAX_AGE,
     MAX_ATTEMPTS,
+    _active_target_record,
     deliver_one,
     expired_by_age,
     expiry_reason,
@@ -388,11 +389,23 @@ def _resolve_and_scan_candidates(records, events, source_events, now):
 
 
 def _migrate_outbox_with_index(
-    outbox, records, events, now, config, degraded_delta=None
+    outbox,
+    records,
+    events,
+    now,
+    config,
+    degraded_delta=None,
+    plans=(),
+    prior_records=None,
 ):
     groups, _ = lineage_index(records, [])
     if not live(config):
         return groups, [], 0, []
+    planned_group_fps = {
+        (groups.get(plan["id"]), plan["fingerprint"])
+        for plan in plans
+        if isinstance(plan, dict) and "id" in plan and "fingerprint" in plan
+    }
     event_index = {}
     for event in events:
         eid = event["id"]
@@ -409,18 +422,53 @@ def _migrate_outbox_with_index(
         if not isinstance(item, dict):
             continue
         incident = item.get("incident_id")
-        if records.get(incident, {}).get("state") == "cancelled":
-            key = _outbox_signature(groups, item, records)
-            prior_can = cancelled_unique.get(key)
-            if prior_can is None or item["attempts"] > prior_can["attempts"]:
-                cancelled_unique[key] = item
-            continue
+        incident_state = records.get(incident, {}).get("state")
         successors = event_index.get(
             (groups.get(incident), item.get("fingerprint")), []
         )
-        if records.get(incident, {}).get("state") == "quarantined":
-            successors = []
-        if successors:
+        if incident_state in ("cancelled", "quarantined"):
+            group_fp = (groups.get(incident), item.get("fingerprint"))
+            can_migrate = (
+                incident_state == "cancelled" or group_fp not in planned_group_fps
+            )
+            active_siblings = (
+                [
+                    eid
+                    for eid in successors
+                    if eid != incident
+                    and records.get(eid, {}).get("state") == "active"
+                    and not (
+                        incident_state == "quarantined"
+                        and prior_records is not None
+                        and prior_records.get(incident, {}).get("state")
+                        == "quarantined"
+                        and prior_records.get(eid, {}).get("state") == "active"
+                    )
+                ]
+                if can_migrate
+                else []
+            )
+            migrated_candidate = None
+            for successor in active_siblings:
+                candidate = {
+                    **item,
+                    "incident_id": successor,
+                    "source_url": successor,
+                }
+                if pending_valid(
+                    candidate, records, config, check_time, allow_suspended=True
+                ):
+                    migrated_candidate = candidate
+                    break
+            if migrated_candidate is not None:
+                item = migrated_candidate
+            elif incident_state == "cancelled":
+                key = _outbox_signature(groups, item, records)
+                prior_can = cancelled_unique.get(key)
+                if prior_can is None or item["attempts"] > prior_can["attempts"]:
+                    cancelled_unique[key] = item
+                continue
+        elif successors:
             successor = successors[0]
             candidate = {
                 **item,
@@ -433,7 +481,7 @@ def _migrate_outbox_with_index(
                 item = candidate
         if (
             degraded_delta is not None
-            and records.get(item.get("incident_id"), {}).get("state") == "active"
+            and _active_target_record(item, records)
             and pending_valid(item, records, config, check_time, allow_suspended=True)
         ):
             created_ts = timestamp(item.get("created"))
@@ -1305,11 +1353,15 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             expired_note = ""
         if self.degraded:
             is_live = live(self.config)
+            is_quarantine_ambiguous = bool(quarantine_ambiguous)
             state = (
                 self.degraded_reason,
                 is_live,
                 self.acknowledge_rejected,
                 overflow_concurrent,
+                is_quarantine_ambiguous
+                if self.degraded_reason == "outbox_overflow"
+                else False,
                 expired_count,
                 reasons,
             )
@@ -1333,11 +1385,18 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                             "bounded delivery attempts "
                         )
                     )
+                    quarantine_note = (
+                        " Output is currently blocked for this poll because Situareness could not determine safe scope "
+                        "for one or more malformed NWS features, so all alert lineages are suspended."
+                        if is_quarantine_ambiguous
+                        else ""
+                    )
                     message = (
                         lead
                         + f"up to 100 queued targets per poll (30s deadline, {max_age_mins}-minute MAX_AGE), "
                         + f"so queued targets (including first attempts) beyond ~1,500 attempts per {max_age_mins}-minute window "
                         + "(or fewer under slow timeouts) can expire unsent (expired_unsent)."
+                        + quarantine_note
                         + expired_note
                         + " "
                         + rej_note
@@ -2406,6 +2465,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     now,
                     self.config,
                     degraded_delta=degraded_delta,
+                    plans=plans,
+                    prior_records=self.records,
                 )
             )
             if self._stopping:
@@ -2527,7 +2588,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 )
             if self._stopping:
                 return self._stopped_poll_result()
-            if pending_degraded[0] and pending_degraded[1] == "outbox_overflow":
+            is_quarantine_ambiguous = bool(
+                getattr(events, "quarantine_ambiguous", False)
+            )
+            if (
+                pending_degraded[0]
+                and pending_degraded[1] == "outbox_overflow"
+                and not is_quarantine_ambiguous
+            ):
                 pending_degraded = (
                     False,
                     None,
@@ -2556,9 +2624,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 degraded_state=pending_degraded,
                 clear_ack_on_load=True,
                 was_live=(
-                    self.was_live
-                    if getattr(events, "quarantine_ambiguous", False)
-                    else live(self.config)
+                    self.was_live if is_quarantine_ambiguous else live(self.config)
                 ),
             )
             attempts, failures = await self._finish_poll_delivery(
@@ -2579,6 +2645,25 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 self.config,
                 datetime.now(timezone.utc),
             )
+            if self.degraded:
+                self._sync_degraded_notification(
+                    quarantine_ambiguous=is_quarantine_ambiguous,
+                    expired_unsent=total_expired_unsent,
+                )
+                return self._degraded_health(
+                    events=events,
+                    candidate_events=candidate_events,
+                    records=records,
+                    now=now,
+                    triggered_now=False,
+                    recoverable_prior_conflict=recoverable_prior_conflict,
+                    planned_count=0,
+                    withheld_count=0,
+                    delivery_attempts=attempts,
+                    delivery_failures=failures,
+                    deliverable=deliverable,
+                    expired_unsent=total_expired_unsent,
+                )
             return self._healthy_snapshot(
                 events,
                 candidate_events,
@@ -2600,64 +2685,72 @@ class SituarenessCoordinator(DataUpdateCoordinator):
 
 
 async def async_setup_entry(hass, entry):
-    _clear_retry_listener(hass, entry.entry_id)
     try:
-        config = await hass.async_add_executor_job(
-            _read_config, hass.config.path("situareness.json")
+        try:
+            config = await hass.async_add_executor_job(
+                _read_config, hass.config.path("situareness.json")
+            )
+        except (ValueError, OSError, json.JSONDecodeError) as err:
+            raise ConfigEntryNotReady(f"Invalid situareness.json: {err}") from err
+        prefix = f"{DOMAIN}.{entry.entry_id}"
+        store = Store(
+            hass,
+            1,
+            prefix,
+            private=True,
+            atomic_writes=True,
+            serialize_in_event_loop=False,
         )
-    except (ValueError, OSError, json.JSONDecodeError) as err:
-        raise ConfigEntryNotReady(f"Invalid situareness.json: {err}") from err
-    prefix = f"{DOMAIN}.{entry.entry_id}"
-    store = Store(
-        hass,
-        1,
-        prefix,
-        private=True,
-        atomic_writes=True,
-        serialize_in_event_loop=False,
-    )
-    store_file_existed = await hass.async_add_executor_job(
-        Path(hass.config.path(".storage", prefix)).exists
-    )
-    try:
-        persisted = await store.async_load()
-    except (json.JSONDecodeError, ValueError, NotImplementedError):
-        persisted = ["unreadable"]
-    except Exception as err:
-        cause = getattr(err, "__cause__", None)
-        if isinstance(err, OSError) or isinstance(cause, OSError):
-            raise ConfigEntryNotReady(f"Could not read persisted store: {err}") from err
-        if (
-            isinstance(cause, (ValueError, NotImplementedError))
-            or type(err).__name__ == "UnsupportedStorageVersionError"
-        ):
+        store_file_existed = await hass.async_add_executor_job(
+            Path(hass.config.path(".storage", prefix)).exists
+        )
+        try:
+            persisted = await store.async_load()
+        except (json.JSONDecodeError, ValueError, NotImplementedError):
             persisted = ["unreadable"]
-        else:
-            raise ConfigEntryNotReady(f"Could not load persisted store: {err}") from err
-    has_corrupt_backup = await hass.async_add_executor_job(
-        _has_corrupt_store_backup, hass.config.path(".storage"), prefix
-    )
-    persisted_valid = None
-    if (persisted is None or persisted == {}) and has_corrupt_backup:
-        if persisted is None and (
-            store_file_existed
-            or "malformed_store_at" in entry.data
-            or entry.data.get("journal_initialized") is not True
-        ):
-            persisted = ["corrupt_json"]
-    elif isinstance(persisted, dict) and persisted:
-        persisted_valid = await hass.async_add_executor_job(
-            _valid_persisted_store, persisted
+        except Exception as err:
+            cause = getattr(err, "__cause__", None)
+            if isinstance(err, OSError) or isinstance(cause, OSError):
+                raise ConfigEntryNotReady(
+                    f"Could not read persisted store: {err}"
+                ) from err
+            if (
+                isinstance(cause, (ValueError, NotImplementedError))
+                or type(err).__name__ == "UnsupportedStorageVersionError"
+            ):
+                persisted = ["unreadable"]
+            else:
+                raise ConfigEntryNotReady(
+                    f"Could not load persisted store: {err}"
+                ) from err
+        has_corrupt_backup = await hass.async_add_executor_job(
+            _has_corrupt_store_backup, hass.config.path(".storage"), prefix
         )
-    coordinator = SituarenessCoordinator(
-        hass,
-        config,
-        store,
-        persisted,
-        entry=entry,
-        has_corrupt_backup=has_corrupt_backup,
-        persisted_valid=persisted_valid,
-    )
+        persisted_valid = None
+        if (persisted is None or persisted == {}) and has_corrupt_backup:
+            if persisted is None and (
+                store_file_existed
+                or "malformed_store_at" in entry.data
+                or entry.data.get("journal_initialized") is not True
+            ):
+                persisted = ["corrupt_json"]
+        elif isinstance(persisted, dict) and persisted:
+            persisted_valid = await hass.async_add_executor_job(
+                _valid_persisted_store, persisted
+            )
+        coordinator = SituarenessCoordinator(
+            hass,
+            config,
+            store,
+            persisted,
+            entry=entry,
+            has_corrupt_backup=has_corrupt_backup,
+            persisted_valid=persisted_valid,
+        )
+    except asyncio.CancelledError:
+        _clear_retry_listener(hass, entry.entry_id)
+        _dismiss_degraded_notification(hass)
+        raise
     try:
         await coordinator.async_config_entry_first_refresh()
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
@@ -2672,10 +2765,12 @@ async def async_setup_entry(hass, entry):
         coordinator._stopping = True
         if coordinator._fetch_task is not None and not coordinator._fetch_task.done():
             coordinator._fetch_task.cancel()
+        _clear_retry_listener(hass, entry.entry_id)
         _dismiss_degraded_notification(hass)
         coordinator._notified_degraded_state = None
         raise
     except Exception:
+        _clear_retry_listener(hass, entry.entry_id)
         if callable(getattr(entry, "async_on_state_change", None)):
             unsub = None
             done = False
@@ -2712,6 +2807,7 @@ async def async_setup_entry(hass, entry):
             unsub = entry.async_on_state_change(_on_entry_state_change)
             _SETUP_RETRY_UNSUBS[key] = unsub
         raise
+    _clear_retry_listener(hass, entry.entry_id)
     return True
 
 

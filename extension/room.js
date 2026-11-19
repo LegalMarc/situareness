@@ -173,6 +173,7 @@ function renderStatus(state) {
   els.dashboard.hidden = !dashboardUrl;
   if (els.dashboardDivider) els.dashboardDivider.hidden = !dashboardUrl;
   if (dashboardUrl) els.dashboard.href = dashboardUrl;
+  else els.dashboard.removeAttribute("href");
 }
 
 function renderPlaces(state) {

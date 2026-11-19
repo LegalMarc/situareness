@@ -58,6 +58,9 @@ def _parse_and_collect_page(raw_bytes, state):
     quarantined_lineages = state["quarantined_lineages"]
     quarantined_cancel_lineages = state["quarantined_cancel_lineages"]
     seen_quarantine_ids = state["seen_quarantine_ids"]
+    refs_by_id = state.setdefault("refs_by_id", {})
+    overflowed_ids = state.setdefault("overflowed_ids", set())
+    promoted_cancel_ids = state.setdefault("promoted_cancel_ids", set())
 
     def add_quarantined_lineage(ids, is_cancel=False):
         if not ids:
@@ -80,6 +83,29 @@ def _parse_and_collect_page(raw_bytes, state):
             if is_cancel:
                 quarantined_cancel_lineages.append(retained)
         return fits
+
+    def record_quarantined_id_refs(fid, ref_ids, *, is_cancel=False):
+        acc = refs_by_id.setdefault(fid, {})
+        ref_overflow = False
+        for ref_id in ref_ids:
+            if ref_id == fid or ref_id in acc:
+                continue
+            if len(acc) < MAX_QUARANTINE_IDS:
+                acc[ref_id] = None
+            else:
+                ref_overflow = True
+                overflowed_ids.add(fid)
+                state["quarantine_ambiguous"] = True
+                break
+        if is_cancel and fid not in promoted_cancel_ids:
+            promoted_cancel_ids.add(fid)
+            lineage_ids = [fid, *acc]
+        else:
+            lineage_ids = [fid, *ref_ids]
+        fits = add_quarantined_lineage(lineage_ids, is_cancel=is_cancel)
+        if not fits or ref_overflow:
+            overflowed_ids.add(fid)
+        return fits and not ref_overflow and fid not in overflowed_ids
 
     payload = json.loads(raw_bytes)
     if (
@@ -155,32 +181,47 @@ def _parse_and_collect_page(raw_bytes, state):
                     combined_refs = list(
                         dict.fromkeys([*existing.get("references", []), *valid_ref_ids])
                     )
-                    fits = add_quarantined_lineage(
-                        [feature_id, *combined_refs],
+                    fits = record_quarantined_id_refs(
+                        feature_id,
+                        combined_refs,
                         is_cancel=(feature_id in cancel_seen_for_id),
                     )
                     if (feature_id in cancel_seen_for_id) and (
                         not fits
                         or feature_id in unrecoverable_cancel_for_id
+                        or feature_id in overflowed_ids
                         or not combined_refs
                     ):
                         state["conflicting_cancellation"] = True
-                    if is_cancel and (not refs_valid or not valid_ref_ids or not fits):
+                    if is_cancel and (
+                        not refs_valid
+                        or not valid_ref_ids
+                        or not fits
+                        or feature_id in overflowed_ids
+                    ):
                         state["uncertain_cancellation"] = True
                 elif feature_id in conflicting_ids:
                     if is_cancel:
                         cancel_seen_for_id.add(feature_id)
                     if not refs_valid or (is_cancel and not valid_ref_ids):
                         unrecoverable_cancel_for_id.add(feature_id)
-                    fits = add_quarantined_lineage(
-                        [feature_id, *valid_ref_ids],
+                    fits = record_quarantined_id_refs(
+                        feature_id,
+                        valid_ref_ids,
                         is_cancel=(feature_id in cancel_seen_for_id),
                     )
                     if (feature_id in cancel_seen_for_id) and (
-                        not fits or feature_id in unrecoverable_cancel_for_id
+                        not fits
+                        or feature_id in unrecoverable_cancel_for_id
+                        or feature_id in overflowed_ids
                     ):
                         state["conflicting_cancellation"] = True
-                    if is_cancel and (not refs_valid or not valid_ref_ids or not fits):
+                    if is_cancel and (
+                        not refs_valid
+                        or not valid_ref_ids
+                        or not fits
+                        or feature_id in overflowed_ids
+                    ):
                         state["uncertain_cancellation"] = True
                 else:
                     prior_malformed = malformed_by_id.get(feature_id)
@@ -202,19 +243,21 @@ def _parse_and_collect_page(raw_bytes, state):
                             combined_refs = list(
                                 dict.fromkeys([*prev_refs, *valid_ref_ids])
                             )
-                            fits = add_quarantined_lineage(
-                                [feature_id, *combined_refs],
+                            fits = record_quarantined_id_refs(
+                                feature_id,
+                                combined_refs,
                                 is_cancel=(feature_id in cancel_seen_for_id),
                             )
                             if (feature_id in cancel_seen_for_id) and (
                                 not fits
                                 or feature_id in unrecoverable_cancel_for_id
+                                or feature_id in overflowed_ids
                                 or not combined_refs
                             ):
                                 state["conflicting_cancellation"] = True
                         else:
-                            fits = add_quarantined_lineage(
-                                [feature_id, *valid_ref_ids], is_cancel=is_cancel
+                            fits = record_quarantined_id_refs(
+                                feature_id, valid_ref_ids, is_cancel=is_cancel
                             )
                     else:
                         malformed_by_id[feature_id] = (
@@ -223,10 +266,15 @@ def _parse_and_collect_page(raw_bytes, state):
                             refs_valid,
                             valid_ref_ids,
                         )
-                        fits = add_quarantined_lineage(
-                            [feature_id, *valid_ref_ids], is_cancel=is_cancel
+                        fits = record_quarantined_id_refs(
+                            feature_id, valid_ref_ids, is_cancel=is_cancel
                         )
-                    if is_cancel and (not refs_valid or not valid_ref_ids or not fits):
+                    if is_cancel and (
+                        not refs_valid
+                        or not valid_ref_ids
+                        or not fits
+                        or feature_id in overflowed_ids
+                    ):
                         state["uncertain_cancellation"] = True
             else:
                 state["quarantine_ambiguous"] = True
@@ -254,12 +302,13 @@ def _parse_and_collect_page(raw_bytes, state):
             combined_refs = list(
                 dict.fromkeys([*event.get("references", []), *extra_refs])
             )
-            fits = add_quarantined_lineage(
-                [eid, *combined_refs],
+            fits = record_quarantined_id_refs(
+                eid,
+                combined_refs,
                 is_cancel=(eid in cancel_seen_for_id),
             )
             if (eid in cancel_seen_for_id) and (
-                not fits or eid in unrecoverable_cancel_for_id
+                not fits or eid in unrecoverable_cancel_for_id or eid in overflowed_ids
             ):
                 state["conflicting_cancellation"] = True
             continue
@@ -288,11 +337,11 @@ def _parse_and_collect_page(raw_bytes, state):
                     ]
                 )
             )
-            fits = add_quarantined_lineage(
-                [eid, *combined_refs], is_cancel=(eid in cancel_seen_for_id)
+            fits = record_quarantined_id_refs(
+                eid, combined_refs, is_cancel=(eid in cancel_seen_for_id)
             )
             if (eid in cancel_seen_for_id) and (
-                not fits or eid in unrecoverable_cancel_for_id
+                not fits or eid in unrecoverable_cancel_for_id or eid in overflowed_ids
             ):
                 state["conflicting_cancellation"] = True
             continue
@@ -321,6 +370,9 @@ async def fetch(session, states):
         "quarantined_lineages": [],
         "quarantined_cancel_lineages": [],
         "seen_quarantine_ids": set(),
+        "refs_by_id": {},
+        "overflowed_ids": set(),
+        "promoted_cancel_ids": set(),
         "quarantine_ambiguous": False,
         "uncertain_cancellation": False,
         "conflicting_cancellation": False,

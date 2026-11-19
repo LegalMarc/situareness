@@ -1017,6 +1017,30 @@ test("a worker bundled configuration failure on REFRESH disables controls and sh
 });
 
 test("hiding the context link also hides its meta divider", async () => {
+  const dashboardLink = page.locator("#dashboard-link");
+  await expect(dashboardLink).toBeVisible();
+  await expect(dashboardLink).toHaveAttribute("target", "_blank");
+  await expect(dashboardLink).toHaveAttribute("rel", "noopener noreferrer");
+  await expect(dashboardLink).toHaveAttribute(
+    "href",
+    "https://www.worldmonitor.app/dashboard",
+  );
+
+  await page.getByRole("button", { name: "Open settings" }).click();
+  const dialog = page.getByRole("dialog", { name: "Settings" });
+  await ensureConfigEditorVisible(dialog);
+  const nextConfig = JSON.parse(
+    await dialog.locator("#config-json").inputValue(),
+  );
+  nextConfig.room.context_dashboard = null;
+  await dialog
+    .locator("#config-json")
+    .fill(JSON.stringify(nextConfig, null, 2));
+  await dialog.getByRole("button", { name: "Save settings" }).click();
+  await expect(dashboardLink).toBeHidden();
+  await expect(page.locator("#dashboard-divider")).toBeHidden();
+  expect(await dashboardLink.getAttribute("href")).toBeNull();
+
   await page.addInitScript(() => {
     const original = chrome.runtime.sendMessage.bind(chrome.runtime);
     Object.defineProperty(chrome.runtime, "sendMessage", {
@@ -1031,6 +1055,7 @@ test("hiding the context link also hides its meta divider", async () => {
     });
   });
   await page.reload();
-  await expect(page.locator("#dashboard-link")).toBeHidden();
+  await expect(dashboardLink).toBeHidden();
   await expect(page.locator("#dashboard-divider")).toBeHidden();
+  expect(await dashboardLink.getAttribute("href")).toBeNull();
 });

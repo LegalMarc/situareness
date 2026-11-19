@@ -8685,3 +8685,610 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(coord.expired_unsent_reasons, ["exhausted"])
         self.assertEqual(coord.expired_unsent_at, t1.isoformat())
         self.assertEqual(coord.outcomes[-1]["at"], t1.isoformat())
+
+    async def test_malformed_cancel_and_quarantine_ambiguous_freeze_retry_age_past_15m(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+        from test_domain import collector
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+
+        class Clock(datetime):
+            current = t0
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current
+
+        class FailingServices(Services):
+            async def async_call(self, *args, **kwargs):
+                raise RuntimeError("transient delivery failure")
+
+        live_cfg = {
+            **config(),
+            "live_enabled": True,
+            "commissioning_passed": True,
+            "phones": ["mobile_app_one"],
+            "tts_entity": None,
+        }
+        raw = feature()
+        raw["id"] = "https://api.weather.gov/alerts/std01-a"
+        raw["properties"]["id"] = "std01-a"
+        raw["properties"]["sent"] = (t0 - timedelta(minutes=2)).isoformat()
+        raw["properties"]["effective"] = raw["properties"]["sent"]
+        raw["properties"]["expires"] = (t0 + timedelta(hours=2)).isoformat()
+        raw["properties"]["ends"] = (t0 + timedelta(hours=2)).isoformat()
+        ev = d.normalize(raw)
+
+        store = Store()
+        fail_hass = types.SimpleNamespace(
+            data={},
+            services=FailingServices(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        coord = mod.SituarenessCoordinator(
+            fail_hass,
+            live_cfg,
+            store,
+            {"initialized": True, "was_live": True, "records": {}},
+        )
+
+        # Poll 1 (t0): alert is active, initial delivery fails and queues retry.
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents([ev], 1, set(), False),
+            ),
+        ):
+            h1 = await coord._async_update_data()
+        self.assertEqual(h1["delivery_attempts"], 1)
+        self.assertEqual(h1["delivery_failures"], 1)
+        self.assertEqual(len(coord.outbox), 1)
+        self.assertEqual(h1["expired_unsent"], 0)
+
+        # Poll 2 (t0 + 1m): malformed_cancellation + quarantine_ambiguous suspends alert from active.
+        Clock.current = t0 + timedelta(minutes=1)
+        ambig_malformed = collector.CollectedEvents(
+            [ev], 2, set(), True, uncertain_cancellation=True
+        )
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=ambig_malformed),
+        ):
+            h2 = await coord._async_update_data()
+        self.assertEqual(h2["degraded_reason"], "malformed_cancellation")
+        self.assertTrue(h2["quarantine_ambiguous"])
+        self.assertEqual(coord.records[ev["id"]]["state"], "quarantined")
+        self.assertEqual(coord.records[ev["id"]]["prior_state"], "active")
+        self.assertEqual(len(coord.outbox), 1)
+        self.assertEqual(h2["expired_unsent"], 0)
+
+        # Poll 3 (t0 + 20m, >15m MAX_AGE later): still in degraded + quarantine_ambiguous hold.
+        # degraded_delta must freeze retry age for suspended-from-active record.
+        Clock.current = t0 + timedelta(minutes=20)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(mod, "fetch", return_value=ambig_malformed),
+        ):
+            h3 = await coord._async_update_data()
+        self.assertEqual(h3["degraded_reason"], "malformed_cancellation")
+        self.assertEqual(len(coord.outbox), 1)
+        self.assertEqual(h3["expired_unsent"], 0)
+
+        # Poll 4 (t0 + 25m): recover via reload acknowledgement on clean feed; retry delivers.
+        Clock.current = t0 + timedelta(minutes=25)
+        ok_services = Services()
+        ok_hass = types.SimpleNamespace(
+            data={},
+            services=ok_services,
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        ack_cfg = {**live_cfg, "acknowledge_degraded_at": h3["degraded_at"]}
+        with patch.object(mod, "datetime", Clock):
+            recovered = mod.SituarenessCoordinator(
+                ok_hass, ack_cfg, store, store.saved[-1]
+            )
+            with patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents([ev], 1, set(), False),
+            ):
+                h4 = await recovered._async_update_data()
+        self.assertIsNone(h4["degraded_reason"])
+        self.assertEqual(h4["expired_unsent"], 0)
+        self.assertEqual(h4["delivery_attempts"], 1)
+        self.assertEqual(h4["delivery_failures"], 0)
+        self.assertEqual(recovered.outbox, [])
+        self.assertEqual(
+            [call[2]["data"]["url"] for call in ok_services.calls], [ev["id"]]
+        )
+
+    async def test_cancelled_and_quarantined_sibling_migrate_retry_to_active_sibling(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now = datetime.now(timezone.utc)
+
+        def make(name, seconds, refs=(), kind="Update"):
+            event = d.normalize(feature())
+            event.update(id="https://api.weather.gov/alerts/" + name, message_type=kind)
+            for field, delta in [
+                ("sent", seconds),
+                ("effective", -120),
+                ("onset", -60),
+                ("expires", 1800),
+                ("ends", 1800),
+            ]:
+                event[field] = (now + timedelta(seconds=delta)).isoformat()
+            event["cap_identity"] = ["nws@example.test", name, event["sent"]]
+            event["references"] = [ref["id"] for ref in refs]
+            event["reference_identities"] = [ref["cap_identity"] for ref in refs]
+            event["cap_references_valid"] = True
+            return event
+
+        class FailingServices(Services):
+            async def async_call(self, *args, **kwargs):
+                raise RuntimeError("delivery failure")
+
+        live_cfg = {
+            **config(),
+            "live_enabled": True,
+            "commissioning_passed": True,
+            "phones": ["mobile_app_one"],
+            "tts_entity": None,
+        }
+
+        # Case 1: Cancelled sibling A migrates undelivered retry onto independent active sibling S.
+        root1 = make("adv03-c-root", -100, kind="Alert")
+        sib_a1 = make("adv03-c-a", -80, [root1])
+        sib_s1 = make("adv03-c-s", -70, [root1])
+        cancel_a1 = make("adv03-c-cancel-a", -60, [sib_a1], "Cancel")
+
+        store1 = Store()
+        fail_hass1 = types.SimpleNamespace(
+            data={},
+            services=FailingServices(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        coord1 = mod.SituarenessCoordinator(
+            fail_hass1,
+            live_cfg,
+            store1,
+            {"initialized": True, "was_live": True, "records": {}},
+        )
+        with patch.object(mod, "fetch", return_value=[root1, sib_a1]):
+            await coord1._async_update_data()
+        with patch.object(mod, "fetch", return_value=[sib_a1, sib_s1]):
+            await coord1._async_update_data()
+        self.assertEqual(len(coord1.outbox), 1)
+        self.assertEqual(coord1.outbox[0]["incident_id"], sib_a1["id"])
+        self.assertEqual(coord1.records[sib_s1["id"]]["state"], "active")
+
+        ok_services1 = Services()
+        coord1.hass = types.SimpleNamespace(
+            data={},
+            services=ok_services1,
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        with patch.object(mod, "fetch", return_value=[cancel_a1, sib_s1]):
+            h_cancel = await coord1._async_update_data()
+        self.assertEqual(coord1.records[sib_a1["id"]]["state"], "cancelled")
+        self.assertEqual(coord1.records[sib_s1["id"]]["state"], "active")
+        self.assertEqual(h_cancel["expired_unsent"], 0)
+        self.assertEqual(h_cancel["delivery_attempts"], 1)
+        self.assertEqual(h_cancel["delivery_failures"], 0)
+        self.assertEqual(coord1.outbox, [])
+        self.assertEqual(
+            [call[2]["data"]["url"] for call in ok_services1.calls], [sib_s1["id"]]
+        )
+
+        # Case 2: Quarantined sibling A migrates undelivered retry onto already-active sibling S.
+        root2 = make("adv03-q-root", -100, kind="Alert")
+        branch2 = make("adv03-q-branch", -90, [root2])
+        sib_a2 = make("adv03-q-a", -80, [branch2])
+        sib_s2 = make("adv03-q-s", -70, [root2])
+        cancel_branch2 = make("adv03-q-cancel-b", -60, [branch2], "Cancel")
+
+        store2 = Store()
+        fail_hass2 = types.SimpleNamespace(
+            data={},
+            services=FailingServices(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        coord2 = mod.SituarenessCoordinator(
+            fail_hass2,
+            live_cfg,
+            store2,
+            {"initialized": True, "was_live": True, "records": {}},
+        )
+        with patch.object(mod, "fetch", return_value=[root2, branch2, sib_a2]):
+            await coord2._async_update_data()
+        with patch.object(mod, "fetch", return_value=[sib_a2, sib_s2]):
+            await coord2._async_update_data()
+        self.assertEqual(len(coord2.outbox), 1)
+        self.assertEqual(coord2.outbox[0]["incident_id"], sib_a2["id"])
+        self.assertEqual(coord2.records[sib_s2["id"]]["state"], "active")
+
+        ok_services2 = Services()
+        coord2.hass = types.SimpleNamespace(
+            data={},
+            services=ok_services2,
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        with patch.object(mod, "fetch", return_value=[cancel_branch2, sib_s2]):
+            h_quar = await coord2._async_update_data()
+        self.assertEqual(coord2.records[sib_a2["id"]]["state"], "quarantined")
+        self.assertEqual(coord2.records[sib_s2["id"]]["state"], "active")
+        self.assertEqual(h_quar["expired_unsent"], 0)
+        self.assertEqual(h_quar["delivery_attempts"], 1)
+        self.assertEqual(h_quar["delivery_failures"], 0)
+        self.assertEqual(coord2.outbox, [])
+        self.assertEqual(
+            [call[2]["data"]["url"] for call in ok_services2.calls], [sib_s2["id"]]
+        )
+
+    async def test_setup_retry_listener_survives_early_not_ready_and_clears_on_early_cancel(
+        self,
+    ):
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        dismiss_calls = []
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda *args, **kwargs: None,
+            async_dismiss=lambda hass, nid: dismiss_calls.append(nid),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        async def run_exec(fn, *args):
+            return fn(*args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "situareness.json").write_text("{}", encoding="utf-8")
+            listeners = []
+
+            class FakeEntry:
+                entry_id = "std02-retry"
+                data = {}
+                state = "setup_retry"
+
+                def async_on_state_change(self, cb):
+                    listeners.append(cb)
+                    return lambda: listeners.remove(cb)
+
+            entry = FakeEntry()
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                config_entries=types.SimpleNamespace(
+                    async_forward_entry_setups=lambda *a: asyncio.sleep(0, result=True)
+                ),
+                async_add_executor_job=run_exec,
+            )
+
+            class EmptyStore(Store):
+                async def async_load(self):
+                    return None
+
+            class FailingStore(Store):
+                async def async_load(self):
+                    raise OSError("storage IO error")
+
+            class FailingCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    raise ConfigEntryNotReady("NWS down")
+
+            # Attempt 1 fails in first_refresh -> registers retry listener.
+            with (
+                patch.object(mod, "Store", EmptyStore),
+                patch.object(mod, "SituarenessCoordinator", FailingCoordinator),
+            ):
+                with self.assertRaises(ConfigEntryNotReady):
+                    await mod.async_setup_entry(hass, entry)
+            self.assertEqual(len(listeners), 1)
+            dismiss_calls.clear()
+
+            # Attempt 2 fails in _read_config OSError -> prior retry listener remains intact.
+            with patch.object(mod, "_read_config", side_effect=OSError("config IO")):
+                with self.assertRaises(ConfigEntryNotReady):
+                    await mod.async_setup_entry(hass, entry)
+            self.assertEqual(len(listeners), 1)
+            self.assertEqual(dismiss_calls, [])
+
+            # Attempt 3 fails in store.async_load OSError -> prior retry listener remains intact.
+            with patch.object(mod, "Store", FailingStore):
+                with self.assertRaises(ConfigEntryNotReady):
+                    await mod.async_setup_entry(hass, entry)
+            self.assertEqual(len(listeners), 1)
+            self.assertEqual(dismiss_calls, [])
+
+            # Transitioning entry to not_loaded still dismisses situareness_degraded.
+            entry.state = "not_loaded"
+            for cb in list(listeners):
+                cb()
+            await asyncio.sleep(0)
+            self.assertEqual(dismiss_calls, ["situareness_degraded"])
+            self.assertEqual(listeners, [])
+
+            # Early CancelledError clears prior retry listener and dismisses notification.
+            entry.state = "setup_retry"
+            dismiss_calls.clear()
+            with (
+                patch.object(mod, "Store", EmptyStore),
+                patch.object(mod, "SituarenessCoordinator", FailingCoordinator),
+            ):
+                with self.assertRaises(ConfigEntryNotReady):
+                    await mod.async_setup_entry(hass, entry)
+            self.assertEqual(len(listeners), 1)
+            dismiss_calls.clear()
+
+            async def cancel_exec(fn, *args):
+                raise asyncio.CancelledError()
+
+            hass.async_add_executor_job = cancel_exec
+            with self.assertRaises(asyncio.CancelledError):
+                await mod.async_setup_entry(hass, entry)
+            self.assertEqual(listeners, [])
+            self.assertEqual(dismiss_calls, ["situareness_degraded"])
+
+            # Successful setup also clears any prior retry listener.
+            hass.async_add_executor_job = run_exec
+            with (
+                patch.object(mod, "Store", EmptyStore),
+                patch.object(mod, "SituarenessCoordinator", FailingCoordinator),
+            ):
+                with self.assertRaises(ConfigEntryNotReady):
+                    await mod.async_setup_entry(hass, entry)
+            self.assertEqual(len(listeners), 1)
+
+            class OkCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    return None
+
+            with (
+                patch.object(mod, "Store", EmptyStore),
+                patch.object(mod, "SituarenessCoordinator", OkCoordinator),
+            ):
+                self.assertTrue(await mod.async_setup_entry(hass, entry))
+            self.assertEqual(listeners, [])
+
+    async def test_outbox_overflow_preserved_across_quarantine_ambiguous_poll(self):
+        from datetime import datetime, timedelta, timezone
+        from test_domain import collector
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        notify_history = []
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                ),
+                notify_history.append((notification_id, title, msg)),
+            ),
+            async_dismiss=lambda hass, nid: notifications.pop(nid, None),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        t0 = datetime(2026, 11, 18, 14, 0, tzinfo=timezone.utc)
+
+        class Clock(datetime):
+            current = t0
+
+            @classmethod
+            def now(cls, tz=None):
+                return cls.current
+
+        class FailingServices(Services):
+            async def async_call(self, *args, **kwargs):
+                raise RuntimeError("transient delivery failure")
+
+        live_cfg = {
+            **config(),
+            "live_enabled": True,
+            "commissioning_passed": True,
+            "phones": [f"mobile_app_{i}" for i in range(125)],
+            "tts_entity": None,
+        }
+        hass = types.SimpleNamespace(
+            data={},
+            services=FailingServices(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+
+        q_evs = []
+        q_fps = []
+        records = {}
+        for j in range(40):
+            q_raw = feature()
+            q_raw["id"] = f"https://api.weather.gov/alerts/std03-q-{j}"
+            q_raw["properties"]["id"] = f"std03-q-{j}"
+            q_raw["properties"]["instruction"] = f"Take shelter area {j}."
+            q_raw["properties"]["sent"] = (t0 - timedelta(minutes=2)).isoformat()
+            q_raw["properties"]["effective"] = q_raw["properties"]["sent"]
+            q_raw["properties"]["expires"] = (t0 + timedelta(hours=2)).isoformat()
+            q_raw["properties"]["ends"] = (t0 + timedelta(hours=2)).isoformat()
+            q_ev = d.normalize(q_raw)
+            q_fp = d.fingerprint(q_ev, d.qualify(q_ev, live_cfg, t0))
+            q_evs.append(q_ev)
+            q_fps.append(q_fp)
+            records[q_ev["id"]] = {
+                "state": "active",
+                "fingerprint": q_fp,
+                "lineage": [q_ev["id"]],
+                "actions": {q_fp: ["new_york_ny"]},
+                "updated": (t0 - timedelta(minutes=1)).isoformat(),
+            }
+
+        extra_raw = feature()
+        extra_raw["id"] = "https://api.weather.gov/alerts/std03-extra"
+        extra_raw["properties"]["id"] = "std03-extra"
+        extra_raw["properties"]["instruction"] = "Take shelter extra overflow area."
+        extra_raw["properties"]["sent"] = (t0 - timedelta(minutes=1)).isoformat()
+        extra_raw["properties"]["effective"] = extra_raw["properties"]["sent"]
+        extra_raw["properties"]["expires"] = (t0 + timedelta(hours=2)).isoformat()
+        extra_raw["properties"]["ends"] = (t0 + timedelta(hours=2)).isoformat()
+        extra_ev = d.normalize(extra_raw)
+
+        coord = mod.SituarenessCoordinator(
+            hass,
+            live_cfg,
+            Store(),
+            {
+                "initialized": True,
+                "was_live": True,
+                "records": records,
+                "outbox": [
+                    {
+                        "key": f"std03-fill-{i}",
+                        "incident_id": q_evs[i // 125]["id"],
+                        "event": "Tornado Warning",
+                        "fingerprint": q_fps[i // 125],
+                        "target": f"mobile_app_{i % 125}",
+                        "kind": "phone",
+                        "location": None,
+                        "source_url": q_evs[i // 125]["id"],
+                        "created": (t0 - timedelta(minutes=1)).isoformat(),
+                        "attempts": 0,
+                        "instruction": q_evs[i // 125]["instruction"],
+                        "affected_names": ["New York"],
+                    }
+                    for i in range(5000)
+                ],
+            },
+        )
+
+        # Poll 1: latches outbox_overflow with output_blocked=False.
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents(
+                    [*q_evs, extra_ev], 41, set(), False
+                ),
+            ),
+        ):
+            h1 = await coord._async_update_data()
+        self.assertEqual(h1["degraded_reason"], "outbox_overflow")
+        self.assertFalse(h1["output_blocked"])
+        self.assertFalse(h1["quarantine_ambiguous"])
+        orig_degraded_at = h1["degraded_at"]
+        self.assertEqual(
+            notifications["situareness_degraded"]["title"],
+            "Situareness delivery outbox full",
+        )
+        self.assertNotIn(
+            "Output is currently blocked",
+            notifications["situareness_degraded"]["message"],
+        )
+
+        # Poll 2: quarantine_ambiguous must preserve outbox_overflow, set output_blocked=True,
+        # keep degraded_at stable, and update notification with output-blocked note.
+        Clock.current = t0 + timedelta(minutes=2)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents(
+                    [*q_evs, extra_ev], 42, set(), True
+                ),
+            ),
+        ):
+            h2 = await coord._async_update_data()
+        self.assertEqual(h2["degraded_reason"], "outbox_overflow")
+        self.assertTrue(h2["output_blocked"])
+        self.assertTrue(h2["quarantine_ambiguous"])
+        self.assertEqual(h2["degraded_at"], orig_degraded_at)
+        self.assertEqual(h2["planned_count"], 0)
+        self.assertEqual(h2["withheld_count"], 0)
+        self.assertIn(
+            "Output is currently blocked",
+            notifications["situareness_degraded"]["message"],
+        )
+
+        # Poll 3: clean overflowing poll keeps original degraded_at and updates notification back.
+        Clock.current = t0 + timedelta(minutes=4)
+        with (
+            patch.object(mod, "datetime", Clock),
+            patch.object(
+                mod,
+                "fetch",
+                return_value=collector.CollectedEvents(
+                    [*q_evs, extra_ev], 41, set(), False
+                ),
+            ),
+        ):
+            h3 = await coord._async_update_data()
+        self.assertEqual(h3["degraded_reason"], "outbox_overflow")
+        self.assertFalse(h3["output_blocked"])
+        self.assertFalse(h3["quarantine_ambiguous"])
+        self.assertEqual(h3["degraded_at"], orig_degraded_at)
+        self.assertNotIn(
+            "Output is currently blocked",
+            notifications["situareness_degraded"]["message"],
+        )

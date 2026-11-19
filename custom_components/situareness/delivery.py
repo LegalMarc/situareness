@@ -99,14 +99,19 @@ def pending_valid(item, records, config, now, *, allow_suspended=False):
 
 
 def _active_target_record(item, records):
-    record = records.get(item["incident_id"], {})
+    if not isinstance(item, dict):
+        return False
+    incident_id = item.get("incident_id")
+    fingerprint = item.get("fingerprint")
+    if not isinstance(incident_id, str) or not isinstance(fingerprint, str):
+        return False
+    record = records.get(incident_id, {})
     return (
-        record.get("state") == "active"
-        and record.get("fingerprint") == item["fingerprint"]
+        record.get("state") == "active" and record.get("fingerprint") == fingerprint
     ) or (
         record.get("state") in ("quarantined", "unconfirmed")
         and record.get("prior_state") == "active"
-        and item["fingerprint"] in action_history(record)
+        and fingerprint in action_history(record)
     )
 
 

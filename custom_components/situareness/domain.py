@@ -447,7 +447,9 @@ def cancellation_horizon(group_ids, records, now=None):
                     parsed = timestamp(ref[2])
                     if parsed is not None:
                         record_timestamps.append(min(parsed, upper))
-        if not record_timestamps and obs is not None:
+        if (
+            not record_timestamps or record.get("uncertain_targets")
+        ) and obs is not None:
             record_timestamps.append(min(obs, MAX_TIMESTAMP))
         timestamps.extend(record_timestamps)
     if not timestamps:
@@ -520,6 +522,7 @@ def _cancellation_analysis(
     seeded_cancelled_ids = set()
     seeded_uncertain_ids = set()
     ambiguous_groups = set()
+    bad_cancel_eids = set()
     for ids in quarantine_cancel_lineages:
         if ids:
             seeded_uncertain_ids.update(ids)
@@ -564,6 +567,10 @@ def _cancellation_analysis(
         elif is_cancelled_record:
             seeded_cancelled_ids.add(eid)
             cancellations.append(eid)
+        record_uncertain_targets = record.get("uncertain_targets")
+        if record_uncertain_targets:
+            seeded_uncertain_ids.update([eid, *record_uncertain_targets])
+            cancellations.extend([eid, *record_uncertain_targets])
     for event in events:
         eid = event["id"]
         is_cancel = (
@@ -571,6 +578,19 @@ def _cancellation_analysis(
         )
         if eid in records and conflicting_prior_cancel(event, records[eid]):
             prior_rec = records[eid]
+            if prior_rec.get("cancel_message"):
+                bad_cancel_eids.add(eid)
+                prior_cap_targets = [
+                    "https://api.weather.gov/alerts/" + r[1]
+                    for r in (prior_rec.get("cap_references") or [])
+                    if isinstance(r, list) and len(r) == 3 and isinstance(r[1], str)
+                ]
+                prior_targets = [
+                    *(prior_rec.get("uncertain_targets") or []),
+                    *prior_cap_targets,
+                ]
+                seeded_uncertain_ids.update([eid, *prior_targets])
+                cancellations.extend([eid, *prior_targets])
             if event.get("references") and (
                 not prior_rec.get("cancel_message")
                 or len(prior_rec.get("lineage", [])) > 1
@@ -620,7 +640,6 @@ def _cancellation_analysis(
     for identity in identities:
         by_identifier.setdefault(identity[1], set()).add(identity)
     uncertain = set()
-    bad_cancel_eids = set()
     for eid, (identity, refs, is_cancel) in nodes.items():
         for ref in refs:
             if ref[2] >= identity[2]:
@@ -668,6 +687,7 @@ def _cancellation_analysis(
                     seeded_uncertain_ids.update(
                         "https://api.weather.gov/alerts/" + r[1] for r in refs
                     )
+                    uncertain.add(identity)
                     uncertain.update(refs)
                 else:
                     ambiguous_groups.add(groups.get(eid))
@@ -709,6 +729,15 @@ def _cancellation_analysis(
             earliest = min(target[2] for target in group_targets)
             if any(ref not in identities and ref[2] >= earliest for ref in refs):
                 uncertain.add(identity)
+        if (
+            not is_cancel
+            and not any(ref in valid_cancels for ref in refs)
+            and any(
+                "https://api.weather.gov/alerts/" + ref[1] in seeded_uncertain_ids
+                for ref in refs
+            )
+        ):
+            uncertain.add(identity)
     for target_eid in seeded_uncertain_ids:
         if target_eid in nodes and not nodes[target_eid][2]:
             uncertain.add(nodes[target_eid][0])
@@ -1094,7 +1123,9 @@ def _bound_records(
     cancellation_groups = {
         groups.get(eid)
         for eid, record in records.items()
-        if record.get("cancel_message") or record.get("state") == "cancelled"
+        if record.get("cancel_message")
+        or record.get("state") == "cancelled"
+        or bool(record.get("uncertain_targets"))
     }
     actionable_groups = {
         groups.get(eid)
@@ -1230,7 +1261,9 @@ def reconcile(
     trusted_events = [
         source
         for source in graph_events
-        if source["id"] not in invalid_ids or actual_cancel(source)
+        if source["id"] not in invalid_ids
+        or actual_cancel(source)
+        or conflicting_prior_cancel(source, prior.get(source["id"]))
     ]
     (
         cancelled_ids,
@@ -1413,24 +1446,23 @@ def reconcile(
                     "reasons": ["conflicting cancellation evidence"],
                     "updated": now.isoformat(),
                 }
-                if old_prior.get("uncertain_targets") is not None or (
-                    cancelled and refs
-                ):
-                    old_cap_targets = [
-                        "https://api.weather.gov/alerts/" + r[1]
-                        for r in (old_prior.get("cap_references") or [])
-                        if isinstance(r, list) and len(r) == 3
-                    ]
-                    conflict_record["uncertain_targets"] = sorted(
-                        {
-                            *(old_prior.get("uncertain_targets") or []),
-                            *old_cap_targets,
-                            *refs,
-                        }
-                    )
+                old_cap_targets = [
+                    "https://api.weather.gov/alerts/" + r[1]
+                    for r in (old_prior.get("cap_references") or [])
+                    if isinstance(r, list) and len(r) == 3 and isinstance(r[1], str)
+                ]
+                merged_targets = sorted(
+                    {
+                        *(old_prior.get("uncertain_targets") or []),
+                        *old_cap_targets,
+                        *refs,
+                    }
+                )
+                if old_prior.get("uncertain_targets") is not None or merged_targets:
+                    conflict_record["uncertain_targets"] = merged_targets
                 records[eid] = conflict_record
             else:
-                records[eid] = _quarantined_record(
+                quarantined_conflict = _quarantined_record(
                     eid,
                     event,
                     old_prior,
@@ -1443,6 +1475,11 @@ def reconcile(
                     keep_prior_timestamps=True,
                     preserve_cancel_flag=True,
                 )
+                if cancelled and refs:
+                    quarantined_conflict["uncertain_targets"] = sorted(
+                        {*(old_prior.get("uncertain_targets") or []), *refs}
+                    )
+                records[eid] = quarantined_conflict
             seen.add(eid)
             continue
         continuing_uncertain = (
@@ -1620,6 +1657,64 @@ def reconcile(
             if cancelled_at is not None:
                 updated_rec["cancelled_at"] = cancelled_at
             records[eid] = updated_rec
+    quarantined_cancel_targets = {}
+    for ids in quarantine_cancel_lineages:
+        if not ids:
+            continue
+        cid = ids[0]
+        bucket = quarantined_cancel_targets.setdefault(cid, set())
+        for target in ids[1:]:
+            if target != cid:
+                bucket.add(target)
+    for cid, targets in quarantined_cancel_targets.items():
+        if not targets and cid not in records:
+            continue
+        seen.add(cid)
+        old = records.get(cid)
+        old_uncertain = (old.get("uncertain_targets") or []) if old else []
+        old_cap_targets = (
+            [
+                "https://api.weather.gov/alerts/" + r[1]
+                for r in (old.get("cap_references") or [])
+                if isinstance(r, list) and len(r) == 3 and isinstance(r[1], str)
+            ]
+            if old
+            else []
+        )
+        merged_targets = sorted({*old_uncertain, *old_cap_targets, *targets})
+        if old is None:
+            records[cid] = {
+                "state": "cancelled",
+                "actions": {},
+                "affected": [],
+                "lineage": [cid],
+                "cancel_message": True,
+                "cancellation_expired": False,
+                "uncertain_targets": merged_targets,
+                "reasons": ["quarantined cancellation evidence"],
+                "inactive_since": now.isoformat(),
+                "updated": now.isoformat(),
+            }
+        elif old.get("cancel_message"):
+            records[cid] = {
+                **old,
+                "state": "cancelled",
+                "actions": {},
+                "affected": [],
+                "lineage": old.get("lineage") or [cid],
+                "cancel_message": True,
+                "cancellation_expired": False,
+                "uncertain_targets": merged_targets,
+                "reasons": ["conflicting cancellation evidence"],
+                "inactive_since": old.get("inactive_since") or now.isoformat(),
+                "updated": now.isoformat(),
+            }
+        else:
+            updated_rec = suspend_record(old, "quarantined", now)
+            updated_rec["reasons"] = ["conflicting cancellation evidence"]
+            if merged_targets:
+                updated_rec["uncertain_targets"] = merged_targets
+            records[cid] = updated_rec
     current_cancel_groups = {
         groups.get(source["id"]) for source in trusted_events if actual_cancel(source)
     } | {groups.get(cid) for ids in quarantine_cancel_lineages for cid in ids}

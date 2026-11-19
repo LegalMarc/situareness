@@ -1514,6 +1514,414 @@ class Policy(unittest.TestCase):
         collector._parse_and_collect_page(payload_bad, st_bad)
         self.assertTrue(st_bad["conflicting_cancellation"])
 
+    def test_adv01_quarantined_cancel_persists_tombstone_and_quarantines_target_after_cancel_leaves(
+        self,
+    ):
+        cfg = config()
+        alert_a = cap_event("adv01-a", -5, message_type="Alert")
+        cancel_over_id = "https://api.weather.gov/alerts/adv01-oversized-cancel"
+
+        # Subcase A: Oversized Actual Cancel (quarantined_cancel_lineages) persists a
+        # tombstone and keeps A quarantined on Poll 2 after the Cancel leaves the feed.
+        rec1, plans1 = d.reconcile(
+            {},
+            [alert_a],
+            cfg,
+            NOW,
+            partial=True,
+            quarantine_lineages=[[cancel_over_id, alert_a["id"]]],
+            quarantine_cancel_lineages=[[cancel_over_id, alert_a["id"]]],
+        )
+        self.assertEqual(plans1, [])
+        self.assertEqual(rec1[alert_a["id"]]["state"], "quarantined")
+        self.assertIn(cancel_over_id, rec1)
+        tombstone = rec1[cancel_over_id]
+        self.assertEqual(tombstone["state"], "cancelled")
+        self.assertTrue(tombstone["cancel_message"])
+        self.assertFalse(tombstone["cancellation_expired"])
+        self.assertEqual(tombstone["uncertain_targets"], [alert_a["id"]])
+        self.assertEqual(tombstone["reasons"], ["quarantined cancellation evidence"])
+
+        # Poll 2: Oversized Cancel is absent; A stays quarantined and never fires.
+        rec2, plans2 = d.reconcile(rec1, [alert_a], cfg, NOW + timedelta(minutes=1))
+        self.assertEqual(plans2, [])
+        self.assertEqual(rec2[alert_a["id"]]["state"], "quarantined")
+        self.assertIn(cancel_over_id, rec2)
+        self.assertEqual(rec2[cancel_over_id]["uncertain_targets"], [alert_a["id"]])
+
+        # Tombstone with uncertain_targets survives a 1,000-record ineligible burst.
+        noise = []
+        for idx in range(1000):
+            ev = cap_event(f"adv01-noise-{idx}", -1, message_type="Alert")
+            ev["instruction"] = "Stay tuned for routine updates."
+            noise.append(ev)
+        rec_burst, plans_burst = d.reconcile(
+            rec2, [alert_a, *noise], cfg, NOW + timedelta(minutes=2)
+        )
+        self.assertEqual(plans_burst, [])
+        self.assertEqual(len(rec_burst), 1000)
+        self.assertIn(cancel_over_id, rec_burst)
+        self.assertIn(alert_a["id"], rec_burst)
+        self.assertEqual(rec_burst[alert_a["id"]]["state"], "quarantined")
+
+        # Subcase B: Conflicting-duplicate Cancel against existing persisted Cancel
+        # preserves cap_identity/cap_references and merges targets across polls.
+        a0 = cap_event("adv01-a0", -15, message_type="Alert")
+        a1 = cap_event("adv01-a1", -5, message_type="Alert")
+        c_dup = cap_event("adv01-cdup", -10, [a0], "Cancel")
+        rec_c1, _ = d.reconcile({}, [c_dup], cfg, NOW)
+        orig_cap_id = rec_c1[c_dup["id"]]["cap_identity"]
+        orig_cap_refs = rec_c1[c_dup["id"]]["cap_references"]
+        rec_c2, plans_c2 = d.reconcile(
+            rec_c1,
+            [a1],
+            cfg,
+            NOW + timedelta(minutes=1),
+            partial=True,
+            quarantine_lineages=[[c_dup["id"], a1["id"]]],
+            quarantine_cancel_lineages=[[c_dup["id"], a1["id"]]],
+        )
+        self.assertEqual(plans_c2, [])
+        self.assertEqual(rec_c2[c_dup["id"]]["state"], "cancelled")
+        self.assertTrue(rec_c2[c_dup["id"]]["cancel_message"])
+        self.assertEqual(rec_c2[c_dup["id"]]["cap_identity"], orig_cap_id)
+        self.assertEqual(rec_c2[c_dup["id"]]["cap_references"], orig_cap_refs)
+        self.assertEqual(
+            rec_c2[c_dup["id"]]["reasons"], ["conflicting cancellation evidence"]
+        )
+        self.assertEqual(
+            rec_c2[c_dup["id"]]["uncertain_targets"], sorted([a0["id"], a1["id"]])
+        )
+        rec_c3, plans_c3 = d.reconcile(
+            rec_c2, [a0, a1], cfg, NOW + timedelta(minutes=2)
+        )
+        self.assertEqual(plans_c3, [])
+        self.assertEqual(rec_c3[a0["id"]]["state"], "quarantined")
+        self.assertEqual(rec_c3[a1["id"]]["state"], "quarantined")
+
+        # Subcase C: Quarantined Cancel colliding with existing persisted Alert
+        # suspends it with list[str] uncertain_targets (and omits key when empty).
+        c_alert = cap_event("adv01-calert", -10, message_type="Alert")
+        a2 = cap_event("adv01-a2", -5, message_type="Alert")
+        rec_a1, _ = d.reconcile({}, [c_alert], cfg, NOW)
+        rec_a2, plans_a2 = d.reconcile(
+            rec_a1,
+            [a2],
+            cfg,
+            NOW + timedelta(minutes=1),
+            partial=True,
+            quarantine_lineages=[[c_alert["id"], a2["id"]]],
+            quarantine_cancel_lineages=[[c_alert["id"], a2["id"]]],
+        )
+        self.assertEqual(plans_a2, [])
+        self.assertEqual(rec_a2[c_alert["id"]]["state"], "quarantined")
+        self.assertFalse(rec_a2[c_alert["id"]]["cancel_message"])
+        self.assertEqual(
+            rec_a2[c_alert["id"]]["reasons"], ["conflicting cancellation evidence"]
+        )
+        self.assertEqual(rec_a2[c_alert["id"]]["uncertain_targets"], [a2["id"]])
+        rec_a3, plans_a3 = d.reconcile(rec_a2, [a2], cfg, NOW + timedelta(minutes=2))
+        self.assertEqual(plans_a3, [])
+        self.assertEqual(rec_a3[a2["id"]]["state"], "quarantined")
+
+        rec_empty, _ = d.reconcile(
+            rec_a1,
+            [],
+            cfg,
+            NOW + timedelta(minutes=1),
+            partial=True,
+            quarantine_lineages=[[c_alert["id"]]],
+            quarantine_cancel_lineages=[[c_alert["id"]]],
+        )
+        self.assertNotIn("uncertain_targets", rec_empty[c_alert["id"]])
+
+    def test_adv02_conflicting_cancel_against_persisted_alert_and_expired_cancel_persists_uncertain_targets(
+        self,
+    ):
+        cfg = config()
+        # Subcase A: Conflicting Cancel reusing an existing persisted Alert ID.
+        x_alert = cap_event("adv02-x", -10, message_type="Alert")
+        y_alert = cap_event("adv02-y", -5, message_type="Alert")
+        rec1, plans1 = d.reconcile({}, [x_alert], cfg, NOW)
+        self.assertEqual([pl["id"] for pl in plans1], [x_alert["id"]])
+
+        cancel_reusing_x = cap_event("adv02-x", -2, [y_alert], "Cancel")
+        rec2, plans2 = d.reconcile(
+            rec1, [cancel_reusing_x, y_alert], cfg, NOW + timedelta(minutes=1)
+        )
+        self.assertEqual(plans2, [])
+        self.assertEqual(rec2[x_alert["id"]]["state"], "quarantined")
+        self.assertFalse(rec2[x_alert["id"]]["cancel_message"])
+        self.assertEqual(rec2[x_alert["id"]]["uncertain_targets"], [y_alert["id"]])
+        self.assertEqual(rec2[y_alert["id"]]["state"], "quarantined")
+
+        # Poll 3: Conflicting Cancel leaves; Y must stay quarantined.
+        rec3, plans3 = d.reconcile(rec2, [y_alert], cfg, NOW + timedelta(minutes=2))
+        self.assertEqual(plans3, [])
+        self.assertEqual(rec3[y_alert["id"]]["state"], "quarantined")
+        self.assertEqual(rec3[x_alert["id"]]["uncertain_targets"], [y_alert["id"]])
+
+        # Subcase B: Conflicting Cancel reusing a Day-0 expired Cancel ID.
+        x0 = cap_event("adv02-x0", -20, message_type="Alert")
+        c_day0 = cap_event("adv02-cexp", -10, [x0], "Cancel")
+        rec_d0, _ = d.reconcile({}, [x0, c_day0], cfg, NOW)
+        day8 = NOW + d.MAX_ACCEPTANCE_AGE + timedelta(days=1)
+        rec_d8_exp, _ = d.reconcile(rec_d0, [], cfg, day8)
+        self.assertFalse(rec_d8_exp[c_day0["id"]]["cancel_message"])
+        self.assertTrue(rec_d8_exp[c_day0["id"]]["cancellation_expired"])
+
+        day8_min = int((day8 - NOW).total_seconds() // 60)
+        y2 = cap_event("adv02-y2", day8_min - 5, message_type="Alert")
+        y2["effective"] = y2["sent"]
+        y2["onset"] = y2["sent"]
+        y2["expires"] = (day8 + timedelta(hours=1)).isoformat()
+        y2["ends"] = (day8 + timedelta(hours=1)).isoformat()
+
+        cancel_reusing_expired = cap_event("adv02-cexp", day8_min - 1, [y2], "Cancel")
+        cancel_reusing_expired["effective"] = cancel_reusing_expired["sent"]
+        cancel_reusing_expired["expires"] = (day8 + timedelta(hours=1)).isoformat()
+        cancel_reusing_expired["ends"] = (day8 + timedelta(hours=1)).isoformat()
+
+        rec_p2, plans_p2 = d.reconcile(
+            rec_d8_exp,
+            [cancel_reusing_expired, y2],
+            cfg,
+            day8 + timedelta(minutes=1),
+        )
+        self.assertEqual(plans_p2, [])
+        self.assertEqual(rec_p2[c_day0["id"]]["state"], "quarantined")
+        self.assertFalse(rec_p2[c_day0["id"]]["cancel_message"])
+        self.assertEqual(rec_p2[c_day0["id"]]["uncertain_targets"], [y2["id"]])
+        self.assertEqual(rec_p2[y2["id"]]["state"], "quarantined")
+
+        # Poll 3: Conflicting Cancel leaves; 7-day horizon anchored to Day-8 observation
+        # prevents immediate expiry and keeps Y2 quarantined.
+        rec_p3, plans_p3 = d.reconcile(rec_p2, [y2], cfg, day8 + timedelta(minutes=2))
+        self.assertEqual(plans_p3, [])
+        self.assertEqual(rec_p3[y2["id"]]["state"], "quarantined")
+        self.assertEqual(rec_p3[c_day0["id"]]["uncertain_targets"], [y2["id"]])
+
+        # Non-cancel collision against expired Cancel must not store uncertain_targets=None.
+        alert_reusing_expired = cap_event(
+            "adv02-cexp", day8_min - 1, message_type="Alert"
+        )
+        rec_non_cancel, _ = d.reconcile(
+            rec_d8_exp, [alert_reusing_expired], cfg, day8 + timedelta(minutes=1)
+        )
+        self.assertNotIn("uncertain_targets", rec_non_cancel[c_day0["id"]])
+
+    def test_adv04_collector_late_cancel_promotes_refs_and_overflow_order_independent(
+        self,
+    ):
+        cfg = config()
+        alert_a_id = "https://api.weather.gov/alerts/adv04-a"
+        target_b_id = "https://api.weather.gov/alerts/adv04-b"
+        target_c_id = "https://api.weather.gov/alerts/adv04-c"
+        dup_x_id = "https://api.weather.gov/alerts/adv04-x"
+
+        def raw_msg(
+            fid,
+            msg_type,
+            refs,
+            *,
+            sent="2026-11-15T19:56:00Z",
+            instruction="Take shelter now.",
+        ):
+            f = feature()
+            f["id"] = fid
+            f["properties"]["id"] = fid.rsplit("/", 1)[-1]
+            f["properties"]["messageType"] = msg_type
+            f["properties"]["sent"] = sent
+            f["properties"]["instruction"] = instruction
+            f["properties"]["references"] = [
+                {
+                    "@id": r,
+                    "identifier": r.rsplit("/", 1)[-1],
+                    "sender": "nws@example.test",
+                    "sent": "2026-11-15T19:55:00Z",
+                }
+                for r in refs
+            ]
+            return f
+
+        def new_state():
+            return {
+                "events": {},
+                "conflicting_ids": set(),
+                "malformed_by_id": {},
+                "id_counts": {},
+                "cancel_seen_for_id": set(),
+                "unrecoverable_cancel_for_id": set(),
+                "quarantined": 0,
+                "quarantined_lineages": [],
+                "quarantined_cancel_lineages": [],
+                "seen_quarantine_ids": set(),
+                "quarantine_ambiguous": False,
+                "uncertain_cancellation": False,
+                "conflicting_cancellation": False,
+                "feature_count": 0,
+            }
+
+        # Trace A: [A, f1, f2, f3] vs [A, f3, f1, f2] where f1 & f2 are conflicting
+        # non-cancels referencing A & B, and f3 is a late Actual Cancel referencing C.
+        feat_a = raw_msg(alert_a_id, "Alert", [], sent="2026-11-15T19:55:00Z")
+        f1 = raw_msg(dup_x_id, "Update", [alert_a_id], sent="2026-11-15T19:56:00Z")
+        f2 = raw_msg(
+            dup_x_id,
+            "Update",
+            [target_b_id],
+            sent="2026-11-15T19:57:00Z",
+            instruction="Take shelter in a basement now.",
+        )
+        f3 = raw_msg(dup_x_id, "Cancel", [target_c_id], sent="2026-11-15T19:58:00Z")
+
+        for order in ([feat_a, f1, f2, f3], [feat_a, f3, f1, f2]):
+            st = new_state()
+            payload = json.dumps(
+                {"type": "FeatureCollection", "features": order}
+            ).encode()
+            collector._parse_and_collect_page(payload, st)
+            self.assertNotIn(dup_x_id, st["events"])
+            self.assertIn(alert_a_id, st["events"])
+            self.assertFalse(st["conflicting_cancellation"])
+            self.assertFalse(st["uncertain_cancellation"])
+            promoted_targets = {
+                target
+                for lin in st["quarantined_cancel_lineages"]
+                if lin and lin[0] == dup_x_id
+                for target in lin[1:]
+            }
+            self.assertEqual(promoted_targets, {alert_a_id, target_b_id, target_c_id})
+
+            # End-to-end: A is quarantined on Poll 1 and stays quarantined on Poll 2.
+            events_p1 = list(st["events"].values())
+            rec1, plans1 = d.reconcile(
+                {},
+                events_p1,
+                cfg,
+                NOW,
+                partial=True,
+                quarantine_lineages=st["quarantined_lineages"],
+                quarantine_cancel_lineages=st["quarantined_cancel_lineages"],
+            )
+            self.assertEqual(plans1, [])
+            self.assertEqual(rec1[alert_a_id]["state"], "quarantined")
+            self.assertEqual(
+                rec1[dup_x_id]["uncertain_targets"],
+                sorted([alert_a_id, target_b_id, target_c_id]),
+            )
+            rec2, plans2 = d.reconcile(rec1, events_p1, cfg, NOW + timedelta(minutes=1))
+            self.assertEqual(plans2, [])
+            self.assertEqual(rec2[alert_a_id]["state"], "quarantined")
+
+        # Trace B: 5,000-ID overflow [f1, f2, f3] vs [f3, f1, f2] must set
+        # conflicting_cancellation in BOTH orders even when f3 only references an
+        # already-tracked ID.
+        ov_x_id = "https://api.weather.gov/alerts/adv04-ov-x"
+        ov_refs_1 = [f"https://api.weather.gov/alerts/adv04-r-{i}" for i in range(3000)]
+        ov_refs_2 = [
+            f"https://api.weather.gov/alerts/adv04-r-{i}" for i in range(3000, 5500)
+        ]
+        ov_f1 = feature()
+        ov_f1["id"] = ov_x_id
+        ov_f1["properties"]["id"] = "adv04-ov-x"
+        ov_f1["properties"]["messageType"] = "Update"
+        ov_f1["properties"]["references"] = [{"@id": r} for r in ov_refs_1]
+        ov_f2 = feature()
+        ov_f2["id"] = ov_x_id
+        ov_f2["properties"]["id"] = "adv04-ov-x"
+        ov_f2["properties"]["messageType"] = "Update"
+        ov_f2["properties"]["references"] = [{"@id": r} for r in ov_refs_2]
+        ov_f3 = raw_msg(ov_x_id, "Cancel", [ov_refs_1[0]], sent="2026-11-15T19:58:00Z")
+
+        for order in ([ov_f1, ov_f2, ov_f3], [ov_f3, ov_f1, ov_f2]):
+            st = new_state()
+            payload = json.dumps(
+                {"type": "FeatureCollection", "features": order}
+            ).encode()
+            collector._parse_and_collect_page(payload, st)
+            self.assertTrue(st["quarantine_ambiguous"])
+            self.assertTrue(st["conflicting_cancellation"])
+            self.assertIn(ov_x_id, st["overflowed_ids"])
+
+    def test_adv05_conflicting_prior_cancel_quarantines_renewal_and_continuing_update_on_poll2_and_poll3(
+        self,
+    ):
+        cfg = config()
+        alert_a = cap_event("adv05-a", -20, message_type="Alert")
+        alert_b = cap_event("adv05-b", -18, message_type="Alert")
+        cancel_c = cap_event("adv05-c", -15, [alert_a], "Cancel")
+
+        # Poll 1: Valid Cancel C cancels Alert A.
+        rec1, plans1 = d.reconcile(
+            {}, [alert_a, cancel_c], cfg, NOW, graph_events=[alert_a, cancel_c]
+        )
+        self.assertEqual(plans1, [])
+        self.assertEqual(rec1[alert_a["id"]]["state"], "cancelled")
+        self.assertTrue(rec1[cancel_c["id"]]["cancel_message"])
+        self.assertNotIn("uncertain_targets", rec1[cancel_c["id"]])
+
+        # Poll 2: Conflicting Cancel reusing ID C (targeting B) arrives alongside
+        # Renewal R referencing C and Continuing Update U referencing A.
+        conflict_c = cap_event("adv05-c", -12, [alert_b], "Cancel")
+        renewal_r = cap_event("adv05-r", -5, [cancel_c], "Update")
+        renewal_r["instruction"] = "Take shelter in an interior room immediately."
+        cont_u = cap_event("adv05-u", -4, [alert_a], "Update")
+        cont_u["instruction"] = "Take shelter in a basement immediately."
+
+        rec2, plans2 = d.reconcile(
+            rec1,
+            [conflict_c, renewal_r, cont_u],
+            cfg,
+            NOW + timedelta(minutes=1),
+            graph_events=[conflict_c, renewal_r, cont_u],
+        )
+        self.assertEqual(plans2, [])
+        self.assertEqual(rec2[renewal_r["id"]]["state"], "quarantined")
+        self.assertEqual(rec2[cont_u["id"]]["state"], "quarantined")
+        self.assertEqual(
+            rec2[cancel_c["id"]]["uncertain_targets"],
+            sorted([alert_a["id"], alert_b["id"]]),
+        )
+
+        # Poll 3: Conflicting Cancel leaves; R and U remain quarantined (matching Poll 2).
+        rec3, plans3 = d.reconcile(
+            rec2,
+            [renewal_r, cont_u],
+            cfg,
+            NOW + timedelta(minutes=2),
+            graph_events=[renewal_r, cont_u],
+        )
+        self.assertEqual(plans3, [])
+        self.assertEqual(rec3[renewal_r["id"]]["state"], "quarantined")
+        self.assertEqual(rec3[cont_u["id"]]["state"], "quarantined")
+
+        # Also verify conflicting non-Cancel Alert reusing ID C (empty incoming refs)
+        # persists prior cap_references as uncertain_targets and quarantines R & U on Poll 2 and Poll 3.
+        conflict_alert_c = cap_event("adv05-c", -12, message_type="Alert")
+        rec2_alt, plans2_alt = d.reconcile(
+            rec1,
+            [conflict_alert_c, renewal_r, cont_u],
+            cfg,
+            NOW + timedelta(minutes=1),
+            graph_events=[conflict_alert_c, renewal_r, cont_u],
+        )
+        self.assertEqual(plans2_alt, [])
+        self.assertEqual(rec2_alt[renewal_r["id"]]["state"], "quarantined")
+        self.assertEqual(rec2_alt[cont_u["id"]]["state"], "quarantined")
+        self.assertEqual(rec2_alt[cancel_c["id"]]["uncertain_targets"], [alert_a["id"]])
+
+        rec3_alt, plans3_alt = d.reconcile(
+            rec2_alt,
+            [renewal_r, cont_u],
+            cfg,
+            NOW + timedelta(minutes=2),
+            graph_events=[renewal_r, cont_u],
+        )
+        self.assertEqual(plans3_alt, [])
+        self.assertEqual(rec3_alt[renewal_r["id"]]["state"], "quarantined")
+        self.assertEqual(rec3_alt[cont_u["id"]]["state"], "quarantined")
+
 
 class Services:
     def __init__(self):
