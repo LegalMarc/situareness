@@ -259,7 +259,7 @@ def _parse_and_collect_page(raw_bytes, state):
                 is_cancel=(eid in cancel_seen_for_id),
             )
             if (eid in cancel_seen_for_id) and (
-                not fits or eid in unrecoverable_cancel_for_id or not combined_refs
+                not fits or eid in unrecoverable_cancel_for_id
             ):
                 state["conflicting_cancellation"] = True
             continue
@@ -292,7 +292,7 @@ def _parse_and_collect_page(raw_bytes, state):
                 [eid, *combined_refs], is_cancel=(eid in cancel_seen_for_id)
             )
             if (eid in cancel_seen_for_id) and (
-                not fits or eid in unrecoverable_cancel_for_id or not combined_refs
+                not fits or eid in unrecoverable_cancel_for_id
             ):
                 state["conflicting_cancellation"] = True
             continue

@@ -1,6 +1,16 @@
 # Supervisor handoff
 
-Snapshot: November 19, 2026 UTC (November 18 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
+Snapshot: November 19, 2026 UTC. Resume from live Git state, not an assumption that the latest checkpoint passed review.
+
+## Continuation update: November 19 thirty-eighth repair candidate
+
+Independent high-effort Google-model reviews of `e395e0f` reported a second consecutive **Verdict: PASS** (zero findings) from **Gemini 4 Hydrogen (high)** on `specification`, and 2 findings (`STD-01` High, `STD-02` Medium) from **Gemini 4 Neon (high)** on `standards`.
+
+Both findings were resolved cleanly in Round 38 (`custom_components/situareness/domain.py`, `custom_components/situareness/collector.py`, and `tests/ha/test_domain.py`):
+- **`STD-01`**: Persisted `"cap_references": []` (instead of `None`) for verified hidden non-superseding `Actual Alert` placeholders in `domain.py:reconcile()` so later partial cancellations, continuing updates, and sibling-only cancellations include those alerts in `_cancellation_analysis` `nodes`/`identities` without injecting directed edges (verified by regression tests for both continuing segments and sibling-only cancellation).
+- **`STD-02`**: Removed the redundant `or not combined_refs` clause in `collector.py:_parse_and_collect_page()` where unrecoverable cancels are already tracked in `unrecoverable_cancel_for_id`, preventing paginated/duplicate non-cancel copies from escalating locally scoped conflicting-cancel quarantine to 7-day poll-wide `conflicting_cancellation` (verified across arrival orders and multi-page splits plus negative control).
+
+Verification on the repaired candidate: `234` total automated tests (`44` Node + `148` `-W error` / `-X dev` stdlib HA with zero asyncio slow-callback warnings + `7` skill + `22` Chromium Playwright + `13` real HA, plus Ruff lint/format), deterministic packaging (`685368a8...` extension ZIP, `387efa44...` HA ZIP), live anonymous browser smoke (`2026-11-19T18:37:18.019Z`, HTTP 200 across all four endpoints: `0` NWS alerts, `5` USGS, `35` BBC World, `21` BBC US & Canada), and privacy audit (`issue_count: 0`). Next: commit/push to `wip/supervisor-handoff-20261117` and run fresh Google-model `standards`, `spec`, and blind `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
 
 ## Continuation update: November 19 thirty-seventh repair candidate
 

@@ -1371,6 +1371,8 @@ def reconcile(
                 "cap_identity": source.get("cap_identity"),
                 "cap_references": source.get("reference_identities")
                 if can_supersede and source.get("cap_references_valid")
+                else []
+                if source.get("cap_references_valid")
                 else None,
                 "cancel_message": False,
                 "sent": source.get("sent"),

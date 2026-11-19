@@ -1377,6 +1377,143 @@ class Policy(unittest.TestCase):
         self.assertEqual(len(rec4), 1000)
         self.assertNotIn(p["id"], rec4)
 
+    def test_hidden_actual_alert_persists_empty_cap_references_for_later_cancellation(
+        self,
+    ):
+        cfg = config()
+        # Subcase (a): Poll 1 receives Actual Alert A hidden by Actual Update U; Poll 2 receives Cancel C(A)
+        # + continuing Update U2(A) with a distinct qualifying protective action.
+        a = cap_event("hid-a", -20, message_type="Alert")
+        u = cap_event("hid-u", -15, [a], "Update")
+        cands1 = d.resolve_candidates({}, [a, u], [a, u], now=NOW)
+        self.assertEqual([e["id"] for e in cands1], [u["id"]])
+        rec1, _ = d.reconcile({}, cands1, cfg, NOW, graph_events=[a, u])
+        self.assertEqual(rec1[a["id"]]["state"], "superseded")
+        self.assertEqual(rec1[a["id"]]["cap_references"], [])
+
+        cancel_c = cap_event("hid-c", -10, [a], "Cancel")
+        u2 = cap_event("hid-u2", -5, [a], "Update")
+        u2["instruction"] = "Take shelter in a basement immediately."
+        cands2 = d.resolve_candidates(
+            rec1, [cancel_c, u2], [cancel_c, u2], now=NOW + timedelta(minutes=1)
+        )
+        rec2, plans2 = d.reconcile(
+            rec1,
+            cands2,
+            cfg,
+            NOW + timedelta(minutes=1),
+            graph_events=[cancel_c, u2],
+        )
+        self.assertEqual(rec2[a["id"]]["state"], "cancelled")
+        self.assertEqual(rec2[u2["id"]]["state"], "active")
+        self.assertEqual([pl["id"] for pl in plans2], [u2["id"]])
+
+        # Subcase (b): hidden Actual Alert A + U + sibling S, followed by sibling-only Cancel CU(U).
+        a_b = cap_event("hidb-a", -20, message_type="Alert")
+        u_b = cap_event("hidb-u", -15, [a_b], "Update")
+        s_b = cap_event("hidb-s", -14, [a_b], "Update")
+        cands_b1 = d.resolve_candidates({}, [a_b, u_b, s_b], [a_b, u_b, s_b], now=NOW)
+        rec_b1, _ = d.reconcile({}, cands_b1, cfg, NOW, graph_events=[a_b, u_b, s_b])
+        self.assertEqual(rec_b1[a_b["id"]]["state"], "superseded")
+        self.assertEqual(rec_b1[a_b["id"]]["cap_references"], [])
+
+        cu_b = cap_event("hidb-cu", -10, [u_b], "Cancel")
+        cands_b2 = d.resolve_candidates(
+            rec_b1, [cu_b, s_b], [cu_b, s_b], now=NOW + timedelta(minutes=1)
+        )
+        rec_b2, _ = d.reconcile(
+            rec_b1,
+            cands_b2,
+            cfg,
+            NOW + timedelta(minutes=1),
+            graph_events=[cu_b, s_b],
+        )
+        self.assertEqual(rec_b2[a_b["id"]]["state"], "superseded")
+        self.assertEqual(rec_b2[u_b["id"]]["state"], "cancelled")
+        self.assertEqual(rec_b2[s_b["id"]]["state"], "active")
+        for rec in rec_b2.values():
+            self.assertNotIn("cancellation scope uncertain", rec.get("reasons", []))
+
+    def test_duplicate_conflicting_non_cancel_preserves_local_cancel_scope_across_orders(
+        self,
+    ):
+        dup_id = "https://api.weather.gov/alerts/dup-order-x"
+        target_id = "https://api.weather.gov/alerts/dup-order-target"
+
+        cancel_with_refs = feature()
+        cancel_with_refs["id"] = dup_id
+        cancel_with_refs["properties"]["id"] = "dup-order-x"
+        cancel_with_refs["properties"]["messageType"] = "Cancel"
+        cancel_with_refs["properties"]["references"] = [
+            {
+                "@id": target_id,
+                "identifier": "dup-order-target",
+                "sender": "w-nws.webmaster@noaa.gov",
+                "sent": cancel_with_refs["properties"]["sent"],
+            }
+        ]
+        alert_copy = feature()
+        alert_copy["id"] = dup_id
+        alert_copy["properties"]["id"] = "dup-order-x"
+        alert_copy["properties"]["messageType"] = "Alert"
+        alert_copy["properties"]["references"] = []
+
+        def new_state():
+            return {
+                "events": {},
+                "conflicting_ids": set(),
+                "malformed_by_id": {},
+                "id_counts": {},
+                "cancel_seen_for_id": set(),
+                "unrecoverable_cancel_for_id": set(),
+                "quarantined": 0,
+                "quarantined_lineages": [],
+                "quarantined_cancel_lineages": [],
+                "seen_quarantine_ids": set(),
+                "quarantine_ambiguous": False,
+                "uncertain_cancellation": False,
+                "conflicting_cancellation": False,
+                "feature_count": 0,
+            }
+
+        for pages in (
+            [[cancel_with_refs, alert_copy, alert_copy]],
+            [[alert_copy, alert_copy, cancel_with_refs]],
+            [[cancel_with_refs, alert_copy], [alert_copy]],
+        ):
+            st = new_state()
+            for feats in pages:
+                payload = json.dumps(
+                    {"type": "FeatureCollection", "features": feats}
+                ).encode()
+                collector._parse_and_collect_page(payload, st)
+            self.assertNotIn(dup_id, st["events"])
+            self.assertIn(dup_id, st["conflicting_ids"])
+            self.assertFalse(st["conflicting_cancellation"])
+            self.assertFalse(st["uncertain_cancellation"])
+            self.assertTrue(
+                any(
+                    target_id in lin and dup_id in lin
+                    for lin in st["quarantined_cancel_lineages"]
+                )
+            )
+
+        # Negative control: Cancel lacking recoverable targets still escalates conflicting_cancellation.
+        cancel_no_refs = feature()
+        cancel_no_refs["id"] = dup_id
+        cancel_no_refs["properties"]["id"] = "dup-order-x"
+        cancel_no_refs["properties"]["messageType"] = "Cancel"
+        cancel_no_refs["properties"]["references"] = []
+        st_bad = new_state()
+        payload_bad = json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [cancel_no_refs, alert_copy, alert_copy],
+            }
+        ).encode()
+        collector._parse_and_collect_page(payload_bad, st_bad)
+        self.assertTrue(st_bad["conflicting_cancellation"])
+
 
 class Services:
     def __init__(self):
