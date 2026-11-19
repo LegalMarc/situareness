@@ -3,7 +3,7 @@
 <!-- docs-sync
 roots: docs/ home-assistant/ README.md AGENTS.md CLAUDE.md skills/situareness-sources/
 exclude: .git/ work/ .venv/ __pycache__/ ignored-resources/ node_modules/ dist/
-code: extension/ custom_components/ tools/ tests/ skills/situareness-sources/scripts/ package.json playwright.config.js
+code: extension/ custom_components/ tools/ tests/ skills/situareness-sources/scripts/ package.json playwright.config.js .github/workflows/
 -->
 
 Start with the [project context](CONTEXT.md) and [continuation guide](plans/RESUME.md). Source catalog entries are research, not runtime inputs. Configuration exports and personal settings are sensitive.
@@ -13,10 +13,13 @@ Start with the [project context](CONTEXT.md) and [continuation guide](plans/RESU
 - `CLAUDE.md` — Shared agent entry point.
 - `README.md` — Project overview, links, privacy, and source limitations.
 
+## .github/workflows/
+- `.github/workflows/ci.yml` — Public CI workflow running Ruff, unit tests, public hygiene gate, and Playwright browser checks.
+
 ## docs/
 - `docs/CONTEXT.md` — Domain terms, operating model, sources, and current boundaries. anchors: purpose, domain-language, operating-model, sources-and-configuration, current-boundaries
 - `docs/extension-quickstart.md` — Packaged room installation and configuration privacy.
-- `docs/setup.md` — Room operation, source freshness, private settings, and development checks. anchors: what-runs-where, load-into-chrome, settings-and-privacy, sources-and-freshness, develop-and-verify, future-work covers: extension/**, tools/**, tests/browser/**, tests/runtime/**, tests/ui/**, package.json, playwright.config.js
+- `docs/setup.md` — Room operation, source freshness, private settings, and development checks. anchors: what-runs-where, load-into-chrome, settings-and-privacy, sources-and-freshness, develop-and-verify, future-work covers: extension/**, tools/**, tests/browser/**, tests/runtime/**, tests/ui/**, package.json, playwright.config.js, .github/workflows/**
 
 ## docs/adr/
 - `docs/adr/0001-confirmed-operating-model.md` — Independent monitoring and conservative household alarm decisions. anchors: status, decision, consequences
@@ -51,3 +54,6 @@ Start with the [project context](CONTEXT.md) and [continuation guide](plans/RESU
 
 ## skills/situareness-sources/references/
 - `skills/situareness-sources/references/catalog-format.md` — Research catalog schema and validation guidance.
+
+## tools/
+- `tools/check_public_hygiene.py` — Public hygiene check for tracked paths, secret scans, reproducible packaging, and docs index links.

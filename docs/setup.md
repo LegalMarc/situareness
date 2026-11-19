@@ -38,9 +38,12 @@ With Node 22.19 or newer and Python 3.11 or newer:
 npm ci
 npx playwright install chromium
 npm run check
+python3 tools/check_public_hygiene.py
 npm run test:browser
 npm run package
 ```
+
+`python3 tools/check_public_hygiene.py` checks tracked paths against private/generated exclusions, scans tracked UTF-8 text files for credential patterns, verifies reproducible ZIP digests and archive entry safety via `tools/package.py`, and checks `docs/INDEX.md` file links against `git ls-files`. Public CI in `.github/workflows/ci.yml` runs Ruff checks, `npm run check`, `python3 -X dev -W error -m unittest discover -s tests/ha -p 'test_*.py'`, `python3 tools/check_public_hygiene.py`, and `npm run test:browser` without live external network smoke tests or physical Home Assistant commissioning.
 
 Browser tests use fixtures and isolated profiles. `node tools/live-browser-smoke.mjs` performs optional anonymous read-only collection. Packaging creates separate room and HA archives in `dist/`. See [the validation report](reports/VALIDATION.md) for recorded evidence and its limits. The [HA guide](ha/README.md) describes optional isolated tests against installed HA interfaces.
 
