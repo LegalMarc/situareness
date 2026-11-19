@@ -116,8 +116,16 @@ def normalize(feature):
     ):
         raise OversizedFeature("NWS reference limit exceeded")
     references = [
-        r.get("@id") for r in refs if isinstance(r, dict) and safe_url(r.get("@id"))
+        ref_id
+        for r in refs
+        if isinstance(r, dict)
+        and isinstance(ref_id := r.get("@id"), str)
+        and safe_url(ref_id)
+        and ref_id.startswith("https://api.weather.gov/alerts/")
     ]
+    references_complete = (
+        p.get("references") is None or isinstance(p.get("references"), list)
+    ) and len(references) == len(refs)
     identity = cap_identity(p.get("id"), p.get("sender"), p.get("sent"))
     if identity and identifier != "https://api.weather.gov/alerts/" + identity[1]:
         identity = None
@@ -157,6 +165,7 @@ def normalize(feature):
         "instruction": p.get("instruction"),
         "geometry": feature.get("geometry"),
         "references": references,
+        "references_complete": references_complete,
     }
 
 
@@ -566,6 +575,7 @@ def _cancellation_analysis(
                 not prior_rec.get("cancel_message")
                 or len(prior_rec.get("lineage", [])) > 1
                 or prior_rec.get("cap_references")
+                or prior_rec.get("uncertain_targets")
             ):
                 seeded_uncertain_ids.update(event.get("references", []))
                 if not prior_rec.get("cancel_message"):
@@ -1533,8 +1543,10 @@ def reconcile(
                 }
             )
             planned_in_poll.add((group, fp))
-        if cancelled or blocked:
+        if cancelled:
             actions = {}
+        elif blocked:
+            actions = dict(action_history(old_prior)) if old_prior else {}
         elif decision["qualifies"]:
             actions = {fp: decision["affected"]}
         inactive_since = min(inactive_dates, default=now).isoformat()
@@ -1593,7 +1605,7 @@ def reconcile(
             updated_rec = {
                 **records[eid],
                 "state": "cancelled",
-                "actions": {},
+                "actions": dict(action_history(records[eid])),
                 "reasons": ["message explicitly referenced by cancellation"],
             }
             if cancelled_at is not None:

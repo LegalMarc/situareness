@@ -1128,6 +1128,153 @@ class Policy(unittest.TestCase):
         with self.assertRaises(ValueError):
             collector._parse_and_collect_page(payload, state)
 
+    def test_partial_cancel_preserves_pre_cancel_actions_across_polls(self):
+        cfg = config()
+        p = cap_event("pc-p", -10, message_type="Alert")
+        rec1, plans1 = d.reconcile({}, [p], cfg, NOW)
+        self.assertEqual([pl["id"] for pl in plans1], [p["id"]])
+
+        # Poll 2: partial Cancel arrives first without continuing segment (test both P absent and P present).
+        cancel_c = cap_event("pc-c", -5, [p], "Cancel")
+        for poll2_events in ([cancel_c], [cancel_c, p]):
+            rec2, plans2 = d.reconcile(
+                rec1, poll2_events, cfg, NOW + timedelta(minutes=1)
+            )
+            self.assertEqual(plans2, [])
+            self.assertEqual(rec2[p["id"]]["state"], "cancelled")
+            self.assertTrue(rec2[p["id"]]["actions"])
+
+            # Poll 3: unreferenced continuing Update repeating pre-cancel action must stay withheld.
+            u_same = cap_event("pc-u-same", -4, [p])
+            u_same["instruction"] = p["instruction"]
+            rec3, plans3 = d.reconcile(rec2, [u_same], cfg, NOW + timedelta(minutes=2))
+            self.assertEqual(plans3, [])
+            self.assertEqual(rec3[u_same["id"]]["state"], "quarantined")
+
+            # Poll 3 with distinct qualifying instruction must qualify normally as active.
+            u_new = cap_event("pc-u-new", -4, [p])
+            u_new["instruction"] = "Take shelter in a sturdy building immediately."
+            rec4, plans4 = d.reconcile(rec2, [u_new], cfg, NOW + timedelta(minutes=2))
+            self.assertEqual([pl["id"] for pl in plans4], [u_new["id"]])
+            self.assertEqual(rec4[u_new["id"]]["state"], "active")
+
+    def test_collector_mixed_valid_and_malformed_duplicate_isolation(self):
+        target_id = "https://api.weather.gov/alerts/dup-target"
+        dup_id = "https://api.weather.gov/alerts/dup-upd"
+
+        def make_state():
+            return {
+                "events": {},
+                "conflicting_ids": set(),
+                "malformed_by_id": {},
+                "id_counts": {},
+                "cancel_seen_for_id": set(),
+                "unrecoverable_cancel_for_id": set(),
+                "quarantined": 0,
+                "quarantined_lineages": [],
+                "quarantined_cancel_lineages": [],
+                "seen_quarantine_ids": set(),
+                "quarantine_ambiguous": False,
+                "uncertain_cancellation": False,
+                "conflicting_cancellation": False,
+                "feature_count": 0,
+            }
+
+        valid_upd = feature()
+        valid_upd["id"] = dup_id
+        valid_upd["properties"]["id"] = dup_id.rsplit("/", 1)[-1]
+        valid_upd["properties"]["messageType"] = "Update"
+        valid_upd["properties"]["references"] = [{"@id": target_id}]
+        malformed_upd = copy.deepcopy(valid_upd)
+        malformed_upd["properties"]["headline"] = 123
+
+        for order in ([valid_upd, malformed_upd], [malformed_upd, valid_upd]):
+            st = make_state()
+            payload = json.dumps(
+                {"type": "FeatureCollection", "features": order}
+            ).encode()
+            collector._parse_and_collect_page(payload, st)
+            self.assertNotIn(dup_id, st["events"])
+            self.assertEqual(st["quarantined"], 2)
+            self.assertFalse(st["conflicting_cancellation"])
+
+        valid_can = copy.deepcopy(valid_upd)
+        valid_can["properties"]["messageType"] = "Cancel"
+        malformed_bad_ref = copy.deepcopy(valid_upd)
+        malformed_bad_ref["properties"]["headline"] = 123
+        malformed_bad_ref["properties"]["references"] = ["bad-ref"]
+        for order in ([valid_can, malformed_bad_ref], [malformed_bad_ref, valid_can]):
+            st = make_state()
+            payload = json.dumps(
+                {"type": "FeatureCollection", "features": order}
+            ).encode()
+            collector._parse_and_collect_page(payload, st)
+            self.assertNotIn(dup_id, st["events"])
+            self.assertTrue(st["conflicting_cancellation"])
+
+    def test_conflicting_cancel_against_persisted_uncertain_targets_quarantines_new_target(
+        self,
+    ):
+        cfg = config()
+        a1 = cap_event("unc-a1", -15, message_type="Alert")
+        a2 = cap_event("unc-a2", -5, message_type="Alert")
+        bad_c1 = cap_event("unc-c1", -10, [a1], "Cancel")
+        bad_c1["cap_references_valid"] = False
+        rec1, _ = d.reconcile({}, [bad_c1], cfg, NOW)
+        self.assertEqual(rec1[bad_c1["id"]]["uncertain_targets"], [a1["id"]])
+
+        conflict_c1 = cap_event("unc-c1", -5, [a2], "Cancel")
+        conflict_c1["cap_references_valid"] = True
+        rec2, plans2 = d.reconcile(
+            rec1, [conflict_c1, a2], cfg, NOW + timedelta(minutes=1)
+        )
+        self.assertEqual(plans2, [])
+        self.assertEqual(rec2[a2["id"]]["state"], "quarantined")
+
+    def test_actual_cancel_with_mixed_valid_and_unrecoverable_refs_is_malformed(self):
+        cfg = config()
+        target_id = "https://api.weather.gov/alerts/a1"
+        for bad_ref in (
+            {"@id": "https://api.weather.gov/zones/NYZ072"},
+            "not-a-dict",
+        ):
+            raw = feature()
+            raw["properties"]["messageType"] = "Cancel"
+            raw["properties"]["references"] = [
+                {
+                    "@id": target_id,
+                    "identifier": "a1",
+                    "sender": "w-nws.webmaster@noaa.gov",
+                    "sent": raw["properties"]["sent"],
+                },
+                bad_ref,
+            ]
+            norm = d.normalize(raw)
+            self.assertEqual(norm["references"], [target_id])
+            self.assertFalse(norm["references_complete"])
+            st = {
+                "events": {},
+                "conflicting_ids": set(),
+                "malformed_by_id": {},
+                "id_counts": {},
+                "cancel_seen_for_id": set(),
+                "unrecoverable_cancel_for_id": set(),
+                "quarantined": 0,
+                "quarantined_lineages": [],
+                "quarantined_cancel_lineages": [],
+                "seen_quarantine_ids": set(),
+                "quarantine_ambiguous": False,
+                "uncertain_cancellation": False,
+                "conflicting_cancellation": False,
+                "feature_count": 0,
+            }
+            payload = json.dumps(
+                {"type": "FeatureCollection", "features": [raw]}
+            ).encode()
+            collector._parse_and_collect_page(payload, st)
+            self.assertTrue(st["uncertain_cancellation"])
+            self.assertTrue(bool(d.qualify(norm, cfg, NOW)))
+
 
 class Services:
     def __init__(self):

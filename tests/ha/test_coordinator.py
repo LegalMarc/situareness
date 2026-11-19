@@ -8175,3 +8175,245 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["expired_unsent"], 1)
         self.assertEqual(health["expired_unsent_reasons"], ["age"])
         self.assertEqual(health["delivery_attempts"], 0)
+
+    async def test_pre_drain_save_clears_expired_degraded_state_and_freeze_anchor(self):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now_real = datetime.now(timezone.utc)
+        live_cfg = {
+            **config(),
+            "live_enabled": True,
+            "commissioning_passed": True,
+            "phones": [f"mobile_app_{i}" for i in range(125)],
+            "tts_entity": None,
+        }
+
+        class CaptureStore(Store):
+            def __init__(self):
+                super().__init__()
+                self.saved_payloads = []
+
+            async def async_save(self, data):
+                self.saved_payloads.append(dict(data))
+                await super().async_save(data)
+
+        cap_store = CaptureStore()
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        q_evs = []
+        q_fps = []
+        records = {}
+        for j in range(40):
+            q_raw = feature()
+            q_raw["id"] = f"https://api.weather.gov/alerts/pre-q-{j}"
+            q_raw["properties"]["id"] = f"pre-q-{j}"
+            q_raw["properties"]["instruction"] = f"Take shelter for zone {j}."
+            q_raw["properties"]["sent"] = (now_real - timedelta(minutes=2)).isoformat()
+            q_raw["properties"]["effective"] = q_raw["properties"]["sent"]
+            q_raw["properties"]["expires"] = (now_real + timedelta(hours=1)).isoformat()
+            q_raw["properties"]["ends"] = (now_real + timedelta(hours=1)).isoformat()
+            q_ev = d.normalize(q_raw)
+            q_fp = d.fingerprint(q_ev, d.qualify(q_ev, live_cfg, now_real))
+            q_evs.append(q_ev)
+            q_fps.append(q_fp)
+            records[q_ev["id"]] = {
+                "state": "active",
+                "fingerprint": q_fp,
+                "lineage": [q_ev["id"]],
+                "actions": {q_fp: ["new_york_ny"]},
+                "updated": (now_real - timedelta(minutes=5)).isoformat(),
+            }
+
+        ev_raw = feature()
+        ev_raw["id"] = "https://api.weather.gov/alerts/pre-new"
+        ev_raw["properties"]["id"] = "pre-new"
+        ev_raw["properties"]["instruction"] = "Take shelter in interior room now."
+        ev_raw["properties"]["sent"] = (now_real - timedelta(minutes=1)).isoformat()
+        ev_raw["properties"]["effective"] = ev_raw["properties"]["sent"]
+        ev_raw["properties"]["expires"] = (now_real + timedelta(hours=1)).isoformat()
+        ev_raw["properties"]["ends"] = (now_real + timedelta(hours=1)).isoformat()
+        ev = d.normalize(ev_raw)
+        coord = mod.SituarenessCoordinator(
+            hass,
+            live_cfg,
+            cap_store,
+            {
+                "initialized": True,
+                "was_live": True,
+                "degraded": True,
+                "degraded_reason": "journal_lost",
+                "degraded_at": (now_real - timedelta(days=8)).isoformat(),
+                "degraded_until": (now_real - timedelta(minutes=1)).isoformat(),
+                "last_degraded_poll": (now_real - timedelta(minutes=5)).isoformat(),
+                "records": records,
+                "outbox": [
+                    {
+                        "key": f"q-{i}",
+                        "incident_id": q_evs[i // 125]["id"],
+                        "event": "Tornado Warning",
+                        "fingerprint": q_fps[i // 125],
+                        "target": f"mobile_app_{i % 125}",
+                        "kind": "phone",
+                        "location": None,
+                        "source_url": q_evs[i // 125]["id"],
+                        "created": (now_real - timedelta(minutes=10)).isoformat(),
+                        "attempts": 0,
+                        "instruction": q_evs[i // 125]["instruction"],
+                        "affected_names": ["New York"],
+                    }
+                    for i in range(5000)
+                ],
+            },
+        )
+        coord.acknowledge_rejected = True
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents([*q_evs, ev], 41, set(), False),
+        ):
+            health = await coord._async_update_data()
+        pre_drain_payload = cap_store.saved_payloads[0]
+        self.assertFalse(pre_drain_payload["degraded"])
+        self.assertIsNone(pre_drain_payload["last_degraded_poll"])
+        self.assertFalse(health["acknowledge_rejected"])
+        self.assertEqual(health["degraded_reason"], "outbox_overflow")
+
+    async def test_activate_outbox_overflow_strips_shadow_inactive_predecessor_actions(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        now_real = datetime.now(timezone.utc)
+        live_cfg = {
+            **config(),
+            "live_enabled": True,
+            "commissioning_passed": True,
+            "phones": [f"mobile_app_{i}" for i in range(125)],
+            "tts_entity": None,
+        }
+        hass = types.SimpleNamespace(
+            data={},
+            services=Services(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        q_evs = []
+        q_fps = []
+        records = {}
+        for j in range(40):
+            q_raw = feature()
+            q_raw["id"] = f"https://api.weather.gov/alerts/act-q-{j}"
+            q_raw["properties"]["id"] = f"act-q-{j}"
+            q_raw["properties"]["instruction"] = f"Take shelter for other area {j}."
+            q_raw["properties"]["sent"] = (now_real - timedelta(minutes=3)).isoformat()
+            q_raw["properties"]["effective"] = q_raw["properties"]["sent"]
+            q_raw["properties"]["expires"] = (now_real + timedelta(hours=1)).isoformat()
+            q_raw["properties"]["ends"] = (now_real + timedelta(hours=1)).isoformat()
+            q_ev = d.normalize(q_raw)
+            q_fp = d.fingerprint(q_ev, d.qualify(q_ev, live_cfg, now_real))
+            q_evs.append(q_ev)
+            q_fps.append(q_fp)
+            records[q_ev["id"]] = {
+                "state": "active",
+                "fingerprint": q_fp,
+                "lineage": [q_ev["id"]],
+                "actions": {q_fp: ["new_york_ny"]},
+                "updated": (now_real - timedelta(minutes=1)).isoformat(),
+            }
+
+        f1 = feature()
+        f1["id"] = "https://api.weather.gov/alerts/act-ov-1"
+        f1["properties"]["id"] = "act-ov-1"
+        f1["properties"]["messageType"] = "Alert"
+        f1["properties"]["sent"] = (now_real - timedelta(minutes=12)).isoformat()
+        f1["properties"]["effective"] = f1["properties"]["sent"]
+        f1["properties"]["expires"] = (now_real + timedelta(hours=1)).isoformat()
+        f1["properties"]["ends"] = (now_real + timedelta(hours=1)).isoformat()
+        a1 = d.normalize(f1)
+        fp1 = d.fingerprint(a1, d.qualify(a1, live_cfg, now_real))
+        f2 = feature()
+        f2["id"] = "https://api.weather.gov/alerts/act-ov-2"
+        f2["properties"]["id"] = "act-ov-2"
+        f2["properties"]["messageType"] = "Update"
+        f2["properties"]["sent"] = (now_real - timedelta(minutes=2)).isoformat()
+        f2["properties"]["effective"] = f2["properties"]["sent"]
+        f2["properties"]["expires"] = (now_real + timedelta(hours=1)).isoformat()
+        f2["properties"]["ends"] = (now_real + timedelta(hours=1)).isoformat()
+        a2 = d.normalize(f2)
+        cohere(a2, a1)
+
+        records[a1["id"]] = {
+            "state": "ended_or_absent",
+            "fingerprint": fp1,
+            "lineage": [a1["id"]],
+            "actions": {fp1: ["new_york_ny"]},
+            "inactive_since": (now_real - timedelta(minutes=5)).isoformat(),
+            "updated": (now_real - timedelta(minutes=5)).isoformat(),
+        }
+        coord = mod.SituarenessCoordinator(
+            hass,
+            live_cfg,
+            Store(),
+            {
+                "initialized": True,
+                "was_live": False,
+                "records": records,
+                "outbox": [
+                    {
+                        "key": f"fill-{i}",
+                        "incident_id": q_evs[i // 125]["id"],
+                        "event": "Tornado Warning",
+                        "fingerprint": q_fps[i // 125],
+                        "target": f"mobile_app_{i % 125}",
+                        "kind": "phone",
+                        "location": None,
+                        "source_url": q_evs[i // 125]["id"],
+                        "created": (now_real - timedelta(minutes=1)).isoformat(),
+                        "attempts": 0,
+                        "instruction": q_evs[i // 125]["instruction"],
+                        "affected_names": ["New York"],
+                    }
+                    for i in range(5000)
+                ],
+            },
+        )
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents([*q_evs, a2], 41, set(), False),
+        ):
+            h_ov = await coord._async_update_data()
+        self.assertEqual(h_ov["degraded_reason"], "outbox_overflow")
+        self.assertEqual(coord.records[a1["id"]]["actions"], {})
+        coord.outbox = []
+        with patch.object(
+            mod,
+            "fetch",
+            return_value=collector.CollectedEvents([*q_evs, a2], 41, set(), False),
+        ):
+            h_clean = await coord._async_update_data()
+        self.assertEqual(h_clean["planned_count"], 1)

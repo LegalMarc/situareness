@@ -1,6 +1,21 @@
 # Supervisor handoff
 
-Snapshot: November 18, 2026 UTC (November 17 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
+Snapshot: November 19, 2026 UTC (November 18 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
+
+## Continuation update: November 19 thirty-sixth repair candidate
+
+Independent high-effort Google-model reviews of `5696a03` (**Gemini 4 Neon, high** `standards` and **Gemini 4 Hydrogen, high** `specification`) reported **0 Critical findings**, with 7 total findings (`STD-01` High, `STD-02` High, `SPEC-01` High, `STD-03` Medium, `SPEC-02` Medium, `SPEC-03` Low, `STD-04` Nit). Model workflow note: use Google-provided models in Antigravity (`Gemini 4 Neon`, `Gemini 4 Hydrogen`) for primary and review work until non-Google external limits reset or explicit user approval is given for external CLIs.
+
+All 7 findings were resolved cleanly in Round 36 (`custom_components/situareness/domain.py`, `custom_components/situareness/collector.py`, `custom_components/situareness/__init__.py`, `docs/spec/o3-mvp.md`, `tests/ha/test_domain.py`, and `tests/ha/test_coordinator.py`):
+- **`STD-01`**: Added `malformed_by_id` conflict tracking in `collector.py` (`_parse_and_collect_page` and `fetch`) so mixed valid and malformed/oversized duplicate features sharing an NWS alert ID pop/block the valid copy in either arrival order, preserve valid references across isolation, and escalate `conflicting_cancellation` when a Cancel is involved without misclassifying single malformed Cancels (verified by unit tests).
+- **`STD-02`**: Added `or prior_rec.get("uncertain_targets")` to `_cancellation_analysis` recoverability checking in `domain.py` to match `_unrecoverable_prior_cancel_conflict` and quarantine targets referenced by conflicting `Actual Cancel` replays against persisted `uncertain_targets` (verified by unit test).
+- **`SPEC-01`**: Preserved `action_history(old_prior)` on blocked/cancelled target records in `domain.py:reconcile()` (while keeping `actions = {}` on `Cancel` messages) so cross-poll unreferenced continuing updates (`sent >= cancelled_at`) keep pre-cancellation repeating actions suspended in `quarantined` state (verified by unit test).
+- **`STD-03`**: Threaded `pending_degraded` into `_queue_outbox_plans()` in `__init__.py` and passed `last_degraded_poll=None`, `expired_state=expired_state`, and `degraded_state=pending_degraded` to the pre-drain `_save()` call so cleared degraded holds do not leak stale `degraded` / `last_degraded_poll` / `acknowledge_rejected` state (verified by unit test).
+- **`SPEC-02`**: Enforced `https://api.weather.gov/alerts/` prefix validation and `references_complete` completeness tracking in `domain.py:normalize()` and checked `references_complete` across `collector.py` (`_cancel_refs_recoverable`) and `__init__.py` (`_unrecoverable_prior_cancel_conflict`, `_resolve_and_scan_candidates`) so `Actual Cancel` messages with mixed valid and unrecoverable references enter `malformed_cancellation` (verified by unit test).
+- **`SPEC-03`**: Computed `activating = live(self.config) and not self.was_live` in `__init__.py:_update_once()` and updated `_strip_withheld_actions(..., strip_prior_shadow=activating)` to clear shadow actions from inactive predecessors on `activate=True` `outbox_overflow` while skipping `state == "cancelled"` records (verified by unit test).
+- **`STD-04`**: Added `"source cancellation before delivery completion"` (`cancelled`) to the `expired_unsent_reasons` notification attribution parenthetical in `docs/spec/o3-mvp.md`.
+
+Verification on the repaired candidate: `227` total automated tests (`44` Node + `141` `-W error` / `-X dev` stdlib HA with zero asyncio slow-callback warnings + `7` skill + `22` Chromium Playwright + `13` real HA, plus Ruff lint/format), deterministic packaging (`685368a8...` extension ZIP, `51214cec...` HA ZIP), live anonymous browser smoke (`2026-11-19T04:53:52.880Z`, HTTP 200 across all four endpoints: `0` NWS alerts, `5` USGS, `33` BBC World, `26` BBC US & Canada), and privacy audit (`issue_count: 0`). Next: commit/push to `wip/supervisor-handoff-20261117` and run fresh Google-model `standards`, `spec`, and blind `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
 
 ## Continuation update: November 18 thirty-fifth Opus repair candidate
 

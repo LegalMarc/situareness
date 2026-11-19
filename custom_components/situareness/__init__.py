@@ -353,8 +353,10 @@ def _unrecoverable_prior_cancel_conflict(event, old):
         or old.get("uncertain_targets")
         or len(old.get("lineage", [])) > 1
     )
-    return not event.get("references") or (
-        old.get("cancel_message") is True and not old_has_targets
+    return (
+        not event.get("references")
+        or not event.get("references_complete", True)
+        or (old.get("cancel_message") is True and not old_has_targets)
     )
 
 
@@ -374,7 +376,7 @@ def _resolve_and_scan_candidates(records, events, source_events, now):
     malformed_cancel = bool(getattr(events, "uncertain_cancellation", False)) or any(
         event.get("status") == "Actual"
         and event.get("message_type") == "Cancel"
-        and not event.get("references")
+        and (not event.get("references") or not event.get("references_complete", True))
         for event in source_events
     )
     return (
@@ -555,11 +557,13 @@ def _count_deliverable(outbox, records, candidate_events, config, health_now):
     )
 
 
-def _strip_withheld_actions(records, plans, groups, now):
+def _strip_withheld_actions(records, plans, groups, now, *, strip_prior_shadow=False):
     withheld_keys = {(groups.get(plan["id"]), plan["fingerprint"]) for plan in plans}
     now_iso = now.isoformat()
     for eid, record in records.items():
-        if record.get("updated") == now_iso:
+        if record.get("state") == "cancelled":
+            continue
+        if strip_prior_shadow or record.get("updated") == now_iso:
             rec_actions = record.get("actions")
             if isinstance(rec_actions, dict):
                 for fp in list(rec_actions):
@@ -1839,6 +1843,8 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         extra_outcomes=(),
         extra_expired=0,
         attempted_keys=None,
+        pending_degraded=None,
+        strip_prior_shadow=False,
     ):
         """Queue plans atomically up to 5,000 targets; drain pending deliverable work first if needed."""
         attempts = failures = 0
@@ -1875,7 +1881,14 @@ class SituarenessCoordinator(DataUpdateCoordinator):
         already_delivered = False
         if pre_drain_records is not None:
             await self.hass.async_add_executor_job(
-                _strip_withheld_actions, records, plans, groups, now
+                partial(
+                    _strip_withheld_actions,
+                    records,
+                    plans,
+                    groups,
+                    now,
+                    strip_prior_shadow=strip_prior_shadow,
+                )
             )
             if self._stopping:
                 return outbox, False, [], records, 0, 0, False
@@ -1886,7 +1899,9 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 records,
                 outbox,
                 list(self.outcomes) + list(extra_outcomes),
+                last_degraded_poll=None,
                 expired_state=expired_state,
+                degraded_state=pending_degraded,
             )
             attempts, failures = await self._deliver_outbox_batch(
                 candidate_events, now, attempted_keys=attempted_keys
@@ -2257,6 +2272,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 return self._stopped_poll_result()
             # Initial shadow setup establishes a baseline; every subsequent restart reconciles normally.
             baseline = not self.initialized and not live(self.config)
+            activating = live(self.config) and not self.was_live
             poll_evidence_reasons = set()
             if conflicting_cancel:
                 poll_evidence_reasons.add("conflicting_cancellation")
@@ -2280,7 +2296,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                         self.config,
                         now,
                         baseline=baseline,
-                        activate=live(self.config) and not self.was_live,
+                        activate=activating,
                         partial=bool(getattr(events, "quarantined", 0)),
                         quarantine_lineages=getattr(events, "quarantined_lineages", ()),
                         quarantine_all=getattr(events, "quarantine_ambiguous", False),
@@ -2429,13 +2445,22 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                 extra_outcomes=migrated_expired_outcomes,
                 extra_expired=migrated_expired,
                 attempted_keys=pre_drain_attempted_keys,
+                pending_degraded=pending_degraded,
+                strip_prior_shadow=activating,
             )
             if outbox_overflow:
                 pending_degraded = self._compute_degraded_latch(
                     "outbox_overflow", now, now + MAX_AGE
                 )
                 await self.hass.async_add_executor_job(
-                    _strip_withheld_actions, records, dropped_plans, groups, now
+                    partial(
+                        _strip_withheld_actions,
+                        records,
+                        dropped_plans,
+                        groups,
+                        now,
+                        strip_prior_shadow=activating,
+                    )
                 )
                 if self._stopping:
                     return self._stopped_poll_result()

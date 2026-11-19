@@ -43,10 +43,15 @@ class CollectedEvents(list):
         )
 
 
+def _cancel_refs_recoverable(ev):
+    return bool(ev.get("references")) and ev.get("references_complete", True)
+
+
 def _parse_and_collect_page(raw_bytes, state):
     MAX_QUARANTINE_IDS = 5000
     events = state["events"]
     conflicting_ids = state["conflicting_ids"]
+    malformed_by_id = state.setdefault("malformed_by_id", {})
     id_counts = state["id_counts"]
     cancel_seen_for_id = state["cancel_seen_for_id"]
     unrecoverable_cancel_for_id = state["unrecoverable_cancel_for_id"]
@@ -131,11 +136,98 @@ def _parse_and_collect_page(raw_bytes, state):
                     and (raw_refs is None or isinstance(raw_refs, list))
                     and len(valid_ref_ids) == len(refs)
                 )
-                fits = add_quarantined_lineage(
-                    [feature_id, *valid_ref_ids], is_cancel=is_cancel
-                )
-                if is_cancel and (not refs_valid or not valid_ref_ids or not fits):
-                    state["uncertain_cancellation"] = True
+                if feature_id in events:
+                    existing = events.pop(feature_id)
+                    conflicting_ids.add(feature_id)
+                    state["quarantined"] += id_counts[feature_id]
+                    existing_is_cancel = (
+                        existing.get("status") == "Actual"
+                        and existing.get("message_type") == "Cancel"
+                    )
+                    if existing_is_cancel or is_cancel:
+                        cancel_seen_for_id.add(feature_id)
+                    if (
+                        (existing_is_cancel and not _cancel_refs_recoverable(existing))
+                        or not refs_valid
+                        or (is_cancel and not valid_ref_ids)
+                    ):
+                        unrecoverable_cancel_for_id.add(feature_id)
+                    combined_refs = list(
+                        dict.fromkeys([*existing.get("references", []), *valid_ref_ids])
+                    )
+                    fits = add_quarantined_lineage(
+                        [feature_id, *combined_refs],
+                        is_cancel=(feature_id in cancel_seen_for_id),
+                    )
+                    if (feature_id in cancel_seen_for_id) and (
+                        not fits
+                        or feature_id in unrecoverable_cancel_for_id
+                        or not combined_refs
+                    ):
+                        state["conflicting_cancellation"] = True
+                    if is_cancel and (not refs_valid or not valid_ref_ids or not fits):
+                        state["uncertain_cancellation"] = True
+                elif feature_id in conflicting_ids:
+                    if is_cancel:
+                        cancel_seen_for_id.add(feature_id)
+                    if not refs_valid or (is_cancel and not valid_ref_ids):
+                        unrecoverable_cancel_for_id.add(feature_id)
+                    fits = add_quarantined_lineage(
+                        [feature_id, *valid_ref_ids],
+                        is_cancel=(feature_id in cancel_seen_for_id),
+                    )
+                    if (feature_id in cancel_seen_for_id) and (
+                        not fits or feature_id in unrecoverable_cancel_for_id
+                    ):
+                        state["conflicting_cancellation"] = True
+                    if is_cancel and (not refs_valid or not valid_ref_ids or not fits):
+                        state["uncertain_cancellation"] = True
+                else:
+                    prior_malformed = malformed_by_id.get(feature_id)
+                    if prior_malformed is not None:
+                        prev_feat, prev_cancel, prev_refs_valid, prev_refs = (
+                            prior_malformed
+                        )
+                        if prev_feat != feature:
+                            conflicting_ids.add(feature_id)
+                            if prev_cancel or is_cancel:
+                                cancel_seen_for_id.add(feature_id)
+                            if (
+                                not prev_refs_valid
+                                or not refs_valid
+                                or (prev_cancel and not prev_refs)
+                                or (is_cancel and not valid_ref_ids)
+                            ):
+                                unrecoverable_cancel_for_id.add(feature_id)
+                            combined_refs = list(
+                                dict.fromkeys([*prev_refs, *valid_ref_ids])
+                            )
+                            fits = add_quarantined_lineage(
+                                [feature_id, *combined_refs],
+                                is_cancel=(feature_id in cancel_seen_for_id),
+                            )
+                            if (feature_id in cancel_seen_for_id) and (
+                                not fits
+                                or feature_id in unrecoverable_cancel_for_id
+                                or not combined_refs
+                            ):
+                                state["conflicting_cancellation"] = True
+                        else:
+                            fits = add_quarantined_lineage(
+                                [feature_id, *valid_ref_ids], is_cancel=is_cancel
+                            )
+                    else:
+                        malformed_by_id[feature_id] = (
+                            feature,
+                            is_cancel,
+                            refs_valid,
+                            valid_ref_ids,
+                        )
+                        fits = add_quarantined_lineage(
+                            [feature_id, *valid_ref_ids], is_cancel=is_cancel
+                        )
+                    if is_cancel and (not refs_valid or not valid_ref_ids or not fits):
+                        state["uncertain_cancellation"] = True
             else:
                 state["quarantine_ambiguous"] = True
                 if is_cancel:
@@ -145,18 +237,29 @@ def _parse_and_collect_page(raw_bytes, state):
         is_cancel = (
             event.get("status") == "Actual" and event.get("message_type") == "Cancel"
         )
-        if eid in conflicting_ids:
+        if eid in conflicting_ids or eid in malformed_by_id:
+            extra_refs = ()
+            if eid in malformed_by_id and eid not in conflicting_ids:
+                _, prev_cancel, prev_refs_valid, extra_refs = malformed_by_id[eid]
+                conflicting_ids.add(eid)
+                if prev_cancel:
+                    cancel_seen_for_id.add(eid)
+                if not prev_refs_valid or (prev_cancel and not extra_refs):
+                    unrecoverable_cancel_for_id.add(eid)
             state["quarantined"] += 1
             if is_cancel:
                 cancel_seen_for_id.add(eid)
-                if not event.get("references"):
+                if not _cancel_refs_recoverable(event):
                     unrecoverable_cancel_for_id.add(eid)
+            combined_refs = list(
+                dict.fromkeys([*event.get("references", []), *extra_refs])
+            )
             fits = add_quarantined_lineage(
-                [eid, *event.get("references", [])],
+                [eid, *combined_refs],
                 is_cancel=(eid in cancel_seen_for_id),
             )
             if (eid in cancel_seen_for_id) and (
-                not fits or eid in unrecoverable_cancel_for_id
+                not fits or eid in unrecoverable_cancel_for_id or not combined_refs
             ):
                 state["conflicting_cancellation"] = True
             continue
@@ -173,8 +276,8 @@ def _parse_and_collect_page(raw_bytes, state):
             )
             if existing_is_cancel or is_cancel:
                 cancel_seen_for_id.add(eid)
-                if (existing_is_cancel and not existing.get("references")) or (
-                    is_cancel and not event.get("references")
+                if (existing_is_cancel and not _cancel_refs_recoverable(existing)) or (
+                    is_cancel and not _cancel_refs_recoverable(event)
                 ):
                     unrecoverable_cancel_for_id.add(eid)
             combined_refs = list(
@@ -195,7 +298,7 @@ def _parse_and_collect_page(raw_bytes, state):
             continue
         id_counts[eid] = 1
         events[eid] = event
-        if is_cancel and not event.get("references"):
+        if is_cancel and not _cancel_refs_recoverable(event):
             state["uncertain_cancellation"] = True
     pagination = payload.get("pagination") or {}
     if not isinstance(pagination, dict):
@@ -210,6 +313,7 @@ async def fetch(session, states):
     state = {
         "events": {},
         "conflicting_ids": set(),
+        "malformed_by_id": {},
         "id_counts": {},
         "cancel_seen_for_id": set(),
         "unrecoverable_cancel_for_id": set(),
