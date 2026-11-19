@@ -2,6 +2,19 @@
 
 Snapshot: November 19, 2026 UTC (November 18 in US Eastern time). Resume from live Git state, not an assumption that the latest checkpoint passed review.
 
+## Continuation update: November 19 thirty-seventh repair candidate
+
+Independent high-effort Google-model reviews of `13ed6ec` reported **Verdict: PASS** (zero findings) from **Gemini 4 Hydrogen (high)** on `specification`, and 5 findings (`STD-01` High, `STD-02` Medium, `STD-03` Low, `STD-04` Low, `STD-05` Nit) from **Gemini 4 Neon (high)** on `standards`.
+
+All 5 findings were resolved cleanly in Round 37 (`custom_components/situareness/domain.py`, `custom_components/situareness/__init__.py`, `tests/ha/test_domain.py`, and `tests/ha/test_coordinator.py`):
+- **`STD-01`**: Removed `and not activate` from `continuing_withheld` in `domain.py:reconcile()` so repeating pre-cancellation actions on unreferenced continuing segments stay quarantined across shadow-to-live activation (`activate=True`), while distinct new qualifying actions qualify normally (verified by unit test).
+- **`STD-02`**: Set `inactive_since` and `affected=[]` when transitioning absent `active` records to `"cancelled"` in `domain.py:reconcile()` (without bumping `updated`), updated `_expire_cancellation_horizons` fallback order (`inactive_since` -> `cancelled_at` -> `updated` -> `now`, mirrored onto `prior`), and verified Day-8 non-bridging/non-protection via unit test.
+- **`STD-03`**: Evaluated `_has_corrupt_store_backup` unconditionally in `async_setup_entry()` (while keeping `malformed_store` classification gated on `persisted is None`) so lingering `.corrupt.*` backups re-arm cleanup across restarts after unlink `OSError` (verified by unit test).
+- **`STD-04`**: Added an `except asyncio.CancelledError:` handler around `async_config_entry_first_refresh()` / `async_forward_entry_setups()` in `async_setup_entry()` to set `_stopping = True`, cancel `_fetch_task`, and dismiss `situareness_degraded` before re-raising (verified by unit test).
+- **`STD-05`**: Tracked post-delivery `post_now` across `deliver_one` results in `_deliver_outbox_batch()` and passed it to `_compute_expired_unsent()` so `expired_unsent_at` aligns with post-delivery `outcome["at"]` (verified by unit test).
+
+Verification on the repaired candidate: `232` total automated tests (`44` Node + `146` `-W error` / `-X dev` stdlib HA with zero asyncio slow-callback warnings + `7` skill + `22` Chromium Playwright + `13` real HA, plus Ruff lint/format), deterministic packaging (`685368a8...` extension ZIP, `cbd93f1c...` HA ZIP), live anonymous browser smoke (`2026-11-19T05:14:34.740Z`, HTTP 200 across all four endpoints: `0` NWS alerts, `5` USGS, `33` BBC World, `26` BBC US & Canada), and privacy audit (`issue_count: 0`). Next: commit/push to `wip/supervisor-handoff-20261117` and run fresh Google-model `standards`, `spec`, and blind `adversarial` reviews on the immutable candidate. Household outputs remain disabled and no commissioning occurred.
+
 ## Continuation update: November 19 thirty-sixth repair candidate
 
 Independent high-effort Google-model reviews of `5696a03` (**Gemini 4 Neon, high** `standards` and **Gemini 4 Hydrogen, high** `specification`) reported **0 Critical findings**, with 7 total findings (`STD-01` High, `STD-02` High, `SPEC-01` High, `STD-03` Medium, `SPEC-02` Medium, `SPEC-03` Low, `STD-04` Nit). Model workflow note: use Google-provided models in Antigravity (`Gemini 4 Neon`, `Gemini 4 Hydrogen`) for primary and review work until non-Google external limits reset or explicit user approval is given for external CLIs.

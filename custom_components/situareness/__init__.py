@@ -2051,6 +2051,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
             processed_keys = set()
             requeued = []
             new_outcomes = []
+            post_now = current
             for item, accepted in zip(group, results):
                 if accepted is None:
                     break
@@ -2061,6 +2062,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     attempted_keys.add(item["key"])
                 updated = {**item, "attempts": item["attempts"] + 1}
                 now_after = datetime.now(timezone.utc)
+                post_now = now_after
                 outcome = {
                     "key": item["key"],
                     "accepted": accepted,
@@ -2105,7 +2107,7 @@ class SituarenessCoordinator(DataUpdateCoordinator):
                     o for o in new_outcomes if o.get("expired")
                 ]
                 expired_state = self._compute_expired_unsent(
-                    len(all_expired), current, all_expired
+                    len(all_expired), post_now, all_expired
                 )
                 await self._save(
                     self.records,
@@ -2614,7 +2616,6 @@ async def async_setup_entry(hass, entry):
         atomic_writes=True,
         serialize_in_event_loop=False,
     )
-    has_corrupt_backup = False
     store_file_existed = await hass.async_add_executor_job(
         Path(hass.config.path(".storage", prefix)).exists
     )
@@ -2633,11 +2634,11 @@ async def async_setup_entry(hass, entry):
             persisted = ["unreadable"]
         else:
             raise ConfigEntryNotReady(f"Could not load persisted store: {err}") from err
-    persisted_valid = None
-    if (persisted is None or persisted == {}) and await hass.async_add_executor_job(
+    has_corrupt_backup = await hass.async_add_executor_job(
         _has_corrupt_store_backup, hass.config.path(".storage"), prefix
-    ):
-        has_corrupt_backup = True
+    )
+    persisted_valid = None
+    if (persisted is None or persisted == {}) and has_corrupt_backup:
         if persisted is None and (
             store_file_existed
             or "malformed_store_at" in entry.data
@@ -2667,6 +2668,13 @@ async def async_setup_entry(hass, entry):
             _dismiss_degraded_notification(hass)
             await coordinator.async_stop()
             raise
+    except asyncio.CancelledError:
+        coordinator._stopping = True
+        if coordinator._fetch_task is not None and not coordinator._fetch_task.done():
+            coordinator._fetch_task.cancel()
+        _dismiss_degraded_notification(hass)
+        coordinator._notified_degraded_state = None
+        raise
     except Exception:
         if callable(getattr(entry, "async_on_state_change", None)):
             unsub = None

@@ -922,8 +922,14 @@ def _expire_cancellation_horizons(prior, records, members, active_feed_groups, n
                     prior[eid].pop("uncertain_targets", None)
                     records[eid].pop("uncertain_targets", None)
                 if prior[eid].get("state") == "cancelled":
-                    since = records[eid].get("inactive_since") or now.isoformat()
+                    since = (
+                        records[eid].get("inactive_since")
+                        or records[eid].get("cancelled_at")
+                        or records[eid].get("updated")
+                        or now.isoformat()
+                    )
                     prior[eid]["state"] = "ended_or_absent"
+                    prior[eid]["inactive_since"] = since
                     records[eid]["state"] = "ended_or_absent"
                     records[eid]["inactive_since"] = since
                     records[eid]["updated"] = now.isoformat()
@@ -1448,7 +1454,6 @@ def reconcile(
             and fp in summary.get("pre_cancel_actions", {})
             and fp not in summary.get("active", {})
             and (group, fp) not in planned_in_poll
-            and not activate
         )
         if (
             eid in quarantined_event_ids
@@ -1606,6 +1611,8 @@ def reconcile(
                 **records[eid],
                 "state": "cancelled",
                 "actions": dict(action_history(records[eid])),
+                "inactive_since": records[eid].get("inactive_since") or now.isoformat(),
+                "affected": [],
                 "reasons": ["message explicitly referenced by cancellation"],
             }
             if cancelled_at is not None:

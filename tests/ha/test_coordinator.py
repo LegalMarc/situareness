@@ -8417,3 +8417,271 @@ class CoordinatorBoundary(unittest.IsolatedAsyncioTestCase):
         ):
             h_clean = await coord._async_update_data()
         self.assertEqual(h_clean["planned_count"], 1)
+
+    async def test_corrupt_backup_cleanup_rearms_across_restart_after_unlink_failure(
+        self,
+    ):
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        async def run_exec(fn, *args):
+            return await asyncio.to_thread(fn, *args)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            storage_dir = Path(tmp) / ".storage"
+            storage_dir.mkdir(parents=True, exist_ok=True)
+            prefix = f"{mod.DOMAIN}.rearm-corrupt"
+            corrupt_path = storage_dir / f"{prefix}.corrupt.20261119T000000"
+            corrupt_path.write_text("{corrupt", encoding="utf-8")
+            (storage_dir / prefix).write_text("{}", encoding="utf-8")
+            (Path(tmp) / "situareness.json").write_text("{}", encoding="utf-8")
+
+            valid_persisted = {
+                "initialized": True,
+                "was_live": False,
+                "records": {},
+                "outbox": [],
+                "outcomes": [],
+            }
+
+            class ValidNonEmptyStore(Store):
+                async def async_load(self):
+                    return dict(valid_persisted)
+
+            class RefreshCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    self.data = await self._update_once()
+
+            class Entries:
+                def async_update_entry(self, ent, data=None):
+                    ent.data = data
+
+                async def async_forward_entry_setups(self, ent, platforms):
+                    return True
+
+            entry = types.SimpleNamespace(
+                entry_id="rearm-corrupt",
+                data={"journal_initialized": True},
+                state="loaded",
+            )
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                config_entries=Entries(),
+                async_add_executor_job=run_exec,
+            )
+
+            with (
+                patch.object(mod, "Store", ValidNonEmptyStore),
+                patch.object(mod, "SituarenessCoordinator", RefreshCoordinator),
+                patch.object(
+                    mod,
+                    "fetch",
+                    return_value=collector.CollectedEvents([], 0, set(), False),
+                ),
+                patch.object(mod, "_clear_corrupt_store_backups", return_value=False),
+            ):
+                ok = await mod.async_setup_entry(hass, entry)
+            self.assertTrue(ok)
+            coord = hass.data[mod.DOMAIN][entry.entry_id]
+            self.assertFalse(coord.degraded)
+            self.assertIsNone(coord.degraded_reason)
+            self.assertTrue(coord._needs_corrupt_cleanup)
+            self.assertTrue(corrupt_path.exists())
+
+            await coord._save({}, [], [])
+            self.assertFalse(coord._needs_corrupt_cleanup)
+            self.assertFalse(corrupt_path.exists())
+
+    async def test_setup_first_refresh_cancelled_dismisses_degraded_notification(self):
+        import tempfile
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        notifications = {}
+        dismiss_calls = []
+        fake_pn = types.SimpleNamespace(
+            async_create=lambda hass, msg, title=None, notification_id=None: (
+                notifications.__setitem__(
+                    notification_id, {"message": msg, "title": title}
+                )
+            ),
+            async_dismiss=lambda hass, nid: (
+                dismiss_calls.append(nid),
+                notifications.pop(nid, None),
+            ),
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                **HA_MODULES,
+                "homeassistant.components": module(
+                    "homeassistant.components", persistent_notification=fake_pn
+                ),
+                "homeassistant.components.persistent_notification": fake_pn,
+            },
+        ):
+            spec.loader.exec_module(mod)
+
+        async def run_exec(fn, *args):
+            return await asyncio.to_thread(fn, *args)
+
+        created = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "situareness.json").write_text("{}", encoding="utf-8")
+
+            class Entries:
+                def async_update_entry(self, ent, data=None):
+                    ent.data = data
+
+            class CancelledRefreshCoordinator(mod.SituarenessCoordinator):
+                async def async_config_entry_first_refresh(self):
+                    created["coord"] = self
+                    self._fetch_task = asyncio.create_task(asyncio.sleep(10))
+                    raise asyncio.CancelledError()
+
+            class EmptyStore(Store):
+                async def async_load(self):
+                    return None
+
+            entry = types.SimpleNamespace(
+                entry_id="cancel-refresh",
+                data={"journal_initialized": True},
+                state="not_loaded",
+            )
+            hass = types.SimpleNamespace(
+                data={},
+                services=Services(),
+                config=types.SimpleNamespace(
+                    path=lambda *p: str(Path(tmp).joinpath(*p))
+                ),
+                config_entries=Entries(),
+                async_add_executor_job=run_exec,
+            )
+
+            with (
+                patch.object(mod, "Store", EmptyStore),
+                patch.object(
+                    mod, "SituarenessCoordinator", CancelledRefreshCoordinator
+                ),
+                self.assertRaises(asyncio.CancelledError),
+            ):
+                await mod.async_setup_entry(hass, entry)
+
+            coord = created["coord"]
+            await asyncio.sleep(0)
+            self.assertTrue(coord._stopping)
+            self.assertTrue(coord._fetch_task.cancelled())
+            self.assertNotIn("situareness_degraded", notifications)
+            self.assertGreaterEqual(len(dismiss_calls), 1)
+
+    async def test_deliver_outbox_batch_uses_post_delivery_clock_for_expired_unsent_at(
+        self,
+    ):
+        from datetime import datetime, timedelta, timezone
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "custom_components/situareness/__init__.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            PACKAGE, path, submodule_search_locations=[str(path.parent)]
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, HA_MODULES):
+            spec.loader.exec_module(mod)
+
+        t0 = datetime(2026, 11, 18, 12, 0, tzinfo=timezone.utc)
+        t1 = t0 + timedelta(seconds=10)
+
+        class Clock:
+            current = t0
+
+            @classmethod
+            def now(cls, tz):
+                return cls.current
+
+        class FailAdvancingServices(Services):
+            async def async_call(self, *args, **kwargs):
+                Clock.current = t1
+                raise RuntimeError("delivery failure")
+
+        live_cfg = {
+            **config(),
+            "live_enabled": True,
+            "commissioning_passed": True,
+            "phones": ["mobile_app_one"],
+            "tts_entity": None,
+        }
+        hass = types.SimpleNamespace(
+            data={},
+            services=FailAdvancingServices(),
+            async_add_executor_job=lambda fn, *a: asyncio.to_thread(fn, *a),
+        )
+        raw = feature()
+        raw["properties"]["sent"] = (t0 - timedelta(minutes=2)).isoformat()
+        raw["properties"]["effective"] = raw["properties"]["sent"]
+        raw["properties"]["expires"] = (t0 + timedelta(hours=1)).isoformat()
+        raw["properties"]["ends"] = (t0 + timedelta(hours=1)).isoformat()
+        ev = d.normalize(raw)
+        fp = d.fingerprint(ev, d.qualify(ev, live_cfg, t0))
+        coord = mod.SituarenessCoordinator(
+            hass,
+            live_cfg,
+            Store(),
+            {
+                "initialized": True,
+                "was_live": True,
+                "records": {
+                    ev["id"]: {
+                        "state": "active",
+                        "fingerprint": fp,
+                        "lineage": [ev["id"]],
+                        "actions": {fp: ["new_york_ny"]},
+                        "updated": (t0 - timedelta(minutes=2)).isoformat(),
+                    }
+                },
+                "outbox": [
+                    {
+                        "key": "exp-post-clock-0",
+                        "incident_id": ev["id"],
+                        "event": "Tornado Warning",
+                        "fingerprint": fp,
+                        "target": "mobile_app_one",
+                        "kind": "phone",
+                        "location": None,
+                        "source_url": ev["id"],
+                        "created": (t0 - timedelta(minutes=2)).isoformat(),
+                        "attempts": 2,
+                        "instruction": ev["instruction"],
+                        "affected_names": ["New York"],
+                    }
+                ],
+            },
+        )
+        with patch.object(mod, "datetime", Clock):
+            attempts, failures = await coord._deliver_outbox_batch([ev], t0)
+        self.assertEqual((attempts, failures), (1, 1))
+        self.assertEqual(coord.expired_unsent, 1)
+        self.assertEqual(coord.expired_unsent_reasons, ["exhausted"])
+        self.assertEqual(coord.expired_unsent_at, t1.isoformat())
+        self.assertEqual(coord.outcomes[-1]["at"], t1.isoformat())

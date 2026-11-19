@@ -1275,6 +1275,108 @@ class Policy(unittest.TestCase):
             self.assertTrue(st["uncertain_cancellation"])
             self.assertTrue(bool(d.qualify(norm, cfg, NOW)))
 
+    def test_activate_preserves_continuing_withheld_quarantine_while_qualifying_new_action(
+        self,
+    ):
+        cfg = config()
+        p = cap_event("act-cw-p", -10, message_type="Alert")
+        rec1, plans1 = d.reconcile({}, [p], cfg, NOW)
+        self.assertEqual([pl["id"] for pl in plans1], [p["id"]])
+
+        cancel_c = cap_event("act-cw-c", -5, [p], "Cancel")
+        u_same = cap_event("act-cw-usame", -4, [p])
+        u_same["instruction"] = p["instruction"]
+        u_new = cap_event("act-cw-unew", -4, [p])
+        u_new["instruction"] = "Take shelter in a basement immediately."
+        rec2, plans2 = d.reconcile(
+            rec1, [cancel_c, u_same, u_new], cfg, NOW, activate=False
+        )
+        self.assertEqual(rec2[u_same["id"]]["state"], "quarantined")
+        self.assertEqual(rec2[u_new["id"]]["state"], "active")
+        self.assertEqual([pl["id"] for pl in plans2], [u_new["id"]])
+
+        # Shadow-to-live activation must NOT release continuing_withheld pre-cancellation actions.
+        rec3, plans3 = d.reconcile(
+            rec2, [u_same, u_new], cfg, NOW + timedelta(minutes=1), activate=True
+        )
+        self.assertEqual(rec3[u_same["id"]]["state"], "quarantined")
+        self.assertEqual(
+            rec3[u_same["id"]]["reasons"], ["cancellation scope uncertain"]
+        )
+        self.assertNotIn(u_same["id"], [pl["id"] for pl in plans3])
+        self.assertEqual([pl["id"] for pl in plans3], [u_new["id"]])
+
+        rec4, plans4 = d.reconcile(
+            rec3, [u_same, u_new], cfg, NOW + timedelta(minutes=2), activate=False
+        )
+        self.assertEqual(rec4[u_same["id"]]["state"], "quarantined")
+        self.assertEqual(plans4, [])
+
+    def test_expired_absent_cancelled_record_does_not_bridge_or_protect(self):
+        cfg = config()
+        p = cap_event("exp-can-p", -10, message_type="Alert")
+        rec1, _ = d.reconcile({}, [p], cfg, NOW)
+        fp1 = rec1[p["id"]]["fingerprint"]
+
+        cancel_t = NOW + timedelta(minutes=1)
+        cancel_c = cap_event("exp-can-c", 1, [p], "Cancel")
+        rec2, _ = d.reconcile(rec1, [cancel_c], cfg, cancel_t)
+        self.assertEqual(rec2[p["id"]]["state"], "cancelled")
+        self.assertEqual(rec2[p["id"]]["inactive_since"], cancel_t.isoformat())
+        self.assertEqual(rec2[p["id"]]["affected"], [])
+        self.assertEqual(list(rec2[p["id"]]["actions"]), [fp1])
+
+        # Verify legacy absent cancelled record lacking inactive_since keeps historical anchor on expiry.
+        legacy_id = "https://api.weather.gov/alerts/exp-can-legacy"
+        legacy_cancel_id = "https://api.weather.gov/alerts/exp-can-legacy-c"
+        later = NOW + d.MAX_ACCEPTANCE_AGE + timedelta(days=1)
+        later_min = int((later - NOW).total_seconds() // 60) - 1
+        probe_records = {
+            **rec2,
+            legacy_id: {
+                "state": "cancelled",
+                "fingerprint": fp1,
+                "actions": {fp1: ["new_york_ny"]},
+                "lineage": [legacy_id, legacy_cancel_id],
+                "cancelled_at": cancel_t.isoformat(),
+                "updated": cancel_t.isoformat(),
+            },
+        }
+        probe_prior = {k: dict(v) for k, v in probe_records.items()}
+        _, members = d.lineage_index(probe_records, [])
+        d._expire_cancellation_horizons(
+            probe_prior, probe_records, members, set(), later
+        )
+        self.assertEqual(probe_records[p["id"]]["state"], "ended_or_absent")
+        self.assertEqual(probe_records[p["id"]]["inactive_since"], cancel_t.isoformat())
+        self.assertEqual(probe_records[legacy_id]["state"], "ended_or_absent")
+        self.assertEqual(
+            probe_records[legacy_id]["inactive_since"], cancel_t.isoformat()
+        )
+        self.assertEqual(probe_prior[legacy_id]["inactive_since"], cancel_t.isoformat())
+
+        # Fresh alert repeating fp1 after 7-day expiry must qualify (not suppressed via stale Day-0 bridge)
+        # and the expired absent record is not protected past the 1,000-record cap.
+        fresh_ev = cap_event("exp-can-fresh", later_min, [p], "Update")
+        fresh_ev["effective"] = fresh_ev["sent"]
+        fresh_ev["expires"] = (later + timedelta(hours=1)).isoformat()
+        fresh_ev["ends"] = (later + timedelta(hours=1)).isoformat()
+        fresh_ev["instruction"] = p["instruction"]
+        rec3, plans3 = d.reconcile(rec2, [fresh_ev], cfg, later)
+        self.assertEqual([pl["id"] for pl in plans3], [fresh_ev["id"]])
+
+        noise = []
+        for idx in range(1005):
+            n = cap_event(f"exp-can-noise-{idx}", later_min, message_type="Alert")
+            n["effective"] = n["sent"]
+            n["expires"] = (later + timedelta(hours=1)).isoformat()
+            n["ends"] = (later + timedelta(hours=1)).isoformat()
+            n["geometry"] = None
+            noise.append(n)
+        rec4, _ = d.reconcile(rec2, noise, cfg, later)
+        self.assertEqual(len(rec4), 1000)
+        self.assertNotIn(p["id"], rec4)
+
 
 class Services:
     def __init__(self):
